@@ -679,3 +679,82 @@ Describe 'Leads: evidence that points at the next check' {
         (& $Config).EnableAdSites | Should -BeTrue
     }
 }
+
+Describe 'Email and domain posture from public DNS' {
+    It 'finds the client''s public domain and leaves internal names out' {
+        $r = @{ Identity = @{ Upn = 'jlee@northwindtraders.com' }; NetworkExtra = @{ DnsSuffixSearch = @('northwind.local', 'branch.northwindtraders.com', 'contoso.co.uk') }
+                Machine = @{ Domain = 'northwind.local' }; AdSites = @{ Forest = 'northwind.local' } }
+        Get-ClientDomains $r | Should -Be @('northwindtraders.com', 'contoso.co.uk')
+        Get-ClientDomains @{ Identity = @{ Upn = 'jlee@northwind.onmicrosoft.com' } } | Should -BeNullOrEmpty
+    }
+    It 'names the mail provider from the MX hosts' {
+        Get-MailProvider @('northwindtraders-com.mail.protection.outlook.com') | Should -Be 'Microsoft 365'
+        Get-MailProvider @('aspmx.l.google.com') | Should -Be 'Google Workspace'
+        Get-MailProvider @('mx1-us1.ppe-hosted.com') | Should -Be 'Proofpoint'
+        Get-MailProvider @('mail.example.net') | Should -Be 'other or self-hosted'
+    }
+    It 'reads SPF: <Rec> ends in <All>' -ForEach @(
+        @{ Rec = 'v=spf1 include:spf.protection.outlook.com -all'; All = '-all' }
+        @{ Rec = 'v=spf1 a mx ~all'; All = '~all' }
+        @{ Rec = 'v=spf1 include:_spf.google.com ?all'; All = '?all' }
+        @{ Rec = 'v=spf1 +all'; All = '+all' }
+        @{ Rec = 'v=spf1 redirect=_spf.example.net'; All = 'redirect' }
+    ) {
+        (Get-SpfSummary @('google-site-verification=abc', $Rec)).All | Should -Be $All
+    }
+    It 'counts SPF lookups and notices two SPF records' {
+        $s = Get-SpfSummary @('v=spf1 include:a.example include:b.example a mx -all', 'v=spf1 -all')
+        $s.Lookups | Should -Be 4
+        $s.Multiple | Should -BeTrue
+        (Get-SpfSummary @('some other txt')).Present | Should -BeFalse
+    }
+    It 'reads DMARC' {
+        $d = Get-DmarcSummary @('v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@northwindtraders.com')
+        $d.Policy | Should -Be 'quarantine'
+        $d.Reports | Should -BeTrue
+        (Get-DmarcSummary @()).Present | Should -BeFalse
+    }
+    It 'looks the domain up in public DNS (DNS mocked)' {
+        Mock Resolve-PublicDns {
+            switch ("$Name|$Type") {
+                'northwindtraders.com|MX' { @([pscustomobject]@{ Type = 'MX'; Preference = 0; NameExchange = 'northwindtraders-com.mail.protection.outlook.com' }) }
+                'northwindtraders.com|TXT' { @([pscustomobject]@{ Type = 'TXT'; Strings = @('v=spf1 include:spf.protection.outlook.com ', '-all') }) }
+                '_dmarc.northwindtraders.com|TXT' { @([pscustomobject]@{ Type = 'TXT'; Strings = @('v=DMARC1; p=none') }) }
+                'selector1._domainkey.northwindtraders.com|CNAME' { @([pscustomobject]@{ Type = 'CNAME'; NameHost = 'selector1-northwindtraders-com._domainkey.northwind.onmicrosoft.com' }) }
+                'autodiscover.northwindtraders.com|CNAME' { @([pscustomobject]@{ Type = 'CNAME'; NameHost = 'autodiscover.outlook.com' }) }
+                default { @() }
+            }
+        }
+        $p = Get-DomainPosture 'northwindtraders.com'
+        $p.Provider | Should -Be 'Microsoft 365'
+        $p.Spf.All | Should -Be '-all' -Because 'a TXT record split into strings is joined first'
+        $p.Dmarc.Policy | Should -Be 'none'
+        $p.DkimSelectors | Should -Be @('selector1')
+        $p.Autodiscover | Should -Be @('autodiscover.outlook.com')
+        $flags = @(Get-DomainFlags $p)
+        ($flags | Where-Object Message -like '*p=none*').Severity | Should -Be 'Low'
+        @($flags | Where-Object Message -like '*SPF*').Count | Should -Be 0
+    }
+    It 'flags a domain that can be spoofed' {
+        $p = @{ Domain = 'contoso.co.uk'; Mx = @('mail.contoso.co.uk'); Provider = 'other or self-hosted'; Spf = @{ Present = $true; All = '+all'; Lookups = 1; Multiple = $false }; Dmarc = @{ Present = $false }; DkimSelectors = @() }
+        $f = @(Get-DomainFlags $p)
+        ($f | Where-Object Message -like '*+all*').Severity | Should -Be 'High'
+        ($f | Where-Object Message -like '*no DMARC*').Severity | Should -Be 'Medium'
+        @($f | ForEach-Object Category | Sort-Object -Unique) | Should -Be @('Email security')
+    }
+    It 'turns the lookup into a finding' {
+        $r = @{ Domains = @{ Domains = @(@{ Domain = 'northwindtraders.com'; Mx = @('northwindtraders-com.mail.protection.outlook.com'); Provider = 'Microsoft 365'; Spf = @{ Present = $true; All = '-all'; Record = 'v=spf1 -all' }; Dmarc = @{ Present = $true; Policy = 'reject'; Reports = $true; Record = 'v=DMARC1; p=reject' }; DkimSelectors = @('selector1', 'selector2'); MtaSts = $false; Autodiscover = @() }) } }
+        (@(Get-AssessmentFindings $r) | Where-Object Area -eq 'Email and domain').Finding | Should -Match 'Microsoft 365.*SPF ends in -all.*DMARC p=reject with reports.*DKIM at selector1, selector2'
+    }
+}
+
+Describe 'DKIM keys' {
+    It 'does not count an empty key (p= with no value) as DKIM' {
+        Mock Resolve-PublicDns {
+            if ($Type -eq 'TXT' -and $Name -like 'selector1._domainkey.*') { @([pscustomobject]@{ Type = 'TXT'; Strings = @('v=DKIM1; p=') }) }
+            elseif ($Type -eq 'TXT' -and $Name -like 'k1._domainkey.*') { @([pscustomobject]@{ Type = 'TXT'; Strings = @('v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA') }) }
+            else { @() }
+        }
+        (Get-DomainPosture 'example.com').DkimSelectors | Should -Be @('k1')
+    }
+}

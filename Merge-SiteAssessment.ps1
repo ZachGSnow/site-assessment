@@ -484,7 +484,13 @@ foreach ($r in $runs) {
 }
 $gear = @($gear | Sort-Object Site, Type, IP, Mac -Unique)
 # Two machines at one site see the same network, so a network risk is kept once per site.
-$flags = @(@($flags | Where-Object { $_.Category -ne 'Network risk' }) + @($flags | Where-Object { $_.Category -eq 'Network risk' } | Sort-Object Site, Message -Unique))
+$flags = @(@($flags | Where-Object { $_.Category -notin @('Network risk', 'Email security') }) + @($flags | Where-Object { $_.Category -in @('Network risk', 'Email security') } | Sort-Object Site, Message -Unique))
+# The client's email domains, once each, from whichever run looked them up last.
+$domainRows = @(foreach ($r in $runs) { foreach ($p in @(V (V $r 'Domains') 'Domains')) { if ($p) {
+    [pscustomobject][ordered]@{ Domain = $p.Domain; Provider = $p.Provider; Mx = (J @($p.Mx) ', '); Spf = $(if (V $p.Spf 'Present') { V $p.Spf 'All' } else { 'missing' }); SpfLookups = V $p.Spf 'Lookups'
+        Dmarc = $(if (V $p.Dmarc 'Present') { "p=$(V $p.Dmarc 'Policy')" } else { 'missing' }); DmarcReports = V $p.Dmarc 'Reports'; Dkim = (J @($p.DkimSelectors) ', '); MtaSts = $p.MtaSts; TlsRpt = $p.TlsRpt; CheckedFrom = $r._Label; CheckedAt = V $r.Meta 'RunStart' }
+} } })
+$domainRows = @($domainRows | Sort-Object Domain, @{ Expression = 'CheckedAt'; Descending = $true } | Group-Object Domain | ForEach-Object { $_.Group[0] })
 # A test laptop has no history at the site: blank the fields that would otherwise read as the site's.
 foreach ($e in $endpoints) {
     if ($e.Role -ne 'Test laptop') { continue }
@@ -1073,6 +1079,7 @@ $gear | Export-Csv (Join-Path $OutDir 'NetworkGear.csv') -NoTypeInformation
 $routerAddr | Export-Csv (Join-Path $OutDir 'RouterAddresses.csv') -NoTypeInformation
 $routeRows | Export-Csv (Join-Path $OutDir 'Routes.csv') -NoTypeInformation
 $upsRows | Export-Csv (Join-Path $OutDir 'Ups.csv') -NoTypeInformation
+$domainRows | Export-Csv (Join-Path $OutDir 'Domains.csv') -NoTypeInformation
 @($flags) + @($deviceFlags) | Export-Csv (Join-Path $OutDir 'Flags.csv') -NoTypeInformation
 $software | Export-Csv (Join-Path $OutDir 'Software.csv') -NoTypeInformation
 $traceRows | Export-Csv (Join-Path $OutDir 'Traceroutes.csv') -NoTypeInformation
@@ -1599,6 +1606,7 @@ if ($sites.Count -gt 1) {
 }
 
 $topHigh = @($flags | Where-Object Severity -eq 'High' | Sort-Object Site, Hostname | Select-Object -First 12)
+if ($domainRows.Count) { [void]$sb.Append((New-Section 'Email and domain (public DNS)' (New-Table $domainRows @('Domain', 'Provider|Mail goes to', 'Mx|MX', 'Spf|SPF', 'Dmarc|DMARC', 'Dkim|DKIM selectors', 'MtaSts|MTA-STS', 'CheckedFrom|Checked from')) -Open)) }
 [void]$sb.Append('<h2>Key findings</h2>')
 if ($topHigh.Count) { [void]$sb.Append((New-Table $topHigh @('Site', 'Hostname|Machine', 'Category', 'Message|Finding'))) }
 else { [void]$sb.Append('<p class="muted">No high-severity findings.</p>') }
