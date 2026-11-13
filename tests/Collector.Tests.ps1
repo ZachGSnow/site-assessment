@@ -388,3 +388,70 @@ Describe 'Router and UPS tables over SNMP (Phase B)' {
         ($f | Where-Object { $_.Finding -like 'UPS*' }).Finding | Should -Match 'RUNNING ON BATTERY'
     }
 }
+
+Describe 'Network risks from collected data (Phase C)' {
+    BeforeAll {
+        $now = [datetime]'2026-11-12T12:00:00'
+        $script:RiskRun = @{
+            Identify = @{ Devices = @(
+                @{ IP = '10.20.1.10'; Name = 'nw-fs01.northwind.local'; OpenPorts = @(445); Smb = @{ Smb1Enabled = $true } }
+                @{ IP = '10.20.1.20'; Name = 'nw-sw01'; OpenPorts = @(23, 80); Web = @(@{ Url = 'http://10.20.1.20/'; Status = 200 }) }
+                @{ IP = '10.20.1.21'; OpenPorts = @(21, 22); SshBanner = 'SSH-2.0-OpenSSH_6.6.1p1'; Web = @() }
+                @{ IP = '10.20.1.22'; OpenPorts = @(22, 80, 443); SshBanner = 'SSH-2.0-OpenSSH_8.9p1'
+                   Web = @(@{ Url = 'http://10.20.1.22/'; Status = 301 }, @{ Url = 'https://10.20.1.22/'; Status = 200; CertNotAfter = '2025-06-30T00:00:00' }) }
+                @{ IP = '10.20.1.23'; OpenPorts = @(22); SshBanner = 'SSH-2.0-dropbear_2015.67' }
+                @{ IP = '10.20.2.31'; Name = 'NW-DOCK02'; Remote = $true; OpenPorts = @(445, 3389) }
+            ) }
+            Snmp = @{ Community = 'public'; Answered = 3 }
+            WindowsHosts = @{ Hosts = @(
+                @{ IP = '10.20.1.30'; ComputerName = 'NW-OLD01'; Os = 'Windows 7 / Server 2008 R2' }
+                @{ IP = '10.20.1.31'; ComputerName = 'NW-ACCT02'; Os = 'Windows 10 (2004 to 22H2)' }
+                @{ IP = '10.20.1.32'; ComputerName = 'NW-SRV19'; Os = 'Windows 10 1809 / Server 2019' }
+            ) }
+        }
+        $script:Risks = @(Get-NetworkRiskFlags $RiskRun -Now $now)
+        $script:Find = { param($text) @($Risks | Where-Object { $_.Message -like "*$text*" }) }
+    }
+    It 'flags SMBv1 as high' {
+        $f = & $Find 'SMBv1'
+        $f.Severity | Should -Be 'High'
+        $f.Message | Should -Match '10\.20\.1\.10 \(nw-fs01\)'
+    }
+    It 'flags Telnet and FTP' {
+        (& $Find 'Telnet').Severity | Should -Be 'Medium'
+        (& $Find 'run FTP').Severity | Should -Be 'Low'
+    }
+    It 'flags a web page that is only on plain HTTP, not one that also has HTTPS' {
+        $f = & $Find 'only over plain HTTP'
+        $f.Message | Should -Match '1 device'
+        $f.Message | Should -Match '10\.20\.1\.20'
+        $f.Message | Should -Not -Match '10\.20\.1\.22'
+    }
+    It 'flags an expired certificate' {
+        (& $Find 'expired HTTPS certificate').Message | Should -Match '10\.20\.1\.22'
+    }
+    It 'flags Remote Desktop and file sharing open across routing' {
+        (& $Find 'Remote Desktop answers').Message | Should -Match 'NW-DOCK02'
+        (& $Find 'file sharing answers').Severity | Should -Be 'Medium'
+    }
+    It 'flags SNMP answering on public' {
+        (& $Find "community 'public'").Message | Should -Match '^3 device'
+    }
+    It 'flags old SSH servers, not current ones' {
+        $f = & $Find 'SSH server from before 2017'
+        $f.Message | Should -Match '^2 device'
+        $f.Message | Should -Not -Match '10\.20\.1\.22'
+    }
+    It 'flags Windows out of support, and leaves the ambiguous server builds alone' {
+        (& $Find 'no longer gets security updates').Severity | Should -Be 'High'
+        $w10 = & $Find 'run Windows 10'
+        $w10.Message | Should -Match 'NW-ACCT02'
+        $w10.Message | Should -Not -Match 'NW-SRV19'
+    }
+    It 'raises nothing on a run without discovery' {
+        @(Get-NetworkRiskFlags @{ Network = @{} }).Count | Should -Be 0
+    }
+    It 'files every risk under one category the merge keeps for the site' {
+        @($Risks | ForEach-Object Category | Sort-Object -Unique) | Should -Be @('Network risk')
+    }
+}

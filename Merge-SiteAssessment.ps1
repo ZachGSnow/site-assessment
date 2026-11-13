@@ -476,6 +476,8 @@ foreach ($r in $runs) {
     }
 }
 $gear = @($gear | Sort-Object Site, Type, IP, Mac -Unique)
+# Two machines at one site see the same network, so a network risk is kept once per site.
+$flags = @(@($flags | Where-Object { $_.Category -ne 'Network risk' }) + @($flags | Where-Object { $_.Category -eq 'Network risk' } | Sort-Object Site, Message -Unique))
 # A test laptop has no history at the site: blank the fields that would otherwise read as the site's.
 foreach ($e in $endpoints) {
     if ($e.Role -ne 'Test laptop') { continue }

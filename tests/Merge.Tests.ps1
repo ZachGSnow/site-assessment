@@ -159,3 +159,13 @@ Describe 'Router and UPS tables in the report' {
         $Html | Should -Match 'Routers and UPS \(SNMP\)'
     }
 }
+
+Describe 'Network risks in the merged report' {
+    BeforeAll { $script:Fl = @(Import-Csv (Join-Path $MultiOut 'Flags.csv')) }
+    It 'keeps one copy of a network risk two machines at a site both saw' {
+        @($Fl | Where-Object { $_.Category -eq 'Network risk' -and $_.Site -eq 'Main office' -and $_.Message -like '*SMBv1*' }).Count | Should -Be 1
+    }
+    It 'keeps it for the site, not as a device-only finding' {
+        ($Fl | Where-Object { $_.Category -eq 'Network risk' } | Select-Object -First 1).Scope | Should -Be 'Site'
+    }
+}

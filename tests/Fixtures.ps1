@@ -141,6 +141,7 @@ function New-MultiSiteFixture {
     $hd = @{ Profile = 'Custom'; Name = 'Contoso Cloud'; HostPattern = 'contosocloud\.com'; Targets = @('connect.contosocloud.com:443') }
     $portal = 'connect.contosocloud.com'
     $t0 = [datetime]'2026-03-10T09:00:00'
+    $smb1Risk = [ordered]@{ Severity = 'High'; Category = 'Network risk'; Message = '1 device(s) still accept SMBv1, the file-sharing version WannaCry spread over: 10.20.1.10 (nw-fs01)' }
     # With -Discovery, the front desk PC also swept the warehouse subnet across the site tunnel.
     $remote = [ordered]@{
         RemoteSubnets = [ordered]@{ Candidates = @([ordered]@{ Cidr = '10.20.2.0/24'; Reasons = @('route via 10.20.1.254'); Hosted = $false }); Answer = '1'
@@ -173,11 +174,11 @@ function New-MultiSiteFixture {
     $runs = @(
         (New-FixtureRun -Site 'Main office' -Hostname 'NW-FRONT01' -Serial 'NWSN0001' -User 'jlee' -RunStart $t0 `
             -SourceIp '10.20.1.25' -Gateway '10.20.1.1' -PublicIp '203.0.113.40' -HostedDesktop $hd -SelectedTargets @($portal, 'rdp.example.com') `
-            -TcpSeries @((New-FixtureSeries $portal 38 0 3 180 443), (New-FixtureSeries 'rdp.example.com' 20 0 1 180 3389)) -Extra $remote)
+            -TcpSeries @((New-FixtureSeries $portal 38 0 3 180 443), (New-FixtureSeries 'rdp.example.com' 20 0 1 180 3389)) -Flags @($smb1Risk) -Extra $remote)
         (New-FixtureRun -Site 'Main office' -Hostname 'NW-ACCT02' -Serial 'NWSN0002' -User 'mgarcia' -Connection 'Wi-Fi' -RunStart $t0.AddSeconds(20) `
             -SourceIp '10.20.1.61' -Gateway '10.20.1.1' -PublicIp '203.0.113.40' -DownMbps 210 -UpMbps 80 -HostedDesktop $hd -SelectedTargets @($portal) `
             -TcpSeries @((New-FixtureSeries $portal 44 0.6 6 180 443)) -Model 'Latitude 5440' -AgeYears 6.1 -Os 'Microsoft Windows 10 Pro' -IsWindows10 $true -RamGB 8 `
-            -Flags @([ordered]@{ Severity = 'High'; Category = 'Lifecycle'; Message = 'Windows 10 (out of support since Oct 2025)' }) -DataCheck 'WARN')
+            -Flags @([ordered]@{ Severity = 'High'; Category = 'Lifecycle'; Message = 'Windows 10 (out of support since Oct 2025)' }, $smb1Risk) -DataCheck 'WARN')
         (New-FixtureRun -Site 'Warehouse' -Hostname 'NW-DOCK01' -Serial 'NWSN0003' -User 'swilson' -RunStart $t0.AddHours(2) `
             -SourceIp '10.20.2.30' -Gateway '10.20.2.1' -PublicIp '203.0.113.40' -DownMbps 95 -UpMbps 18 -InetAvgMs 31 -IdleMs 29 `
             -Verdict 'Full backhaul' -Confidence 'Medium' -HostedDesktop $hd -SelectedTargets @($portal) `
