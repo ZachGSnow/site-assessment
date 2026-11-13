@@ -54,7 +54,7 @@ function New-FixtureRun {
         [string[]]$SelectedTargets = @(), [object[]]$TcpSeries = @(), [object[]]$ExtraTraces = @(),
         [string]$Model = 'OptiPlex 7010', [string]$Manufacturer = 'Dell Inc.', [double]$AgeYears = 2.5,
         [string]$Os = 'Microsoft Windows 11 Pro', [bool]$IsWindows10 = $false, [double]$RamGB = 16,
-        [object[]]$Flags = @(), [string]$DataCheck = 'PASS',
+        [object[]]$Flags = @(), [string]$DataCheck = 'PASS', [string]$Ipv6 = 'Not offered',
         [System.Collections.IDictionary]$Extra = @{}
     )
     $bwStart = $RunStart.AddMinutes(1)
@@ -102,6 +102,7 @@ function New-FixtureRun {
         Flags = @($Flags)
         Validation = [ordered]@{ Overall = $DataCheck; Checks = @() }
         Errors = @()
+        Ipv6 = $(if ($Ipv6 -eq 'Working') { [ordered]@{ Status = 'Working'; GlobalPrefixes = @('2001:db8:20:1::/64'); TemporaryAddresses = $true; UniqueLocal = $false; DefaultRoute = $true; RouterIsLinkLocal = $true; DnsServers = @(); Egress = [ordered]@{ Reached = $true; Prefix = '2001:db8:20:1::/64'; SameAsPc = $true; Colo = 'ORD' }; Ping = [ordered]@{ Sent = 10; Received = 10; LossPct = 0; AvgMs = 14.2 }; AaaaLookup = $true } } else { [ordered]@{ Status = 'Not offered'; GlobalPrefixes = @(); DefaultRoute = $false; UniqueLocal = $false; AaaaLookup = $true } })
     }
     foreach ($k in $Extra.Keys) { $run[$k] = $Extra[$k] }
     return $run
@@ -174,7 +175,7 @@ function New-MultiSiteFixture {
     $runs = @(
         (New-FixtureRun -Site 'Main office' -Hostname 'NW-FRONT01' -Serial 'NWSN0001' -User 'jlee' -RunStart $t0 `
             -SourceIp '10.20.1.25' -Gateway '10.20.1.1' -PublicIp '203.0.113.40' -HostedDesktop $hd -SelectedTargets @($portal, 'rdp.example.com') `
-            -TcpSeries @((New-FixtureSeries $portal 38 0 3 180 443), (New-FixtureSeries 'rdp.example.com' 20 0 1 180 3389)) -Flags @($smb1Risk) -Extra $remote)
+            -TcpSeries @((New-FixtureSeries $portal 38 0 3 180 443), (New-FixtureSeries 'rdp.example.com' 20 0 1 180 3389)) -Flags @($smb1Risk) -Ipv6 'Working' -Extra $remote)
         (New-FixtureRun -Site 'Main office' -Hostname 'NW-ACCT02' -Serial 'NWSN0002' -User 'mgarcia' -Connection 'Wi-Fi' -RunStart $t0.AddSeconds(20) `
             -SourceIp '10.20.1.61' -Gateway '10.20.1.1' -PublicIp '203.0.113.40' -DownMbps 210 -UpMbps 80 -HostedDesktop $hd -SelectedTargets @($portal) `
             -TcpSeries @((New-FixtureSeries $portal 44 0.6 6 180 443)) -Model 'Latitude 5440' -AgeYears 6.1 -Os 'Microsoft Windows 10 Pro' -IsWindows10 $true -RamGB 8 `

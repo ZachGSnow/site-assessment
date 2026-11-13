@@ -15,6 +15,7 @@
 
 - **Traffic design verdict** for every machine: local breakout, split tunnel (remote desktop over a tunnel, internet local) or full backhaul. It's scored from traceroutes, path MTU, DNS servers, the egress network, remote desktop paths and VPN routes, and every signal is listed as evidence.
 - **Circuit and path:** download and upload with provider failover (Cloudflare, then M-Lab, then Vultr), bufferbloat (latency under load), a 3-minute loss and jitter series, traceroutes, carrier-grade NAT and double NAT detection, and who owns the public address.
+- **IPv6:** whether the network offers it (global prefix, router advertisements, IPv6 DNS) and whether it reaches the internet (Cloudflare over IPv6, 10 pings, AAAA lookups). Working, broken (offered but going nowhere, which slows first connections), local only or not offered. Only /64 prefixes are kept, never a full address.
 - **Hosted desktop profiles:** tell it which service the users work in (plain RDP, Azure Virtual Desktop, Windows 365, Citrix Cloud, or your own). It finds the client app, the hosts it talks to, and the round trip that matters, graded against Microsoft's Azure Virtual Desktop guidance.
 - **The PC itself:** hardware age, Windows version, TPM, BitLocker, disk health, RAM and CPU pressure during the run, Wi-Fi signal and drops, docks, monitors and peripherals, installed security and management tools, patch state, RDP disconnects and client crashes from the event logs.
 - **Findings, not just data:** each run ends with findings marked Confirmed, Likely or Possible, a data check that retries anything that failed, and a summary on the clipboard.
@@ -76,7 +77,7 @@ What leaves the PC, and to whom:
 
 | Sent to | What | When |
 |---|---|---|
-| Cloudflare | Your public IP (trace, speed test) | Always |
+| Cloudflare | Your public IP (trace, speed test), and over IPv6 when the PC has it | Always (`$EnableIpv6Check` for the IPv6 trace and pings) |
 | M-Lab | Your public IP; M-Lab publishes every test in its open dataset | Only when Cloudflare's speed test fails |
 | Vultr | A download of a public test file | Only when Cloudflare and M-Lab fail |
 | ipinfo.io, rdap.org | Your public IP | `$EnableIpInfo`, `$EnableOwnerLookup` |
@@ -122,7 +123,7 @@ Install-Module Pester -RequiredVersion 6.2.0 -Scope CurrentUser -Force -SkipPubl
 
 The Pester tests run in CI on Windows, in both Windows PowerShell 5.1 and PowerShell 7:
 
-- **Collector:** the CONFIG defaults (discovery off, no client values), `-Discovery`, `-HostedDesktop` and `-ConfigPath` with a custom profile, each built-in profile's host pattern, tracert and ping parsing, trace analysis (tunnel, double NAT, carrier-grade NAT), every traffic design verdict, the bufferbloat grades, and the other-subnet sweep: subnet parsing, the subnets a PC already knows about, which ones get swept (never an inferred one on its own, never the PC's own), and a real sweep over loopback; the SNMP router and UPS readers (both ARP table layouts, the CIDR and old route tables, UPS-MIB and the APC MIB) and the router step with SNMP mocked; each network risk rule, including the cases it must leave alone (a page that also has HTTPS, a current SSH server, server builds that are still supported). The collector's functions are loaded from the parsed script, so nothing is collected during tests.
+- **Collector:** the CONFIG defaults (discovery off, no client values), `-Discovery`, `-HostedDesktop` and `-ConfigPath` with a custom profile, each built-in profile's host pattern, tracert and ping parsing, trace analysis (tunnel, double NAT, carrier-grade NAT), every traffic design verdict, the bufferbloat grades, and the other-subnet sweep: subnet parsing, the subnets a PC already knows about, which ones get swept (never an inferred one on its own, never the PC's own), and a real sweep over loopback; the SNMP router and UPS readers (both ARP table layouts, the CIDR and old route tables, UPS-MIB and the APC MIB) and the router step with SNMP mocked; each network risk rule, including the cases it must leave alone (a page that also has HTTPS, a current SSH server, server builds that are still supported); and the IPv6 check with the network calls mocked (working, broken, local only, not offered, and that no full address is kept). The collector's functions are loaded from the parsed script, so nothing is collected during tests.
 - **Merge:** fictional runs for a two-office company (`tests/Fixtures.ps1`, documentation IP ranges only) are zipped the way the collector writes them and merged with `-NoEnrich`. The tests check the one-machine report, the two-site report, test laptop detection, shared egress, overlapping bandwidth tests, the hosted desktop round trip, devices swept across routing filed under the site that owns their subnet, and the router addresses, routes and UPS tables.
 
 ### Used in the field
@@ -135,7 +136,7 @@ This tool started as the collector and merge from a real multi-office client ass
 
 **This release against that field data.** The merge in this repository, run on the same six runs (with `-NoEnrich`, and `-TargetHint` because runs from the earlier versions do not record a hosted desktop profile), produces the same sites, verdicts, circuit figures, hosted desktop round trips and test-laptop detection, and the same number of rows in every CSV, as the merge they were made with. The collector in this repository was run in Windows PowerShell 5.1 (discovery and outside lookups off) and merged into a one-machine report. The built-in Azure Virtual Desktop and Windows 365 hosts were checked against Microsoft's "Required FQDNs and endpoints for Azure Virtual Desktop", and the Citrix Cloud domains against Citrix's connectivity pages (November 2026).
 
-**Not exercised yet:** the M-Lab and Vultr bandwidth fallbacks (Cloudflare never failed in the field), the api.macvendors.com lookup, and the built-in Azure Virtual Desktop, Windows 365 and Citrix Cloud profiles against a live tenant. Non-English Windows is untested: ping and tracert output is parsed in English.
+**Not exercised yet:** the M-Lab and Vultr bandwidth fallbacks (Cloudflare never failed in the field), the api.macvendors.com lookup, and the built-in Azure Virtual Desktop, Windows 365 and Citrix Cloud profiles against a live tenant. Added after the field runs and so far tested with fixtures, mocks and a loopback sweep only: sweeping other subnets, the router and UPS tables over SNMP, the network risk flags, and the IPv6 check on a network that has IPv6 (a passive run on an IPv4-only network reported it correctly as not offered). Non-English Windows is untested: ping and tracert output is parsed in English.
 
 ## License
 

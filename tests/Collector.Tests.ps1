@@ -455,3 +455,66 @@ Describe 'Network risks from collected data (Phase C)' {
         @($Risks | ForEach-Object Category | Sort-Object -Unique) | Should -Be @('Network risk')
     }
 }
+
+Describe 'IPv6 (Phase D)' {
+    It 'is on by default, without -Discovery' {
+        (& $Config).EnableIpv6Check | Should -BeTrue
+    }
+    It 'keeps only the /64 of a global address' {
+        ConvertTo-Ipv6Prefix64 '2001:db8:abcd:12:a1b2:c3d4:e5f6:7' | Should -Be '2001:db8:abcd:12::/64'
+        ConvertTo-Ipv6Prefix64 '2001:db8::1%12' | Should -Be '2001:db8:0:0::/64'
+        ConvertTo-Ipv6Prefix64 '10.20.1.25' | Should -BeNullOrEmpty
+        ConvertTo-Ipv6Prefix64 'not an address' | Should -BeNullOrEmpty
+    }
+    It 'tells <A> is <Kind>' -ForEach @(
+        @{ A = '2001:db8::1'; Kind = 'Global' }, @{ A = 'fd12:3456::1'; Kind = 'UniqueLocal' }, @{ A = 'fe80::1%7'; Kind = 'LinkLocal' }, @{ A = '::1'; Kind = 'Other' }
+    ) {
+        Get-Ipv6Kind $A | Should -Be $Kind
+    }
+    It 'calls IPv6 <Expected> when <Case>' -ForEach @(
+        @{ Case = 'it reached the internet'; Expected = 'Working'; State = @{ GlobalPrefixes = @('2001:db8:1:2::/64'); DefaultRoute = $true; Egress = @{ Reached = $true } } }
+        @{ Case = 'a global address cannot get out'; Expected = 'Broken'; State = @{ GlobalPrefixes = @('2001:db8:1:2::/64'); DefaultRoute = $true; Egress = @{ Reached = $false } } }
+        @{ Case = 'only a route is offered'; Expected = 'Broken'; State = @{ GlobalPrefixes = @(); DefaultRoute = $true } }
+        @{ Case = 'only unique-local addresses exist'; Expected = 'Local only'; State = @{ GlobalPrefixes = @(); UniqueLocal = $true; DefaultRoute = $false } }
+        @{ Case = 'nothing is offered'; Expected = 'Not offered'; State = @{ GlobalPrefixes = @(); DefaultRoute = $false } }
+    ) {
+        Get-Ipv6Verdict $State | Should -Be $Expected
+    }
+    It 'checks a working IPv6 path and keeps no full address (network calls mocked)' {
+        Mock Get-NetAdapter { [pscustomobject]@{ ifIndex = 7; Status = 'Up' } }
+        Mock Get-NetIPAddress { @([pscustomobject]@{ InterfaceIndex = 7; AddressState = 'Preferred'; IPAddress = '2001:db8:1:2:a1b2:c3d4:e5f6:7'; SuffixOrigin = 'Random' }, [pscustomobject]@{ InterfaceIndex = 7; AddressState = 'Preferred'; IPAddress = 'fe80::1'; SuffixOrigin = 'Link' }) }
+        Mock Get-NetRoute { [pscustomobject]@{ InterfaceIndex = 7; NextHop = 'fe80::1' } }
+        Mock Get-DnsClientServerAddress { [pscustomobject]@{ InterfaceIndex = 7; ServerAddresses = @('2001:db8:1:2::53') } }
+        Mock Invoke-WebRequest { [pscustomobject]@{ Content = "fl=1`nip=2001:db8:1:2:a1b2:c3d4:e5f6:7`ncolo=ORD`n" } }
+        Mock Resolve-DnsName { [pscustomobject]@{ Type = 'AAAA'; IPAddress = '2606:4700:4700::1111' } }
+        Mock Measure-Ipv6Ping { [ordered]@{ Sent = 10; Received = 10; LossPct = 0; AvgMs = 14.2 } }
+        $s = Get-Ipv6State
+        $s.Status | Should -Be 'Working'
+        $s.GlobalPrefixes | Should -Be @('2001:db8:1:2::/64')
+        $s.TemporaryAddresses | Should -BeTrue
+        $s.RouterIsLinkLocal | Should -BeTrue
+        $s.Egress.SameAsPc | Should -BeTrue
+        $s.Ping.AvgMs | Should -Be 14.2
+        ($s | ConvertTo-Json -Depth 5) | Should -Not -Match 'a1b2:c3d4' -Because 'only /64 prefixes are kept'
+    }
+    It 'does not test the internet path when no IPv6 is offered' {
+        Mock Get-NetAdapter { [pscustomobject]@{ ifIndex = 7; Status = 'Up' } }
+        Mock Get-NetIPAddress { @([pscustomobject]@{ InterfaceIndex = 7; AddressState = 'Preferred'; IPAddress = 'fe80::1'; SuffixOrigin = 'Link' }) }
+        Mock Get-NetRoute { @() }
+        Mock Get-DnsClientServerAddress { @() }
+        Mock Invoke-WebRequest { throw 'should not be called' }
+        Mock Resolve-DnsName { @() }
+        Mock Measure-Ipv6Ping { throw 'should not be called' }
+        (Get-Ipv6State).Status | Should -Be 'Not offered'
+        Should -Invoke Invoke-WebRequest -Times 0 -Exactly
+        Should -Invoke Measure-Ipv6Ping -Times 0 -Exactly
+    }
+    It 'turns the IPv6 state into a finding' {
+        $working = @{ Ipv6 = @{ Status = 'Working'; GlobalPrefixes = @('2001:db8:1:2::/64'); DefaultRoute = $true; RouterIsLinkLocal = $true; Egress = @{ Reached = $true; SameAsPc = $true }; Ping = @{ AvgMs = 14.2; LossPct = 0 } } }
+        (@(Get-AssessmentFindings $working) | Where-Object { $_.Finding -like 'IPv6*' }).Finding | Should -Match 'works here.*14\.2 ms.*no NAT'
+        $broken = @{ Ipv6 = @{ Status = 'Broken'; GlobalPrefixes = @('2001:db8:1:2::/64'); DefaultRoute = $true; Egress = @{ Reached = $false; Error = 'timed out' } } }
+        (@(Get-AssessmentFindings $broken) | Where-Object { $_.Finding -like 'IPv6*' }).Finding | Should -Match 'does not reach the internet'
+        $none = @{ Ipv6 = @{ Status = 'Not offered' } }
+        (@(Get-AssessmentFindings $none) | Where-Object { $_.Finding -like 'IPv6*' }).Finding | Should -Match 'not offered'
+    }
+}

@@ -148,6 +148,7 @@ $EnableVoiceSample  = $true    # 20 s of pings at call pace (50 per second) to e
 $EnableOutboundCheck = $true   # outbound ports to a public test host (portquiz.net) and test names that DNS filters block
 $EnableTlsCheck     = $true    # read who issued the HTTPS certificate for Cloudflare and each remote desktop host (shows HTTPS inspection)
 $EnableIpInfo       = $true    # public IP -> ISP/ASN/city lookup via ipinfo.io
+$EnableIpv6Check    = $true    # is IPv6 offered here, and does it reach the internet (Cloudflare over IPv6, 10 pings, an AAAA lookup)
 $EnableOuiLookup    = $true    # unknown MAC vendor prefixes -> api.macvendors.com (prefix only)
 $EnableBandwidth    = $true    # download/upload test with provider failover (below)
 $BandwidthProviders = @('Cloudflare', 'MLab', 'Vultr')   # tried in order per direction; Vultr is download-only
@@ -2175,6 +2176,87 @@ function Get-NetworkRiskFlags {
     return $out.ToArray()
 }
 
+# ---------------------------------------------------------------------
+# IPv6: is it offered on this network, and does it reach the internet? Addresses are kept as /64
+# prefixes only: the rest of an IPv6 address can identify the machine.
+# ---------------------------------------------------------------------
+function ConvertTo-Ipv6Prefix64 {
+    # The /64 network of a global IPv6 address, as 'xxxx:xxxx:xxxx:xxxx::/64'; $null for anything else.
+    param([string]$Address)
+    $a = "$Address".Split('%')[0]
+    $ip = $null
+    if (-not [Net.IPAddress]::TryParse($a, [ref]$ip) -or $ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6) { return $null }
+    $b = $ip.GetAddressBytes()
+    $groups = for ($i = 0; $i -lt 8; $i += 2) { '{0:x}' -f (([int]$b[$i] -shl 8) + [int]$b[$i + 1]) }
+    return (($groups -join ':') + '::/64')
+}
+
+function Get-Ipv6Kind {
+    # Global (2000::/3), unique local (fc00::/7), link-local (fe80::/10) or other.
+    param([string]$Address)
+    $a = "$Address".Split('%')[0].ToLower()
+    if ($a -match '^fe[89ab][0-9a-f]:') { return 'LinkLocal' }
+    if ($a -match '^f[cd][0-9a-f]{2}:') { return 'UniqueLocal' }
+    if ($a -match '^[23][0-9a-f]{3}:') { return 'Global' }
+    return 'Other'
+}
+
+function Get-Ipv6Verdict {
+    # Not offered, Local only, Working or Broken, from what the PC holds and whether IPv6 reached the internet.
+    param($State)
+    $global = @(@(Get-Prop $State 'GlobalPrefixes') | Where-Object { $_ }).Count
+    $ula = [bool](Get-Prop $State 'UniqueLocal')
+    $route = [bool](Get-Prop $State 'DefaultRoute')
+    $reached = [bool](Get-Prop $State 'Egress', 'Reached')
+    if ($reached) { return 'Working' }
+    if ($global -or $route) { return 'Broken' }
+    if ($ula) { return 'Local only' }
+    return 'Not offered'
+}
+
+function Measure-Ipv6Ping {
+    # $Count pings to an IPv6 address, 100 ms apart: Sent, Received, LossPct, AvgMs.
+    param([string]$Address, [int]$Count = 10)
+    $times = @()
+    try {
+        $pg = New-Object Net.NetworkInformation.Ping
+        for ($k = 0; $k -lt $Count; $k++) { try { $rp = $pg.Send([Net.IPAddress]::Parse($Address), 1000); if ($rp.Status -eq 'Success') { $times += [int]$rp.RoundtripTime } } catch { }; Start-Sleep -Milliseconds 100 }
+    } catch { }
+    return [ordered]@{ Sent = $Count; Received = $times.Count; LossPct = [math]::Round(100 * ($Count - $times.Count) / [math]::Max(1, $Count), 1); AvgMs = $(if ($times.Count) { [math]::Round(($times | Measure-Object -Average).Average, 1) } else { $null }) }
+}
+
+function Get-Ipv6State {
+    # What this PC holds (addresses on adapters that are up, a default route, IPv6 DNS servers) and a test:
+    # Cloudflare's trace over IPv6, ten pings and an AAAA lookup.
+    $s = [ordered]@{ GlobalPrefixes = @(); TemporaryAddresses = $false; UniqueLocal = $false; DefaultRoute = $false; RouterIsLinkLocal = $null; DnsServers = @(); Egress = $null; Ping = $null; AaaaLookup = $null; Status = $null }
+    $up = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $_.ifIndex })
+    $addrs = @(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object { $up -contains $_.InterfaceIndex -and "$($_.AddressState)" -eq 'Preferred' })
+    $glob = @($addrs | Where-Object { (Get-Ipv6Kind $_.IPAddress) -eq 'Global' })
+    $s.GlobalPrefixes = @($glob | ForEach-Object { ConvertTo-Ipv6Prefix64 $_.IPAddress } | Where-Object { $_ } | Sort-Object -Unique)
+    $s.TemporaryAddresses = [bool]@($glob | Where-Object { "$($_.SuffixOrigin)" -eq 'Random' }).Count
+    $s.UniqueLocal = [bool]@($addrs | Where-Object { (Get-Ipv6Kind $_.IPAddress) -eq 'UniqueLocal' }).Count
+    $rt = @(Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Where-Object { $up -contains $_.InterfaceIndex })
+    $s.DefaultRoute = [bool]$rt.Count
+    if ($rt.Count) { $s.RouterIsLinkLocal = ((Get-Ipv6Kind "$($rt[0].NextHop)") -eq 'LinkLocal') }
+    $s.DnsServers = @(Get-DnsClientServerAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object { $up -contains $_.InterfaceIndex } | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ -and $_ -notlike 'fec0:*' } | Sort-Object -Unique)
+    if ($s.GlobalPrefixes.Count -or $s.DefaultRoute) {
+        $eg = [ordered]@{ Reached = $false; Prefix = $null; SameAsPc = $null; Colo = $null; Error = $null }
+        try {
+            $t = Invoke-WebRequest -Uri 'https://[2606:4700:4700::1111]/cdn-cgi/trace' -UseBasicParsing -TimeoutSec 8
+            $h = @{}; foreach ($l in ($t.Content -split "`n")) { if ($l -match '^([a-z_]+)=(.*)$') { $h[$matches[1]] = $matches[2].Trim() } }
+            if ($h['ip'] -and (Get-Ipv6Kind $h['ip']) -eq 'Global') {
+                $eg.Reached = $true; $eg.Prefix = ConvertTo-Ipv6Prefix64 $h['ip']; $eg.Colo = $h['colo']
+                $eg.SameAsPc = ($s.GlobalPrefixes -contains $eg.Prefix)
+            }
+        } catch { $eg.Error = $_.Exception.Message }
+        $s.Egress = $eg
+        $s.Ping = Measure-Ipv6Ping '2606:4700:4700::1111' 10
+    }
+    try { $s.AaaaLookup = [bool]@(Resolve-DnsName -Name 'one.one.one.one' -Type AAAA -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'AAAA' }).Count } catch { $s.AaaaLookup = $false }
+    $s.Status = Get-Ipv6Verdict $s
+    return $s
+}
+
 function Get-AssessmentFindings {
     # Turns the collected evidence into plain statements, each with what it rests on and how sure it is:
     # Confirmed (measured directly), Likely (several signs agree), Possible (one sign, or an inference).
@@ -2659,6 +2741,31 @@ function Get-AssessmentFindings {
         }
     }
 
+    # ---- IPv6 ----
+    $v6 = Get-Prop $R 'Ipv6'
+    $v6s = "$(Get-Prop $v6 'Status')"
+    if ($v6s) {
+        $pre = @(@(Get-Prop $v6 'GlobalPrefixes') | Where-Object { $_ })
+        $ev6 = @($(if ($pre.Count) { "Global prefix(es): $($pre -join ', ')$(if (Get-Prop $v6 'TemporaryAddresses') { ' (privacy addresses in use)' })" }),
+                 $(if (Get-Prop $v6 'DefaultRoute') { "IPv6 default route$(if (Get-Prop $v6 'RouterIsLinkLocal') { ' via the router''s link-local address (router advertisements)' })" } else { 'No IPv6 default route' }),
+                 $(if (@(Get-Prop $v6 'DnsServers').Count) { "IPv6 DNS servers: $((@(Get-Prop $v6 'DnsServers')) -join ', ')" }),
+                 $(if ($null -ne (Get-Prop $v6 'AaaaLookup')) { "IPv6 (AAAA) name lookups: $(if (Get-Prop $v6 'AaaaLookup') { 'answered' } else { 'no answer' })" }))
+        if ($v6s -eq 'Working') {
+            $ms = Get-Prop $v6 'Ping', 'AvgMs'
+            $t = "IPv6 works here: this PC reaches the internet over IPv6$(if ($null -ne $ms) { " in $ms ms (Cloudflare, $(Get-Prop $v6 'Ping', 'LossPct')% loss)" })."
+            if (Get-Prop $v6 'Egress', 'SameAsPc') { $t += ' It leaves from its own address, with no NAT: inbound IPv6 is held back only by the firewall''s IPv6 rules, so they need the same care as the IPv4 ones.' }
+            $ob = Get-Prop $R 'Outbound'
+            if (@(Get-Prop $ob 'DnsTests').Count) { $t += ' The DNS filtering test above ran over IPv4 only.' }
+            & $add 'Internet service' 'Confirmed' $t $ev6
+        } elseif ($v6s -eq 'Broken') {
+            & $add 'Internet service' 'Confirmed' "IPv6 is offered here but does not reach the internet. Apps try IPv6 first and wait for it to fail, which shows up as slow first connections; fix the IPv6 path or stop advertising it." @($ev6 + @("Cloudflare over IPv6: $(if (Get-Prop $v6 'Egress', 'Error') { Get-Prop $v6 'Egress', 'Error' } else { 'no answer' })"))
+        } elseif ($v6s -eq 'Local only') {
+            & $add 'Internet service' 'Confirmed' 'Only unique-local IPv6 addresses are in use here (no global prefix and no IPv6 route out): IPv6 works inside the network only.' $ev6
+        } else {
+            & $add 'Internet service' 'Confirmed' 'IPv6 is not offered on this network: everything runs over IPv4.' $ev6
+        }
+    }
+
     # ---- Gateway port mapping ----
     $gs = Get-Prop $R 'GatewayServices'
     if ($gs) {
@@ -2874,7 +2981,7 @@ $Result['Meta'] = [ordered]@{
         SubnetSweep = $EnableSubnetSweep; GatewayProbe = $EnableGatewayProbe; IpInfo = $EnableIpInfo
         FirewallPorts = $EnableFirewallPorts; Ssdp = $EnableSsdp; PrinterProbe = $EnablePrinterProbe
         SweepPorts = $EnableSweepPorts; RemoteSweep = $EnableRemoteSweep; TlsCheck = $EnableTlsCheck
-        OuiLookup = $EnableOuiLookup; Bandwidth = $EnableBandwidth; BandwidthSeconds = $BandwidthSeconds
+        OuiLookup = $EnableOuiLookup; Ipv6Check = $EnableIpv6Check; Bandwidth = $EnableBandwidth; BandwidthSeconds = $BandwidthSeconds
         BandwidthStreams = $BandwidthStreams; MaxTestMB = $MaxTestMB; PingCount = $PingCount; LookbackDays = $LookbackDays
         BandwidthRounds = $BandwidthRounds; VendorDiscovery = $EnableVendorDiscovery; MulticastDiscovery = $EnableMulticastDiscovery
         Snmp = $EnableSnmp; ModemPage = $EnableModemPage; WindowsBuild = $EnableWindowsBuild; DnsTiming = $EnableDnsTiming; CloudCheck = $EnableCloudCheck
@@ -4596,6 +4703,7 @@ $EgressBlock = {
     $out
 }
 $Result['Egress'] = Invoke-Collector 'Public egress (Cloudflare, ipinfo)' $EgressBlock
+if ($EnableIpv6Check) { $Result['Ipv6'] = Invoke-Collector 'IPv6 (offered here, reaches the internet?)' { Get-Ipv6State } }
 
 $Result['RdpPath'] =Invoke-Collector 'RDP host DNS and TCP timing' {
     $rows = @()
@@ -6543,6 +6651,7 @@ $Result['Findings'] = $script:Findings
 
 # ---------------- Flags ----------------
 try {
+    if ("$(Get-Prop $Result 'Ipv6', 'Status')" -eq 'Broken') { Add-Flag 'Medium' 'Network' 'IPv6 is offered but does not reach the internet (slow first connections)' }
     foreach ($rf in @(Get-NetworkRiskFlags $Result)) { Add-Flag $rf.Severity $rf.Category $rf.Message }
     foreach ($sd in @(Get-Val $Result['Snmp'] 'Devices')) {
         $u = Get-Prop $sd 'Ups'
@@ -6714,6 +6823,7 @@ Add-Line ('=' * 72)
 Add-Line ("SITE ASSESSMENT  {0}  /  {1}" -f $SiteName, $env:COMPUTERNAME)
 Add-Line ("Run {0}  ({1} s)  by {2}  user {3}" -f $Result['Meta']['RunStart'], $Result['Meta']['RunSeconds'], $currentId.Name, $script:UserName)
 Add-Line ("Admin tier: {0}" -f $(if ($script:AdminActive) { 'ACTIVE' } else { 'off' }))
+if (Get-Prop $Result 'Ipv6', 'Status') { Add-Line ("IPv6: {0}{1}" -f (Get-Prop $Result 'Ipv6', 'Status'), $(if ($null -ne (Get-Prop $Result 'Ipv6', 'Ping', 'AvgMs')) { " ($(Get-Prop $Result 'Ipv6', 'Ping', 'AvgMs') ms to Cloudflare)" })) }
 if ($Notes) { Add-Line "Notes: $Notes" }
 Add-Line ('=' * 72)
 Add-Line ''
