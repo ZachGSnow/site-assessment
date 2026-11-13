@@ -169,3 +169,20 @@ Describe 'Network risks in the merged report' {
         ($Fl | Where-Object { $_.Category -eq 'Network risk' } | Select-Object -First 1).Scope | Should -Be 'Site'
     }
 }
+
+Describe 'IPv6 in the merged report' {
+    BeforeAll {
+        $script:Eps6 = @(Import-Csv (Join-Path $MultiOut 'Endpoints.csv'))
+        $script:Sites6 = @(Import-Csv (Join-Path $MultiOut 'Sites.csv'))
+    }
+    It 'records each machine''s IPv6 state, prefix and round trip' {
+        $e = $Eps6 | Where-Object Hostname -eq 'NW-FRONT01'
+        $e.Ipv6 | Should -Be 'Working'
+        $e.Ipv6Prefix | Should -Be '2001:db8:20:1::/64'
+        $e.Ipv6Ms | Should -Be '14.2'
+    }
+    It 'rolls it up per site, showing every state its machines saw' {
+        ($Sites6 | Where-Object Site -eq 'Main office').Ipv6 | Should -Be 'Not offered, Working' -Because 'one PC there has IPv6 and two do not'
+        ($Sites6 | Where-Object Site -eq 'Warehouse').Ipv6 | Should -Be 'Not offered'
+    }
+}

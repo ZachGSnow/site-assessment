@@ -346,6 +346,7 @@ foreach ($r in $runs) {
         RdpUnexpectedDisconnects = V $rdpc 'UnexpectedDisconnects'; RdpNetworkDisconnects = V $rdpc 'NetworkDisconnects'; RdpUdp = V $udpInfo 'Status'
         HostedTarget = $(if ($avSeries) { '{0}{1}' -f $avSeries.Target, $(if (V $avSeries 'Port') { " tcp/$($avSeries.Port)" } else { ' (ping)' }) }); HostedAvgMs = V $avSeries 'AvgMs'; HostedLossPct = V $avSeries 'LossPct'; HostedJitterMs = V $avSeries 'JitterMs'
         DataCheck = $dataCheck; DataIssues = $dataIssues
+        Ipv6 = V (V $r 'Ipv6') 'Status'; Ipv6Prefix = J @(V (V $r 'Ipv6') 'GlobalPrefixes') ', '; Ipv6Ms = V (V (V $r 'Ipv6') 'Ping') 'AvgMs'
         BandwidthStarted = V $bw 'StartedAt'; BandwidthFinished = V $bw 'FinishedAt'; HttpsInspection = $httpsInspection
         ServersUsed = J ($srvList | ForEach-Object { '{0} [{1}]' -f $_.Name, $_.Location })
         HostedDesktopApp = J (@(V (V $r.Rdp 'HostedDesktopApp') 'Executables') | ForEach-Object { if ($_) { '{0} {1}' -f (Split-Path $_.Path -Leaf), $_.Version } })
@@ -1038,6 +1039,7 @@ foreach ($g in ($endpoints | Group-Object Site | Sort-Object Name)) {
         KnownSubnets = $siteSubnets.Count; LocalSubnets = J $localSets ', '
         RouterWan = J @($routerAddr | Where-Object { $_.Site -eq $g.Name -and $_.Class -eq 'Public' } | ForEach-Object { if ($_.Owner) { '{0} ({1})' -f $_.Address, $_.Owner } else { $_.Address } } | Sort-Object -Unique) ', '
         UpsCount = @($upsRows | Where-Object { $_.Site -eq $g.Name }).Count
+        Ipv6 = J @($eps | ForEach-Object { $_.Ipv6 } | Where-Object { $_ } | Sort-Object -Unique) ', '
         ExposedPorts = J (@($ips | ForEach-Object { $x = $exposure[$_]; if ($x -and $x.Listed) { "$($_): $(@($x.Ports) -join ' ')" } elseif ($x -and -not $x.Error) { "$($_): none listed" } }))
         Notes = J $notes
     }
@@ -1671,6 +1673,7 @@ foreach ($s in $sites) {
         'Wired median down', $(if ($null -ne $s.WiredMedianDown) { "$($s.WiredMedianDown) Mbps" }), 'Wi-Fi median down', $(if ($null -ne $s.WifiMedianDown) { "$($s.WifiMedianDown) Mbps" }),
         'Firewall', $s.FirewallModel, 'Gateway MAC vendor', $s.GatewayVendors, 'Firewall (admin ports)', $s.FirewallHints, 'VPN client vendor on PCs', $s.VpnClientVendors,
         'Router WAN address (SNMP)', $(if ($s.RouterWan) { $s.RouterWan } else { $null }),
+        'IPv6', $(if ($s.Ipv6) { $s.Ipv6 } else { 'not checked' }),
         'Wireless', $(if ($s.ApVendors) { "$($s.ApVendors) ($($s.ApBssids) BSSIDs seen)" } else { 'not identified' }), 'Switching', $(if ($s.Switches) { $s.Switches } else { 'not identified (needs admin run on a wired machine)' }))
     [void]$body.Append((New-Panel 'Site facts' ($facts + "<h4>Topology: $(Enc $s.Verdict)</h4>" + $ev.ToString())))
 
@@ -1727,6 +1730,7 @@ foreach ($s in $sites) {
             "$HostedLabel round trip", $(if ($null -ne $e.HostedAvgMs) { "$($e.HostedAvgMs) ms avg, $($e.HostedLossPct)% loss, $($e.HostedJitterMs) ms jitter ($($e.HostedTarget))" }),
             'Connection', "$($e.Connection) $(if ($e.LinkMbps) { "($($e.LinkMbps) Mbps link)" })", 'Subnet', $e.LocalSubnet, 'Public IP', $e.PublicIP,
             'Adapter power saving', $e.AdapterPowerSaving,
+            'IPv6', $(if ($e.Ipv6) { "$($e.Ipv6)$(if ($e.Ipv6Prefix) { ", $($e.Ipv6Prefix)" })$(if ($null -ne $e.Ipv6Ms -and "$($e.Ipv6Ms)" -ne '') { ", $($e.Ipv6Ms) ms" })" }),
             'Topology verdict', "$($e.Verdict) ($($e.Confidence))", 'HTTPS inspection', $e.HttpsInspection, 'Data check', $e.DataCheck, 'Data gaps', $e.DataIssues)))
         $isTest = ($e.Role -eq 'Test laptop')
         if ($isTest) { [void]$mb.Append('<div class="note"><b>Visiting test laptop, not a client PC.</b> Its bandwidth, traceroute and latency results describe this site. Its own hardware, software, printers, history and unrelated RDP targets are left out of this report; the zip from the run still holds them.</div>') }
