@@ -290,6 +290,7 @@ function Get-OwnerSite {
 }
 
 $endpoints = @(); $printers = @(); $periph = @(); $gear = @(); $flags = @(); $deviceFlags = @()
+$routerAddr = @(); $routeRows = @(); $upsRows = @()
 $runFindings = @(); $devices = @()
 $software = @(); $traceRows = @(); $pingRows = @(); $rdpRows = @()
 foreach ($r in $runs) {
@@ -423,6 +424,24 @@ foreach ($r in $runs) {
             $ports = @(V $dv 'OpenPorts') | Where-Object { $_ }
             $detail = J @((V $dv 'Role'), $(if (@($ports).Count) { 'ports ' + (@($ports) -join ',') }), $(if ($dv.RespondedToPing) { 'answers ping' } else { 'ARP only' }))
             $gear += [pscustomobject][ordered]@{ Site = $site; SeenFrom = $hostName; Type = 'Subnet device'; Name = V $dv 'Name'; IP = $dv.IP; Mac = $dv.Mac; Vendor = $dv.Vendor; Detail = $detail }
+        }
+    }
+    foreach ($sd in @(V (V $r 'Snmp') 'Devices')) {
+        if (-not $sd) { continue }
+        $owner = Get-OwnerSite "$($sd.IP)"
+        $sdSite = if ($owner) { $owner } else { $site }
+        $sdName = if (V $sd 'SysName') { V $sd 'SysName' } else { "$($sd.IP)" }
+        $rt = V $sd 'Router'; $ups = V $sd 'Ups'
+        $type = if ($rt) { 'Router (SNMP)' } elseif ($ups) { 'UPS (SNMP)' } elseif (@(V $sd 'Ports').Count -ge 5) { 'Switch (SNMP)' } elseif (V $sd 'Printer') { 'Printer (SNMP)' } else { 'SNMP device' }
+        $upsText = if ($ups) { J @("battery $(V $ups 'Battery')", $(if ($null -ne (V $ups 'ChargePct')) { "$(V $ups 'ChargePct')% charged" }), $(if ($null -ne (V $ups 'MinutesRemaining')) { "$(V $ups 'MinutesRemaining') min runtime" }), $(if ($null -ne (V $ups 'LoadPct')) { "$(V $ups 'LoadPct')% load" }), $(if (V $ups 'OnBattery') { 'ON BATTERY' }), $(if (V $ups 'ReplaceBattery') { 'replace battery' })) ', ' }
+        $detail = J @((V $sd 'Model'), $(if (V $sd 'Serial') { "serial $(V $sd 'Serial')" }), (V $sd 'PortSummary'), $(if ($null -ne (V $sd 'PoeWattsUsed')) { "PoE $(V $sd 'PoeWattsUsed') of $(V $sd 'PoeWattsBudget') W" }), $(if ($rt -and @(V $rt 'WanAddresses').Count) { "WAN $(J @(V $rt 'WanAddresses') ', ')" }), $(if ($rt) { "$(@(V $rt 'Arp').Count) ARP entries, $(@(V $rt 'Routes').Count) routes" }), $upsText, $(if (-not (V $sd 'Model')) { "$(V $sd 'SysDescr')".Substring(0, [math]::Min(80, "$(V $sd 'SysDescr')".Length)) })) '; '
+        $gear += [pscustomobject][ordered]@{ Site = $sdSite; SeenFrom = $(if ($sdSite -ne $site) { "$hostName at $site" } else { $hostName }); Type = $type; Name = $sdName; IP = $sd.IP; Mac = $null; Vendor = $null; Detail = $detail }
+        if ($rt) {
+            foreach ($a in @(V $rt 'Addresses')) { if ($a) { $routerAddr += [pscustomobject][ordered]@{ Site = $sdSite; Router = $sdName; RouterIP = $sd.IP; Address = $a.IP; Prefix = $a.Prefix; IfIndex = $a.IfIndex; Class = $a.Class; Owner = $null; SeenFrom = $hostName } } }
+            foreach ($rr0 in @(V $rt 'Routes')) { if ($rr0) { $routeRows += [pscustomobject][ordered]@{ Site = $sdSite; Router = $sdName; RouterIP = $sd.IP; Destination = $rr0.Destination; Prefix = $rr0.Prefix; NextHop = $rr0.NextHop; SeenFrom = $hostName } } }
+        }
+        if ($ups) {
+            $upsRows += [pscustomobject][ordered]@{ Site = $sdSite; Name = $sdName; IP = $sd.IP; Manufacturer = V $ups 'Manufacturer'; Model = V $ups 'Model'; Battery = V $ups 'Battery'; ChargePct = V $ups 'ChargePct'; MinutesRemaining = V $ups 'MinutesRemaining'; LoadPct = V $ups 'LoadPct'; OnBattery = V $ups 'OnBattery'; ReplaceBattery = V $ups 'ReplaceBattery'; SeenFrom = $hostName }
         }
     }
     foreach ($dv in @(V $r.RemoteSweep 'Devices')) {
@@ -727,6 +746,7 @@ if (-not $NoEnrich) {
     foreach ($r in $runs) {
         $sn = $siteDisplay[$r._SiteKey]
         Add-IpSeen (V $r.Egress 'PublicIPv4') "$sn public IP"
+        foreach ($sd in @(V (V $r 'Snmp') 'Devices')) { if ($sd) { foreach ($w in @(V (V $sd 'Router') 'WanAddresses')) { if ($w) { Add-IpSeen $w "WAN address of router $(if (V $sd 'SysName') { V $sd 'SysName' } else { $sd.IP }) ($sn)" } } } }
         foreach ($t in @($r.Traceroutes)) { if ($t) { foreach ($hp in @($t.Hops)) { if ($hp -and $hp.IP) { Add-IpSeen $hp.IP "$sn traceroute hop" } } } }
         foreach ($rp in @($r.RdpPath)) { if ($rp) { foreach ($a in @($rp.ResolvedIPs)) { Add-IpSeen $a "RDP target $($rp.Host)" } } }
         foreach ($p in @($r.TcpSeries)) { if ($p) { Add-IpSeen (V $p 'Address') "RDP target $($p.Target)" } }
@@ -872,6 +892,11 @@ if (-not $NoEnrich) {
         $e | Add-Member -NotePropertyName PublicIpNetwork -NotePropertyValue $(if ($i) { $i.Network }) -Force
         $e | Add-Member -NotePropertyName PublicIpRegisteredTo -NotePropertyValue $(if ($i -and $i.RegisteredTo) { '{0}{1}' -f $i.RegisteredTo, $(if ($i.NetName) { " (block $($i.NetName), $($i.Range))" }) }) -Force
     }
+    foreach ($ra in $routerAddr) {
+        if ($ra.Class -ne 'Public') { continue }
+        $i = $ipInfo["$($ra.Address)"]
+        if ($i) { $ra.Owner = J @($(if ($i.RegisteredTo) { $i.RegisteredTo }), $(if ($i.Network) { $i.Network })) ', ' }
+    }
     # ---- What the internet can see on each site's public address: Shodan's InternetDB (free, no key).
     # Only the sites' own public IP addresses are sent. Answers are kept for 7 days.
     $expCachePath = Join-Path $CacheDir 'exposure.json'
@@ -1009,6 +1034,8 @@ foreach ($g in ($endpoints | Group-Object Site | Sort-Object Name)) {
         Win10Count = @($eps | Where-Object { $_.IsWin10 -and $_.Role -ne 'Test laptop' }).Count
         HighFlags = $high; MediumFlags = $med
         KnownSubnets = $siteSubnets.Count; LocalSubnets = J $localSets ', '
+        RouterWan = J @($routerAddr | Where-Object { $_.Site -eq $g.Name -and $_.Class -eq 'Public' } | ForEach-Object { if ($_.Owner) { '{0} ({1})' -f $_.Address, $_.Owner } else { $_.Address } } | Sort-Object -Unique) ', '
+        UpsCount = @($upsRows | Where-Object { $_.Site -eq $g.Name }).Count
         ExposedPorts = J (@($ips | ForEach-Object { $x = $exposure[$_]; if ($x -and $x.Listed) { "$($_): $(@($x.Ports) -join ' ')" } elseif ($x -and -not $x.Error) { "$($_): none listed" } }))
         Notes = J $notes
     }
@@ -1019,6 +1046,9 @@ $sites | Export-Csv (Join-Path $OutDir 'Sites.csv') -NoTypeInformation
 $printers | Export-Csv (Join-Path $OutDir 'Printers.csv') -NoTypeInformation
 $periph | Export-Csv (Join-Path $OutDir 'Peripherals.csv') -NoTypeInformation
 $gear | Export-Csv (Join-Path $OutDir 'NetworkGear.csv') -NoTypeInformation
+$routerAddr | Export-Csv (Join-Path $OutDir 'RouterAddresses.csv') -NoTypeInformation
+$routeRows | Export-Csv (Join-Path $OutDir 'Routes.csv') -NoTypeInformation
+$upsRows | Export-Csv (Join-Path $OutDir 'Ups.csv') -NoTypeInformation
 @($flags) + @($deviceFlags) | Export-Csv (Join-Path $OutDir 'Flags.csv') -NoTypeInformation
 $software | Export-Csv (Join-Path $OutDir 'Software.csv') -NoTypeInformation
 $traceRows | Export-Csv (Join-Path $OutDir 'Traceroutes.csv') -NoTypeInformation
@@ -1638,6 +1668,7 @@ foreach ($s in $sites) {
         'Public IP registered to (whois)', (J (@($eps | ForEach-Object { V $_ 'PublicIpRegisteredTo' } | Where-Object { $_ } | Sort-Object -Unique))),
         'Wired median down', $(if ($null -ne $s.WiredMedianDown) { "$($s.WiredMedianDown) Mbps" }), 'Wi-Fi median down', $(if ($null -ne $s.WifiMedianDown) { "$($s.WifiMedianDown) Mbps" }),
         'Firewall', $s.FirewallModel, 'Gateway MAC vendor', $s.GatewayVendors, 'Firewall (admin ports)', $s.FirewallHints, 'VPN client vendor on PCs', $s.VpnClientVendors,
+        'Router WAN address (SNMP)', $(if ($s.RouterWan) { $s.RouterWan } else { $null }),
         'Wireless', $(if ($s.ApVendors) { "$($s.ApVendors) ($($s.ApBssids) BSSIDs seen)" } else { 'not identified' }), 'Switching', $(if ($s.Switches) { $s.Switches } else { 'not identified (needs admin run on a wired machine)' }))
     [void]$body.Append((New-Panel 'Site facts' ($facts + "<h4>Topology: $(Enc $s.Verdict)</h4>" + $ev.ToString())))
 
@@ -1666,6 +1697,14 @@ foreach ($s in $sites) {
     if ($remoteGear.Count) { $gearBody += (New-Section ("Devices on other subnets, swept across routing ({0})" -f $remoteGear.Count) (New-Table $remoteGear @('IP', 'Name', 'Detail|Type, open ports and subnet', 'SeenFrom|Found from')) -Open:($remoteGear.Count -le 40)) }
     if ($sweep.Count) { $gearBody += (New-Section ("Subnet sweep devices ({0})" -f $sweep.Count) (New-Table $sweep @('IP', 'Name', 'Detail|Type and open ports', 'Vendor', 'Mac|MAC', 'SeenFrom|Seen from')) -Open:($sweep.Count -le 40)) }
     [void]$body.Append((New-Section 'Network equipment' $gearBody -Badge ("{0} items" -f $siteGear.Count)))
+    $siteRa = @($routerAddr | Where-Object Site -eq $name); $siteRoutes = @($routeRows | Where-Object Site -eq $name); $siteUps = @($upsRows | Where-Object Site -eq $name)
+    if ($siteRa.Count -or $siteUps.Count) {
+        $rb = ''
+        if ($siteRa.Count) { $rb += '<h4>Router addresses (a public one is the circuit)</h4>' + (New-Table $siteRa @('Router', 'RouterIP|Router IP', 'Address', 'Prefix', 'Class', 'Owner|Registered to / network', 'SeenFrom|Read from')) }
+        if ($siteRoutes.Count) { $rb += (New-Section ("Routes ({0})" -f $siteRoutes.Count) (New-Table $siteRoutes @('Router', 'Destination', 'Prefix', 'NextHop|Next hop')) -Open:($siteRoutes.Count -le 25)) }
+        if ($siteUps.Count) { $rb += '<h4>UPS</h4>' + (New-Table $siteUps @('Name', 'IP', 'Manufacturer', 'Model', 'Battery', 'ChargePct|Charge %', 'MinutesRemaining|Runtime min', 'LoadPct|Load %', 'OnBattery|On battery', 'ReplaceBattery|Replace battery')) }
+        [void]$body.Append((New-Section 'Routers and UPS (SNMP)' $rb -Badge ("{0} routers, {1} UPS" -f @($siteRa | ForEach-Object RouterIP | Sort-Object -Unique).Count, $siteUps.Count)))
+    }
 
     $sn = @($subnets | Where-Object Site -eq $name)
     $snBody = '<p class="muted">Assembled from data each machine already collected (adapter address and mask, route table, printer ports, DNS/DHCP servers, private traceroute hops, RDP lookups). Nothing was scanned to build this list. "Inferred /24" means only an address was seen, so the real mask is unknown.</p>'

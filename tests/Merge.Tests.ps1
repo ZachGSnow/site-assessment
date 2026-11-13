@@ -128,3 +128,34 @@ Describe 'Devices swept across routing' {
         $Html | Should -Match 'Devices on other subnets, swept across routing \(2\)'
     }
 }
+
+Describe 'Router and UPS tables in the report' {
+    BeforeAll {
+        $script:Ra = @(Import-Csv (Join-Path $MultiOut 'RouterAddresses.csv'))
+        $script:Rt = @(Import-Csv (Join-Path $MultiOut 'Routes.csv'))
+        $script:Ups = @(Import-Csv (Join-Path $MultiOut 'Ups.csv'))
+        $script:Gear = @(Import-Csv (Join-Path $MultiOut 'NetworkGear.csv'))
+        $script:Html = [IO.File]::ReadAllText((Join-Path $MultiOut 'Report.html'))
+    }
+    It 'lists the router''s addresses with the WAN side marked public' {
+        ($Ra | Where-Object Address -eq '203.0.113.42').Class | Should -Be 'Public'
+        ($Ra | Where-Object Address -eq '203.0.113.42').Site | Should -Be 'Main office'
+    }
+    It 'lists the routes' {
+        $Rt.Count | Should -Be 2
+        ($Rt | Where-Object Destination -eq '10.20.2.0').NextHop | Should -Be '10.20.1.254'
+    }
+    It 'lists the UPS and that it is on battery' {
+        $Ups.Count | Should -Be 1
+        $Ups[0].OnBattery | Should -Be 'True'
+        $Ups[0].MinutesRemaining | Should -Be '12'
+    }
+    It 'adds SNMP devices to the network equipment' {
+        ($Gear | Where-Object { $_.Type -eq 'Router (SNMP)' }).Name | Should -Be 'nw-fw01'
+        ($Gear | Where-Object { $_.Type -eq 'UPS (SNMP)' }).Detail | Should -Match 'ON BATTERY'
+    }
+    It 'shows the router''s WAN address in the site facts and a routers section' {
+        $Html | Should -Match 'Router WAN address \(SNMP\)'
+        $Html | Should -Match 'Routers and UPS \(SNMP\)'
+    }
+}

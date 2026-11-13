@@ -1987,6 +1987,133 @@ function Invoke-RemoteSweep {
     }
 }
 
+# ---------------------------------------------------------------------
+# Router and UPS tables over SNMP (read only, same community as the rest of the SNMP step).
+# The parsers take the rows Invoke-SnmpWalk returns (Index = the OID part after the column).
+# ---------------------------------------------------------------------
+function ConvertFrom-SnmpMac {
+    # A MAC from an SNMP octet string; $null unless it is six bytes that are not all zero.
+    param($Value)
+    $v = "$Value".Trim().ToUpper() -replace ':', '-'
+    if ($v -notmatch '^([0-9A-F]{2}-){5}[0-9A-F]{2}$' -or $v -eq '00-00-00-00-00-00' -or $v -eq 'FF-FF-FF-FF-FF-FF') { return $null }
+    return $v
+}
+
+function ConvertFrom-ArpRows {
+    # ipNetToMediaPhysAddress (1.3.6.1.2.1.4.22.1.2, index ifIndex.a.b.c.d) or ipNetToPhysicalPhysAddress
+    # (1.3.6.1.2.1.4.35.1.4, index ifIndex.1.4.a.b.c.d for IPv4) -> IP, Mac, IfIndex.
+    param($Rows)
+    $out = @()
+    foreach ($r in @($Rows)) {
+        if (-not $r) { continue }
+        $p = @("$($r.Index)" -split '\.')
+        $ip = $null
+        if ($p.Count -eq 5) { $ip = ($p[1..4]) -join '.' }
+        elseif ($p.Count -eq 7 -and $p[1] -eq '1' -and $p[2] -eq '4') { $ip = ($p[3..6]) -join '.' }
+        $mac = ConvertFrom-SnmpMac $r.Value
+        if ($ip -and $mac) { $out += [pscustomobject]@{ IP = $ip; Mac = $mac; IfIndex = [int]$p[0] } }
+    }
+    return $out
+}
+
+function ConvertFrom-AddrRows {
+    # ipAdEntIfIndex (1.3.6.1.2.1.4.20.1.2) and ipAdEntNetMask (1.3.6.1.2.1.4.20.1.3), both indexed by the
+    # address -> IP, Mask, Prefix, IfIndex, Class. Loopback addresses are left out.
+    param($IfRows, $MaskRows)
+    $masks = @{}; foreach ($m in @($MaskRows)) { if ($m) { $masks["$($m.Index)"] = "$($m.Value)" } }
+    $out = @()
+    foreach ($r in @($IfRows)) {
+        if (-not $r -or -not (Test-IPv4 "$($r.Index)") -or "$($r.Index)" -like '127.*') { continue }
+        $mk = $masks["$($r.Index)"]; $pre = $null
+        if (Test-IPv4 $mk) { $pre = 0; $mi = ConvertTo-IpNumber $mk; for ($bit = 31; $bit -ge 0; $bit--) { if (($mi -shr $bit) -band 1) { $pre++ } else { break } } }
+        $out += [pscustomobject]@{ IP = "$($r.Index)"; Mask = $mk; Prefix = $pre; IfIndex = [int]$r.Value; Class = (Get-IpClass "$($r.Index)") }
+    }
+    return $out
+}
+
+function ConvertFrom-RouteRows {
+    # ipCidrRouteNextHop (1.3.6.1.2.1.4.24.4.1.4, index dest.mask.tos.nexthop) -> Destination, Prefix, NextHop.
+    # Or, with -Legacy, ipRouteNextHop (1.3.6.1.2.1.4.21.1.7, index dest) plus ipRouteMask rows.
+    param($Rows, $MaskRows = @(), [switch]$Legacy)
+    $toPrefix = { param($mk) if (-not (Test-IPv4 $mk)) { return $null }; $n = 0; $mi = ConvertTo-IpNumber $mk; for ($bit = 31; $bit -ge 0; $bit--) { if (($mi -shr $bit) -band 1) { $n++ } else { break } }; $n }
+    $out = @()
+    if ($Legacy) {
+        $masks = @{}; foreach ($m in @($MaskRows)) { if ($m) { $masks["$($m.Index)"] = "$($m.Value)" } }
+        foreach ($r in @($Rows)) { if ($r -and (Test-IPv4 "$($r.Index)")) { $out += [pscustomobject]@{ Destination = "$($r.Index)"; Prefix = (& $toPrefix $masks["$($r.Index)"]); NextHop = "$($r.Value)" } } }
+    } else {
+        foreach ($r in @($Rows)) {
+            $p = @("$($r.Index)" -split '\.')
+            if ($p.Count -ne 13) { continue }
+            $out += [pscustomobject]@{ Destination = ($p[0..3] -join '.'); Prefix = (& $toPrefix ($p[4..7] -join '.')); NextHop = "$($r.Value)" }
+        }
+    }
+    return @($out | Sort-Object { ConvertTo-IpNumber $_.Destination }, Prefix)
+}
+
+function Get-UpsOidMap {
+    # The UPS values read over SNMP: RFC 1628 UPS-MIB, or with -Apc the APC PowerNet-MIB for network
+    # cards that do not answer UPS-MIB.
+    param([switch]$Apc)
+    if ($Apc) {
+        return [ordered]@{
+            Model = '1.3.6.1.4.1.318.1.1.1.1.1.1.0'; BatteryStatus = '1.3.6.1.4.1.318.1.1.1.2.1.1.0'; ChargePct = '1.3.6.1.4.1.318.1.1.1.2.2.1.0'
+            RuntimeTicks = '1.3.6.1.4.1.318.1.1.1.2.2.3.0'; ReplaceBattery = '1.3.6.1.4.1.318.1.1.1.2.2.4.0'; OutputStatus = '1.3.6.1.4.1.318.1.1.1.4.1.1.0'; LoadPct = '1.3.6.1.4.1.318.1.1.1.4.2.3.0'
+        }
+    }
+    return [ordered]@{
+        Manufacturer = '1.3.6.1.2.1.33.1.1.1.0'; Model = '1.3.6.1.2.1.33.1.1.2.0'; BatteryStatus = '1.3.6.1.2.1.33.1.2.1.0'
+        MinutesRemaining = '1.3.6.1.2.1.33.1.2.3.0'; ChargePct = '1.3.6.1.2.1.33.1.2.4.0'; OutputSource = '1.3.6.1.2.1.33.1.4.1.0'; LoadPct = '1.3.6.1.2.1.33.1.4.4.1.5.1'
+    }
+}
+
+function ConvertTo-UpsStatus {
+    # Values read with $UpsOids (-Standard) or $ApcUpsOids (-Apc) -> one plain UPS record, or $null.
+    param($Standard, $Apc)
+    $UpsOids = Get-UpsOidMap; $ApcUpsOids = Get-UpsOidMap -Apc
+    $num = { param($v) if ($null -eq $v -or "$v" -eq '') { return $null }; try { return [double]$v } catch { return $null } }
+    if ($Standard -and ($Standard[$UpsOids.Model] -or $Standard[$UpsOids.BatteryStatus])) {
+        $bs = & $num $Standard[$UpsOids.BatteryStatus]; $src = & $num $Standard[$UpsOids.OutputSource]
+        return [pscustomobject]@{
+            Source = 'UPS-MIB'; Manufacturer = "$($Standard[$UpsOids.Manufacturer])".Trim(); Model = "$($Standard[$UpsOids.Model])".Trim()
+            Battery = $(switch ($bs) { 2 { 'normal' } 3 { 'low' } 4 { 'depleted' } default { 'unknown' } })
+            OnBattery = ($src -eq 5); ChargePct = (& $num $Standard[$UpsOids.ChargePct]); MinutesRemaining = (& $num $Standard[$UpsOids.MinutesRemaining])
+            LoadPct = (& $num $Standard[$UpsOids.LoadPct]); ReplaceBattery = $null
+        }
+    }
+    if ($Apc -and ($Apc[$ApcUpsOids.Model] -or $Apc[$ApcUpsOids.BatteryStatus])) {
+        $bs = & $num $Apc[$ApcUpsOids.BatteryStatus]; $os = & $num $Apc[$ApcUpsOids.OutputStatus]; $rt = & $num $Apc[$ApcUpsOids.RuntimeTicks]
+        return [pscustomobject]@{
+            Source = 'APC'; Manufacturer = 'APC'; Model = "$($Apc[$ApcUpsOids.Model])".Trim()
+            Battery = $(switch ($bs) { 2 { 'normal' } 3 { 'low' } 4 { 'in fault' } default { 'unknown' } })
+            OnBattery = ($os -eq 3); ChargePct = (& $num $Apc[$ApcUpsOids.ChargePct]); MinutesRemaining = $(if ($null -ne $rt) { [math]::Round($rt / 6000, 0) } else { $null })
+            LoadPct = (& $num $Apc[$ApcUpsOids.LoadPct]); ReplaceBattery = ((& $num $Apc[$ApcUpsOids.ReplaceBattery]) -eq 2)
+        }
+    }
+    return $null
+}
+
+function Get-RouterTables {
+    # A router's own addresses, ARP table and routes, read only. Returns $null when it is not a router.
+    param([string]$Ip, [string]$Community, [bool]$Force = $false)
+    $fw = Get-SnmpValues $Ip $Community @('1.3.6.1.2.1.4.1.0') 1500
+    $isRouter = ($fw -and "$($fw['1.3.6.1.2.1.4.1.0'])" -eq '1')
+    if (-not $isRouter -and -not $Force) { return $null }
+    $addr = @(ConvertFrom-AddrRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.20.1.2' 100 1500) (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.20.1.3' 100 1500))
+    $arp = @(ConvertFrom-ArpRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.22.1.2' 2000 1500))
+    if (-not $arp.Count) { $arp = @(ConvertFrom-ArpRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.35.1.4' 2000 1500)) }
+    $routes = @(ConvertFrom-RouteRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.24.4.1.4' 300 1500))
+    if (-not $routes.Count) { $routes = @(ConvertFrom-RouteRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.21.1.7' 300 1500) (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.21.1.11' 300 1500) -Legacy) }
+    if (-not $isRouter -and -not $addr.Count -and -not $arp.Count -and -not $routes.Count) { return $null }
+    return [ordered]@{
+        Forwarding = $isRouter
+        Addresses = $addr
+        WanAddresses = @($addr | Where-Object { $_.Class -eq 'Public' } | ForEach-Object { $_.IP })
+        Arp = $arp
+        Routes = $routes
+        DefaultRoute = @($routes | Where-Object { $_.Destination -eq '0.0.0.0' -and $_.Prefix -eq 0 } | ForEach-Object { $_.NextHop } | Select-Object -First 1)
+    }
+}
+
 function Get-AssessmentFindings {
     # Turns the collected evidence into plain statements, each with what it rests on and how sure it is:
     # Confirmed (measured directly), Likely (several signs agree), Possible (one sign, or an inference).
@@ -2481,6 +2608,29 @@ function Get-AssessmentFindings {
             if ($maps.Count) { $t += " $($maps.Count) port mappings exist now." }
             & $add 'Gateway' 'Confirmed' $t @($maps | Select-Object -First 12 | ForEach-Object { "$(Get-Prop $_ 'Protocol') $(Get-Prop $_ 'ExternalPort') to $(Get-Prop $_ 'InternalClient'):$(Get-Prop $_ 'InternalPort') ($(Get-Prop $_ 'Description'))" })
         } else { & $add 'Gateway' 'Confirmed' 'The gateway does not offer UPnP or NAT-PMP port mapping.' @() }
+    }
+
+    # ---- Routers and UPS over SNMP ----
+    foreach ($sd in @(@(Get-Prop $R 'Snmp', 'Devices') | Where-Object { $_ -and (Get-Prop $_ 'Router') })) {
+        $rt = Get-Prop $sd 'Router'
+        $nm = "$(Get-Prop $sd 'SysName')"; if (-not $nm) { $nm = "$(Get-Prop $sd 'IP')" }
+        $wan = @(@(Get-Prop $rt 'WanAddresses') | Where-Object { $_ })
+        $t = "Router $nm answered SNMP: $(@(Get-Prop $rt 'Addresses').Count) addresses of its own, $(@(Get-Prop $rt 'Arp').Count) entries in its ARP table and $(@(Get-Prop $rt 'Routes').Count) routes."
+        if ($wan.Count) { $t += " Its WAN side is $($wan -join ', '): that is the circuit it serves, even where no machine was run." }
+        $pub = "$(Get-Prop $R 'Egress', 'PublicIPv4')"
+        if ($wan.Count -and $pub -and $wan -notcontains $pub) { $t += " Traffic from this PC leaves from $pub instead, so another device (an ISP modem doing NAT, or another firewall) is in the path or this router is not this office's exit." }
+        $privNets = @(@(Get-Prop $rt 'Addresses') | Where-Object { $_ -and (Get-Prop $_ 'Class') -eq 'Private' } | ForEach-Object { '{0}/{1}' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'Prefix') })
+        & $add 'Network equipment' 'Confirmed' $t @(@("Interfaces with addresses: $($privNets -join ', ')"), $(if (Get-Prop $rt 'DefaultRoute') { "Default route via $(@(Get-Prop $rt 'DefaultRoute') -join ', ')" }), "System: $(Get-Prop $sd 'SysDescr')")
+    }
+    foreach ($sd in @(@(Get-Prop $R 'Snmp', 'Devices') | Where-Object { $_ -and (Get-Prop $_ 'Ups') })) {
+        $u = Get-Prop $sd 'Ups'
+        $bits = @("battery $(Get-Prop $u 'Battery')")
+        if ($null -ne (Get-Prop $u 'ChargePct')) { $bits += "$(Get-Prop $u 'ChargePct')% charged" }
+        if ($null -ne (Get-Prop $u 'MinutesRemaining')) { $bits += "$(Get-Prop $u 'MinutesRemaining') minutes of runtime" }
+        if ($null -ne (Get-Prop $u 'LoadPct')) { $bits += "$(Get-Prop $u 'LoadPct')% load" }
+        if (Get-Prop $u 'OnBattery') { $bits += 'RUNNING ON BATTERY' }
+        if (Get-Prop $u 'ReplaceBattery') { $bits += 'battery needs replacing' }
+        & $add 'Network equipment' 'Confirmed' "UPS $((("$(Get-Prop $u 'Manufacturer') $(Get-Prop $u 'Model')").Trim())) at $(Get-Prop $sd 'IP'): $($bits -join ', ')." @("Read over SNMP ($(Get-Prop $u 'Source'))")
     }
 
     # ---- Other subnets ----
@@ -6209,10 +6359,41 @@ if ($EnableSnmp -and $script:FullLanguage -and $SnmpCommunity -and $srcIp -and $
                     $supplies = @($sd.Keys | Sort-Object | ForEach-Object { $lv = $sl[$_]; $mx = $sm[$_]; $pct = if ($null -ne $lv -and $mx -and [double]$mx -gt 0 -and [double]$lv -ge 0) { [int](100 * [double]$lv / [double]$mx) } else { $null }; [pscustomobject]@{ Supply = "$($sd[$_])"; Percent = $pct } })
                     if (($pv -and $pv.Count) -or $supplies.Count) { $row['Printer'] = [ordered]@{ Model = $(if ($pv) { "$($pv['1.3.6.1.2.1.25.3.2.1.3.1'])" }); Serial = $(if ($pv) { "$($pv['1.3.6.1.2.1.43.5.1.1.17.1'])" }); PageCount = $(if ($pv) { $pv['1.3.6.1.2.1.43.10.2.1.4.1.1'] }); Supplies = $supplies } }
                 }
+                # Routers and layer 3 switches: their own addresses (a public one is the WAN side), the ARP table
+                # (the MAC of every device they talk to, on every VLAN) and the routes. The site gateway is asked
+                # even if it does not say it forwards.
+                $rtab = Get-RouterTables $ip $SnmpCommunity ($ip -eq "$Gateway")
+                if ($rtab) { $row['Router'] = $rtab }
+                # UPS: battery state, charge, runtime and load (UPS-MIB, else the APC MIB on APC cards)
+                $upsStd = Get-SnmpValues $ip $SnmpCommunity @((Get-UpsOidMap).Values) 1500
+                $upsApc = $null
+                if (-not ($upsStd -and $upsStd.Count) -and ("$($row['SysObjectId'])" -like '1.3.6.1.4.1.318.*' -or "$($row['SysDescr'])" -match 'APC|UPS|PowerChute|Network Management Card')) {
+                    $upsApc = Get-SnmpValues $ip $SnmpCommunity @((Get-UpsOidMap -Apc).Values) 1500
+                }
+                $ups = ConvertTo-UpsStatus $upsStd $upsApc
+                if ($ups) { $row['Ups'] = $ups }
             } catch { $row['Note'] = "read stopped: $($_.Exception.Message)" }
             $rows += [pscustomobject]$row
         }
-        [ordered]@{ Community = $SnmpCommunity; Asked = $sends.Count; Answered = $rows.Count; Devices = $rows }
+        $routers = @($rows | Where-Object { $_.Router })
+        [ordered]@{
+            Community = $SnmpCommunity; Asked = $sends.Count; Answered = $rows.Count
+            Routers = $routers.Count; ArpEntries = (@($routers | ForEach-Object { @($_.Router.Arp).Count }) | Measure-Object -Sum).Sum
+            WanAddresses = @($routers | ForEach-Object { @($_.Router.WanAddresses) } | Where-Object { $_ } | Sort-Object -Unique)
+            Ups = @($rows | Where-Object { $_.Ups }).Count
+            Devices = $rows
+        }
+    }
+    # Devices found without a MAC (across a router) get it from a router's ARP table.
+    $arpMap = @{}
+    foreach ($sd in @(Get-Val $Result['Snmp'] 'Devices')) { foreach ($a in @(Get-Prop $sd 'Router', 'Arp')) { if ($a -and -not $arpMap.ContainsKey("$($a.IP)")) { $arpMap["$($a.IP)"] = "$($a.Mac)" } } }
+    if ($arpMap.Count) {
+        foreach ($d in @(Get-Val $Result['Identify'] 'Devices')) {
+            if ($d -and -not $d.Mac -and $arpMap.ContainsKey("$($d.IP)")) { $d.Mac = $arpMap["$($d.IP)"]; $d.MacSource = 'router ARP (SNMP)'; $d.MacVendor = Get-MacVendor $d.Mac }
+        }
+        foreach ($d in @(Get-Val $Result['RemoteSweep'] 'Devices')) {
+            if ($d -and -not $d.Mac -and $arpMap.ContainsKey("$($d.IP)")) { $d.Mac = $arpMap["$($d.IP)"]; $d.Vendor = Get-MacVendor $d.Mac }
+        }
     }
 }
 
@@ -6301,6 +6482,16 @@ $Result['Findings'] = $script:Findings
 
 # ---------------- Flags ----------------
 try {
+    foreach ($sd in @(Get-Val $Result['Snmp'] 'Devices')) {
+        $u = Get-Prop $sd 'Ups'
+        if (-not $u) { continue }
+        $un = ("UPS {0} at {1}" -f ("$($u.Manufacturer) $($u.Model)").Trim(), $sd.IP)
+        if ($u.OnBattery) { Add-Flag 'High' 'Power' "$un is running on battery" }
+        if ($u.Battery -in @('low', 'depleted', 'in fault')) { Add-Flag 'High' 'Power' "$un reports its battery as $($u.Battery)" }
+        if ($u.ReplaceBattery) { Add-Flag 'High' 'Power' "$un says its battery needs replacing" }
+        if ($null -ne $u.MinutesRemaining -and $u.MinutesRemaining -lt 10) { Add-Flag 'Medium' 'Power' "$un has only $($u.MinutesRemaining) minutes of runtime at the current load" }
+        if ($null -ne $u.LoadPct -and $u.LoadPct -ge 80) { Add-Flag 'Medium' 'Power' "$un is loaded to $($u.LoadPct)%" }
+    }
     $m = $Result['Machine']
     if (Get-Val $m 'IsWindows10') { Add-Flag 'High' 'Lifecycle' 'Windows 10 (out of support since Oct 2025)' }
     if ((Get-Val $m 'RamGB') -and $m['RamGB'] -lt 7.5) { Add-Flag 'Medium' 'Lifecycle' "Only $($m['RamGB']) GB RAM" }
@@ -6920,6 +7111,8 @@ try {
     $rss = @(Get-Val $Result['RemoteSweep'] 'Subnets' | Where-Object { $_ }); if ($rss.Count) { $disco += "  Other subnets:     $((@($rss | ForEach-Object { '{0} {1} devices' -f $_.Subnet, $_.Devices })) -join '; ')" }
     $wo = @(Get-Val $Result['WindowsHosts'] 'OsSummary' | Where-Object { $_ }); if ($wo.Count) { $disco += "  Windows versions:  $($wo -join '; ')" }
     $sn = Get-Val $Result['Snmp'] 'Answered'; if ($null -ne $sn) { $disco += ('  SNMP:              {0} of {1} devices answered community {2}' -f $sn, $Result['Snmp']['Asked'], $Result['Snmp']['Community']) }
+    $rtn = Get-Val $Result['Snmp'] 'Routers'; if ($rtn) { $disco += ('  Routers (SNMP):    {0}, {1} ARP entries, WAN {2}' -f $rtn, $Result['Snmp']['ArpEntries'], $(if (@($Result['Snmp']['WanAddresses']).Count) { @($Result['Snmp']['WanAddresses']) -join ', ' } else { 'not seen' })) }
+    $upn = Get-Val $Result['Snmp'] 'Ups'; if ($upn) { $disco += ('  UPS (SNMP):        {0}' -f $upn) }
     $pqa = Get-Val $Result['PrinterQuery'] 'Answered'; if ($null -ne $pqa) { $disco += ('  Printers (IPP):    {0} of {1} described themselves' -f $pqa, $Result['PrinterQuery']['Asked']) }
     $cqa = Get-Val $Result['CameraQuery'] 'Answered'; if ($null -ne $cqa) { $disco += ('  Cameras (RTSP):    {0} of {1} answered' -f $cqa, $Result['CameraQuery']['Asked']) }
     if ($disco.Count) { $FB.Add(''); $FB.Add('DISCOVERY'); foreach ($ln in $disco) { $FB.Add($ln) } }
