@@ -218,3 +218,28 @@ Describe 'Email domains in the merged report' {
         $HtmlM | Should -Match 'Email and domain \(public DNS\)'
     }
 }
+
+Describe 'Site diagrams' {
+    BeforeAll { $script:DiagDir = Join-Path $MultiOut 'diagrams' }
+    It 'writes one diagram per site, as valid SVG' {
+        foreach ($f in 'Main_office.svg', 'Warehouse.svg') {
+            $p = Join-Path $DiagDir $f
+            $p | Should -Exist
+            { [xml][IO.File]::ReadAllText($p) } | Should -Not -Throw
+        }
+    }
+    It 'draws only what the runs found, with the best name for each box' {
+        $t = [IO.File]::ReadAllText((Join-Path $DiagDir 'Main_office.svg'))
+        $t | Should -Match 'nw-fw01 \(CF-60\)' -Because 'the gateway''s own SNMP answer beats its MAC vendor'
+        $t | Should -Match 'WAN 203\.0\.113\.42'
+        $t | Should -Match 'Contoso Cloud'
+        $t | Should -Match 'CP1500 ON BATTERY'
+        $t | Should -Match 'SSID Northwind-Staff'
+        $w = [IO.File]::ReadAllText((Join-Path $DiagDir 'Warehouse.svg'))
+        $w | Should -Not -Match 'UPS' -Because 'no UPS was found at the warehouse'
+        $w | Should -Not -Match 'Other subnets' -Because 'devices on its own subnet are not other subnets'
+    }
+    It 'puts the diagram in the report' {
+        [IO.File]::ReadAllText((Join-Path $MultiOut 'Report.html')) | Should -Match 'Site diagram'
+    }
+}
