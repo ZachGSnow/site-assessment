@@ -64,7 +64,7 @@ Settings live in the CONFIG block at the top of the collector, so it still works
 | `$PingCount` | 180 | Samples in the loss and latency series, one per second |
 | `$OutputRoot` | Public Documents | Where runs are written (local, not synced to OneDrive) |
 
-Merge options: `-NoEnrich` makes no network requests; `-TestDevice <host or serial>` names a visiting laptop; `-SiteMap @{ 'typo' = 'Name' }` fixes site names after the fact; `-TargetHint <regex>` adds remote desktop targets to treat as the hosted desktop.
+Merge options: `-NoEnrich` makes no network requests; `-TestDevice <host or serial>` names a visiting laptop; `-SiteMap @{ 'typo' = 'Name' }` fixes site names after the fact; `-TargetHint <regex>` adds remote desktop targets to treat as the hosted desktop (use it for runs that do not record a hosted desktop profile).
 
 ## Your data and privacy
 
@@ -122,10 +122,17 @@ Install-Module Pester -RequiredVersion 6.2.0 -Scope CurrentUser -Force -SkipPubl
 - **Collector:** the CONFIG defaults (discovery off, no client values), `-Discovery`, `-HostedDesktop` and `-ConfigPath` with a custom profile, each built-in profile's host pattern, tracert and ping parsing, trace analysis (tunnel, double NAT, carrier-grade NAT), every traffic design verdict, and the bufferbloat grades. The collector's functions are loaded from the parsed script, so nothing is collected during tests.
 - **Merge:** fictional runs for a two-office company (`tests/Fixtures.ps1`, documentation IP ranges only) are zipped the way the collector writes them and merged with `-NoEnrich`. The tests check the one-machine report, the two-site report, test laptop detection, shared egress, overlapping bandwidth tests and the hosted desktop round trip.
 
-**Verified:** a real run of the collector in Windows PowerShell 5.1 with discovery and outside lookups off, merged into a one-machine report. The built-in Azure Virtual Desktop and Windows 365 hosts were checked against Microsoft's "Required FQDNs and endpoints for Azure Virtual Desktop", and the Citrix Cloud domains against Citrix's connectivity pages (November 2026).
+### Used in the field
 
-<!-- TODO: after the real runs, list what was verified: bandwidth providers, ipinfo/RDAP/macvendors, the merge enrichment, and -Discovery on an owned network -->
-**Not yet verified in this release:** a full run with the bandwidth test and the outside lookups, the merge's enrichment sources (Team Cymru, RDAP, IEEE, InternetDB), and `-Discovery` against real network gear. Non-English Windows is untested: ping and tracert output is parsed in English.
+This tool started as the collector and merge from a real multi-office client assessment (November 2026). Those runs were made with the earlier private versions this release is built from:
+
+- **A visiting laptop at two offices**, wired and as administrator, with every discovery check on: three runs of 8 to 12 minutes each, every one with a PASS data check and no collector errors. They exercised the Cloudflare bandwidth test (two rounds, both directions) and the bufferbloat grade, the traceroutes and 180-sample loss series, the ipinfo and RDAP lookups, the subnet sweep (100+ devices at the larger office), read-only SNMP, vendor and multicast discovery, IPP, RTSP, UPnP, the modem page, DNS timing, the Microsoft 365 and outbound checks, reachability across the site tunnel, the LLDP/CDP wire capture, and the traffic design verdict (split tunnel, high confidence).
+- **Three runs on the hosted desktops themselves**, as a standard user, where the verdict reads full backhaul, as expected for a desktop whose internet leaves through the provider.
+- **The merge with enrichment on**, over all six runs: Team Cymru, RDAP, reverse DNS, Shodan InternetDB and the IEEE MAC list all answered, and the visiting laptop was detected by its serial number at both offices.
+
+**This release against that field data.** The merge in this repository, run on the same six runs (with `-NoEnrich`, and `-TargetHint` because runs from the earlier versions do not record a hosted desktop profile), produces the same sites, verdicts, circuit figures, hosted desktop round trips and test-laptop detection, and the same number of rows in every CSV, as the merge they were made with. The collector in this repository was run in Windows PowerShell 5.1 (discovery and outside lookups off) and merged into a one-machine report. The built-in Azure Virtual Desktop and Windows 365 hosts were checked against Microsoft's "Required FQDNs and endpoints for Azure Virtual Desktop", and the Citrix Cloud domains against Citrix's connectivity pages (November 2026).
+
+**Not exercised yet:** the M-Lab and Vultr bandwidth fallbacks (Cloudflare never failed in the field), the api.macvendors.com lookup, and the built-in Azure Virtual Desktop, Windows 365 and Citrix Cloud profiles against a live tenant. Non-English Windows is untested: ping and tracert output is parsed in English.
 
 ## License
 
