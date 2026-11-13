@@ -1,0 +1,21 @@
+# Assessment output holds client data: never commit runs, zips or merged reports
+*.zip
+_merged/
+_work/
+SiteAssessment/
+*_20[0-9][0-9][0-1][0-9][0-3][0-9]-[0-2][0-9][0-5][0-9]/
+
+# Per-job config files hold client names, subnets and servers (keep only the .example)
+*.psd1
+!site-assessment.config.example.psd1
+
+# Test output
+testResults.xml
+coverage.xml
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

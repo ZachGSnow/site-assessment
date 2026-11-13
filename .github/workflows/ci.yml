@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# The collector and the merge are written for Windows PowerShell 5.1 (what every Windows PC has)
+# and also run in PowerShell 7, so the tests run in both.
+jobs:
+  test:
+    name: test (windows-latest, ${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Pester (pinned to the tested version)
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Install-Module Pester -RequiredVersion 6.2.0 -Scope CurrentUser -Force -SkipPublisherCheck
+      - name: Tests
+        run: ./tests/run-tests.ps1
+
+  # Single stable check name for branch protection; fails unless every test leg passed.
+  ci:
+    name: ci
+    needs: [test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tests passed
+        run: test "${{ needs.test.result }}" = "success"
