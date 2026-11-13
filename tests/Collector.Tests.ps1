@@ -454,6 +454,26 @@ Describe 'Network risks from collected data (Phase C)' {
     It 'files every risk under one category the merge keeps for the site' {
         @($Risks | ForEach-Object Category | Sort-Object -Unique) | Should -Be @('Network risk')
     }
+    It 'gives every risk a kind, a template and the devices the merge needs to combine two runs' {
+        foreach ($r in $Risks) {
+            $r.Kind | Should -Not -BeNullOrEmpty
+            $r.SiteWide | Should -BeTrue
+            $r.Template | Should -Match '\{n\}'
+            Format-RiskMessage $r.Template $r.Devices $r.Count | Should -Be $r.Message
+        }
+        (& $Find 'SMBv1').Devices | Should -Contain '10.20.1.10 (nw-fs01)'
+        (& $Find "community 'public'").Count | Should -Be 3
+    }
+}
+
+Describe 'Risk messages' {
+    It 'names six devices, then says how many more' {
+        $m = Format-RiskMessage '{n} device(s) accept Telnet: {list}' @(1..8 | ForEach-Object { "10.0.0.$_" })
+        $m | Should -BeLike '8 device(s) accept Telnet: 10.0.0.1, *, 10.0.0.6 and 2 more'
+    }
+    It 'takes a count without a device list' {
+        Format-RiskMessage '{n} device(s) answer SNMP' @() 5 | Should -Be '5 device(s) answer SNMP'
+    }
 }
 
 Describe 'IPv6 (Phase D)' {
@@ -806,6 +826,11 @@ Describe 'Active Directory site cross-check' {
     }
     It 'files them under one category the merge keeps once per site' {
         @(Get-AdSiteFlags (Get-AdSiteCheck @{ Network = @{ SourceIp = '10.20.7.40' }; AdSites = $AdSites }) | ForEach-Object Category | Sort-Object -Unique) | Should -Be @('Active Directory')
+    }
+    It 'marks only the directory layout as site-wide, not what is about this PC' {
+        $f = @(Get-AdSiteFlags (Get-AdSiteCheck @{ Network = @{ SourceIp = '10.20.7.40' }; AdSites = $AdSites }))
+        @($f | Where-Object { $_.Message -like "This PC's address*" }).SiteWide | Should -Be $false
+        @($f | Where-Object { $_.Message -like 'AD site * has subnets but no domain controller*' }) | ForEach-Object { $_.SiteWide | Should -BeTrue }
     }
     It 'does nothing on a PC that is not in a domain' {
         Get-AdSiteCheck @{ Network = @{ SourceIp = '10.20.1.25' } } | Should -BeNullOrEmpty

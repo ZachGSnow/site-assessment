@@ -171,42 +171,79 @@ Describe 'Network risks in the merged report' {
 }
 
 Describe 'Methodology' {
-    BeforeAll { $script:HtmlS = [IO.File]::ReadAllText((Join-Path $SingleOut 'Report.html')) }
+    BeforeAll {
+        $script:HtmlS = [IO.File]::ReadAllText((Join-Path $SingleOut 'Report.html'))
+        # Runs from before the sweep's port count and subnet limit were recorded
+        $script:OldDir = Join-Path $TestDrive 'older'
+        New-Item -ItemType Directory -Path $OldDir -Force | Out-Null
+        Save-FixtureRun (New-FixtureRun -Site 'Main office' -Hostname 'NW-OLD01' -Serial 'NWSN0901' -User 'jlee' -SourceIp '10.20.1.26' -Gateway '10.20.1.1' -PublicIp '203.0.113.40' -NoOptions) $OldDir | Out-Null
+        $script:HtmlOld = [IO.File]::ReadAllText((Join-Path (Invoke-Merge $OldDir) 'Report.html'))
+        $script:MixDir = Join-Path $TestDrive 'mixed'
+        New-Item -ItemType Directory -Path $MixDir -Force | Out-Null
+        Save-FixtureRun (New-FixtureRun -Site 'Main office' -Hostname 'NW-OLD01' -Serial 'NWSN0901' -User 'jlee' -SourceIp '10.20.1.26' -Gateway '10.20.1.1' -PublicIp '203.0.113.40' -NoOptions) $MixDir | Out-Null
+        Save-FixtureRun (New-FixtureRun -Site 'Main office' -Hostname 'NW-NEW01' -Serial 'NWSN0902' -User 'akim' -SourceIp '10.20.1.27' -Gateway '10.20.1.1' -PublicIp '203.0.113.40' -RunStart ([datetime]'2026-03-10T10:00:00')) $MixDir | Out-Null
+        $script:HtmlMix = [IO.File]::ReadAllText((Join-Path (Invoke-Merge $MixDir) 'Report.html'))
+    }
     It 'takes the sweep port count and subnet limit from the runs' {
-        $HtmlS | Should -Match 'tries 22 common TCP ports'
+        $HtmlS | Should -Match 'tries 22 common TCP ports on each device that answered\.'
         $HtmlS | Should -Match 'at most 8 per run'
     }
+    It 'uses neutral wording for runs that did not record them' {
+        $HtmlOld | Should -Match 'tries a set of common TCP ports'
+        $HtmlOld | Should -Match 'a limited number per run'
+    }
+    It 'says older runs may differ when old and new runs are merged together' {
+        $HtmlMix | Should -Match 'tries 22 common TCP ports on each device that answered \(runs from older collectors may have used a different set\)'
+    }
     It 'leaves no placeholder behind' {
-        $HtmlS | Should -Not -Match '\{(SWEEPPORTS|MAXSUBNETS|HOSTED)\}'
+        foreach ($h in @($HtmlS, $HtmlOld, $HtmlMix)) { $h | Should -Not -Match '\{(SWEEPPORTS|OLDERPORTS|MAXSUBNETS|HOSTED)\}' }
     }
 }
 
 Describe 'Site-wide flags from two machines' {
     BeforeAll {
         . ([scriptblock]::Create((Get-ScriptFunctionText $MergePath)))
-        $f = { param($site, $cat, $msg) [pscustomobject]@{ Site = $site; Hostname = 'PC'; Severity = 'Medium'; Category = $cat; Message = $msg; Scope = 'Site' } }
+        $tel = '{n} device(s) accept Telnet, where logins cross the network in clear text: {list}'
+        $risk = {
+            param($site, $pc, $tpl, $kind, $devs, $count = -1)
+            [pscustomobject]@{ Site = $site; Hostname = $pc; Severity = 'Medium'; Category = 'Network risk'; Message = (Format-RiskMessage $tpl $devs $count); Scope = 'Site'
+                Kind = $kind; Template = $tpl; Devices = @($devs); Count = $(if ($count -ge 0) { $count } else { @($devs).Count }); SiteWide = $true }
+        }
+        $old = { param($site, $cat, $msg) [pscustomobject]@{ Site = $site; Hostname = 'PC'; Severity = 'Medium'; Category = $cat; Message = $msg; Scope = 'Site'; Kind = $null; Template = $null; Devices = @(); Count = $null; SiteWide = $null } }
         $script:Kept = @(Select-SiteWideFlags @(
-            (& $f 'Main office' 'Network risk' '3 device(s) accept Telnet, where logins cross the network in clear text: 10.0.0.5, 10.0.0.6, 10.0.0.7'),
-            (& $f 'Main office' 'Network risk' '4 device(s) accept Telnet, where logins cross the network in clear text: 10.0.0.5, 10.0.0.6, 10.0.0.7, 10.0.0.8'),
-            (& $f 'Warehouse' 'Network risk' '1 device(s) accept Telnet, where logins cross the network in clear text: 10.0.1.5'),
-            (& $f 'Main office' 'Network risk' '2 device(s) still accept SMBv1, the file-sharing version WannaCry spread over: 10.0.0.9, 10.0.0.10'),
-            (& $f 'Main office' 'Email security' 'contoso.com: no DMARC record, so spoofed mail claiming to be from it is delivered'),
-            (& $f 'Main office' 'Email security' 'contoso.com: no DMARC record, so spoofed mail claiming to be from it is delivered'),
-            (& $f 'Main office' 'Email security' 'contoso.com: DMARC is set to p=none, which only reports and blocks nothing')))
+            (& $risk 'Main office' 'NW-FRONT01' $tel 'Telnet' @('10.0.0.5', '10.0.0.6')),
+            (& $risk 'Main office' 'NW-LAB01' $tel 'Telnet' @('10.0.1.7', '10.0.1.8', '10.0.1.9')),
+            (& $risk 'Warehouse' 'NW-WH01' $tel 'Telnet' @('10.0.2.5')),
+            (& $risk 'Main office' 'NW-FRONT01' "{n} device(s) answer SNMP with the default community 'public'" 'SnmpPublic' @() 3),
+            (& $risk 'Main office' 'NW-LAB01' "{n} device(s) answer SNMP with the default community 'public'" 'SnmpPublic' @() 5),
+            (& $risk 'Main office' 'NW-FRONT01' '{n} device(s) still accept SMBv1, the file-sharing version WannaCry spread over: {list}' 'Smb1' @('10.0.0.9')),
+            (& $old 'Main office' 'Email security' 'contoso.com: no DMARC record, so spoofed mail claiming to be from it is delivered'),
+            (& $old 'Main office' 'Email security' 'contoso.com: no DMARC record, so spoofed mail claiming to be from it is delivered'),
+            (& $old 'Main office' 'Email security' 'contoso.com: DMARC is set to p=none, which only reports and blocks nothing')))
     }
-    It 'keeps one Telnet risk per site, from the run that found the most devices' {
-        $t = @($Kept | Where-Object { $_.Site -eq 'Main office' -and $_.Message -like '*Telnet*' })
+    It 'keeps one Telnet risk per site, naming every device either machine found' {
+        $t = @($Kept | Where-Object { $_.Site -eq 'Main office' -and $_.Kind -eq 'Telnet' })
         $t.Count | Should -Be 1
-        $t[0].Message | Should -BeLike '4 device(s)*'
+        $t[0].Message | Should -Be '5 device(s) accept Telnet, where logins cross the network in clear text: 10.0.0.5, 10.0.0.6, 10.0.1.7, 10.0.1.8, 10.0.1.9'
+        $t[0].Hostname | Should -Be 'NW-FRONT01, NW-LAB01'
+    }
+    It 'keeps the larger count for a risk with no device list' {
+        (@($Kept | Where-Object { $_.Kind -eq 'SnmpPublic' })).Message | Should -BeLike '5 device(s) answer SNMP*'
     }
     It 'keeps the same risk at another site' {
         @($Kept | Where-Object { $_.Site -eq 'Warehouse' }).Count | Should -Be 1
     }
     It 'keeps different risks apart' {
-        @($Kept | Where-Object { $_.Message -like '*SMBv1*' }).Count | Should -Be 1
+        @($Kept | Where-Object { $_.Kind -eq 'Smb1' }).Count | Should -Be 1
     }
     It 'keeps different email findings for one domain apart, and drops exact repeats' {
         @($Kept | Where-Object { $_.Category -eq 'Email security' }).Count | Should -Be 2
+    }
+    It 'treats an AD flag about one PC as that machine''s, and older runs by category' {
+        Test-SiteWideFlag ([pscustomobject]@{ Category = 'Active Directory'; SiteWide = $false }) | Should -BeFalse
+        Test-SiteWideFlag ([pscustomobject]@{ Category = 'Active Directory'; SiteWide = $true }) | Should -BeTrue
+        Test-SiteWideFlag ([pscustomobject]@{ Category = 'Network risk'; SiteWide = $null }) | Should -BeTrue
+        Test-SiteWideFlag ([pscustomobject]@{ Category = 'Wireless'; SiteWide = $null }) | Should -BeFalse
     }
 }
 

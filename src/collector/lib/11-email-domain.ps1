@@ -105,7 +105,7 @@ function Get-DomainFlags {
     param($P)
     $d = "$(Get-Prop $P 'Domain')"
     $out = @()
-    $f = { param($sev, $msg) [pscustomobject]@{ Severity = $sev; Category = 'Email security'; Message = $msg } }
+    $f = { param($sev, $msg) [pscustomobject]@{ Severity = $sev; Category = 'Email security'; Message = $msg; SiteWide = $true } }
     $hasMx = @(Get-Prop $P 'Mx').Count -gt 0
     $spf = Get-Prop $P 'Spf'; $dm = Get-Prop $P 'Dmarc'
     if (-not (Get-Prop $spf 'Present')) { $out += & $f $(if ($hasMx) { 'Medium' } else { 'Low' }) "${d}: no SPF record, so anyone can send mail that claims to come from it" }

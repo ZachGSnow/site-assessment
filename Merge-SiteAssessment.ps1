@@ -221,22 +221,43 @@ function Test-DeviceOnlyFlag {
     return $false
 }
 
+function Test-SiteWideFlag {
+    # True for a flag that describes the site rather than one machine (a network risk, the email domain,
+    # the directory's own layout). The collector marks these with SiteWide; runs made before it did fall
+    # back to the category.
+    param($Flag)
+    if ($null -ne $Flag.SiteWide -and "$($Flag.SiteWide)" -ne '') { return [bool]$Flag.SiteWide }
+    return ($Flag.Category -in @('Network risk', 'Email security', 'Active Directory'))
+}
+
+function Format-RiskMessage {
+    # Same as the collector's: {n} is the count, {list} the first six devices, then 'and N more'.
+    param([string]$Template, $Devices = @(), [int]$Count = -1)
+    $a = @(@($Devices) | Where-Object { $_ } | ForEach-Object { "$_" })
+    if ($Count -lt 0) { $Count = $a.Count }
+    $t = (@($a | Select-Object -First 6)) -join ', '
+    if ($a.Count -gt 6) { $t += " and $($a.Count - 6) more" }
+    return $Template.Replace('{n}', "$Count").Replace('{list}', $t)
+}
+
 function Select-SiteWideFlags {
-    # Network risk, email domain and Active Directory flags describe the site, not one machine, so two
-    # machines at a site report the same thing: keep one per site. A network risk names the devices its
-    # own run's sweep found, so two runs can word it differently ('3 device(s) accept Telnet: ...' and
-    # '4 device(s) ...'). Those are matched with the numbers and the device list left out, and the run
-    # that found the most devices is kept.
+    # Two machines at a site report the same site-wide flag: keep one per site. A network risk carries
+    # a Kind and the devices its own run found, so the same risk from two machines (perhaps on different
+    # VLANs) becomes one flag naming every device either of them found. Anything else is matched on its
+    # message.
     param($Flags)
-    $kind = {
-        param($f)
-        $m = "$($f.Message)"
-        if ($f.Category -eq 'Network risk') { $m = ($m -replace ':\s[^:]*$', '') -replace '\d+', '#' }
-        '{0}|{1}|{2}' -f $f.Site, $f.Category, $m
-    }
-    $found = { param($f) if ("$($f.Message)" -match '\d+') { [int]$matches[0] } else { 0 } }
-    return @(@($Flags | Where-Object { $_ }) | Group-Object -Property { & $kind $_ } | ForEach-Object {
-        @($_.Group | Sort-Object @{ Expression = { & $found $_ }; Descending = $true }, @{ Expression = { "$($_.Message)".Length }; Descending = $true })[0]
+    return @(@($Flags | Where-Object { $_ }) | Group-Object -Property { '{0}|{1}|{2}' -f $_.Site, $_.Category, $(if ($_.Kind) { "kind:$($_.Kind)" } else { $_.Message }) } | ForEach-Object {
+        $g = @($_.Group)
+        $keep = $g[0]
+        if ($g.Count -gt 1 -and $keep.Kind -and $keep.Template) {
+            $devs = @($g | ForEach-Object { @($_.Devices) } | Where-Object { $_ } | Sort-Object -Unique)
+            $count = [math]::Max($devs.Count, [int](@($g | ForEach-Object { [int]$_.Count } | Measure-Object -Maximum).Maximum))
+            $keep = $keep.PSObject.Copy()
+            $keep.Devices = $devs; $keep.Count = $count
+            $keep.Message = Format-RiskMessage $keep.Template $devs $count
+            $keep.Hostname = (@($g | ForEach-Object Hostname | Where-Object { $_ } | Sort-Object -Unique)) -join ', '
+        }
+        $keep
     } | Sort-Object Site, Message)
 }
 
@@ -482,7 +503,9 @@ foreach ($r in $runs) {
     foreach ($sv in $srvList) {
         $gear += [pscustomobject][ordered]@{ Site = $site; SeenFrom = $hostName; Type = 'Server in use by a PC'; Name = $sv.Name; IP = (J $sv.IPs ', '); Mac = $null; Vendor = $null; Detail = ('{0}; {1}' -f $sv.Location, (J $sv.Sources)) }
     }
-    foreach ($fl in @($r.Flags)) { if ($fl) { $flags += [pscustomobject][ordered]@{ Site = $site; Hostname = $hostName; Severity = $fl.Severity; Category = $fl.Category; Message = $fl.Message; Scope = 'Site' } } }
+    # Kind, Template, Devices, Count and SiteWide are used to combine site-wide flags, then left out of Flags.csv.
+    foreach ($fl in @($r.Flags)) { if ($fl) { $flags += [pscustomobject][ordered]@{ Site = $site; Hostname = $hostName; Severity = $fl.Severity; Category = $fl.Category; Message = $fl.Message; Scope = 'Site'
+        Kind = V $fl 'Kind'; Template = V $fl 'Template'; Devices = @(V $fl 'Devices'); Count = V $fl 'Count'; SiteWide = V $fl 'SiteWide' } } }
     foreach ($fl in @($r._DeviceFlags)) { if ($fl) { $deviceFlags += [pscustomobject][ordered]@{ Site = $site; Hostname = $hostName; Severity = $fl.Severity; Category = $fl.Category; Message = $fl.Message; Scope = 'Test laptop itself (not counted)' } } }
     # Collector 1.6.0+: the run's own correlated findings, and every device it identified.
     foreach ($fd in @(V $r 'Findings')) {
@@ -505,8 +528,7 @@ foreach ($r in $runs) {
 }
 $gear = @($gear | Sort-Object Site, Type, IP, Mac -Unique)
 # Two machines at one site see the same network, so a network risk is kept once per site.
-$siteWide = @('Network risk', 'Email security', 'Active Directory')
-$flags = @(@($flags | Where-Object { $_.Category -notin $siteWide }) + @(Select-SiteWideFlags @($flags | Where-Object { $_.Category -in $siteWide })))
+$flags = @(@($flags | Where-Object { -not (Test-SiteWideFlag $_) }) + @(Select-SiteWideFlags @($flags | Where-Object { Test-SiteWideFlag $_ })))
 # The client's email domains, once each, from whichever run looked them up last.
 $domainRows = @(foreach ($r in $runs) { foreach ($p in @(V (V $r 'Domains') 'Domains')) { if ($p) {
     [pscustomobject][ordered]@{ Domain = $p.Domain; Provider = $p.Provider; Mx = (J @($p.Mx) ', '); Spf = $(if (V $p.Spf 'Present') { V $p.Spf 'All' } else { 'missing' }); SpfLookups = V $p.Spf 'Lookups'
@@ -1103,7 +1125,7 @@ $routerAddr | Export-Csv (Join-Path $OutDir 'RouterAddresses.csv') -NoTypeInform
 $routeRows | Export-Csv (Join-Path $OutDir 'Routes.csv') -NoTypeInformation
 $upsRows | Export-Csv (Join-Path $OutDir 'Ups.csv') -NoTypeInformation
 $domainRows | Export-Csv (Join-Path $OutDir 'Domains.csv') -NoTypeInformation
-@($flags) + @($deviceFlags) | Export-Csv (Join-Path $OutDir 'Flags.csv') -NoTypeInformation
+@($flags) + @($deviceFlags) | Select-Object Site, Hostname, Severity, Category, Message, Scope | Export-Csv (Join-Path $OutDir 'Flags.csv') -NoTypeInformation
 $software | Export-Csv (Join-Path $OutDir 'Software.csv') -NoTypeInformation
 $traceRows | Export-Csv (Join-Path $OutDir 'Traceroutes.csv') -NoTypeInformation
 $pingRows | Export-Csv (Join-Path $OutDir 'PingSeries.csv') -NoTypeInformation
@@ -1685,14 +1707,14 @@ if ($ipInfo.Count) { [void]$sb.Append('<a href="#addresses">Addresses</a>') }
 # The same finding on several machines or sites is one line, with where it was seen.
 $fixItems = @($flags | Where-Object { $_.Scope -eq 'Site' -and $_.Severity -in @('High', 'Medium') } | Group-Object Severity, Category, Message | ForEach-Object {
     $g = @($_.Group)
-    [pscustomobject]@{ Severity = $g[0].Severity; Category = $g[0].Category; Message = $g[0].Message
+    [pscustomobject]@{ Severity = $g[0].Severity; Category = $g[0].Category; Message = $g[0].Message; SiteWide = (Test-SiteWideFlag $g[0])
         Sites = @($g | ForEach-Object Site | Sort-Object -Unique); Machines = @($g | ForEach-Object Hostname | Where-Object { $_ } | Sort-Object -Unique) }
 } | Sort-Object @{ Expression = { if ($_.Severity -eq 'High') { 0 } else { 1 } } }, @{ Expression = { $_.Machines.Count }; Descending = $true }, @{ Expression = { $_.Sites.Count }; Descending = $true }, Message)
 [void]$sb.Append('<h2 id="fix">What to fix first</h2><div class="fix">')
 if ($fixItems.Count) {
     [void]$sb.Append('<ol>')
     foreach ($fi in @($fixItems | Select-Object -First 10)) {
-        $machinePart = if ($fi.Category -in @('Network risk', 'Email security', 'Active Directory') -or $fi.Machines.Count -eq 0) { '' } elseif ($fi.Machines.Count -le 3) { " - $($fi.Machines -join ', ')" } else { " - $($fi.Machines.Count) machines" }
+        $machinePart = if ($fi.SiteWide -or $fi.Machines.Count -eq 0) { '' } elseif ($fi.Machines.Count -le 3) { " - $($fi.Machines -join ', ')" } else { " - $($fi.Machines.Count) machines" }
         [void]$sb.Append(('<li><span class="sev {0}">{0}</span>{1} <span class="where">({2}{3})</span></li>' -f $fi.Severity, (Enc $fi.Message), (Enc ($fi.Sites -join ', ')), (Enc $machinePart)))
     }
     [void]$sb.Append('</ol>')
@@ -1944,7 +1966,8 @@ foreach ($s in $sites) {
                 'Signal', $(if (V $wc 'SignalPct') { "$(V $wc 'SignalPct')% (~$(V $wc 'ApproxDbm') dBm)" }), 'AP', ("$(V $wc 'BSSID') $(V $wc 'ApVendor')".Trim()), 'Nearby networks', $(if (V $wl 'NearbyBssidCount') { "$(V $wl 'NearbySsidCount') SSIDs / $(V $wl 'NearbyBssidCount') BSSIDs" }),
                 'Drops on this SSID (30d)', (V $wev 'SiteSsidDrops'), 'Drops, all networks this machine used (30d)', (V $wev 'RealDrops'), 'Drops by SSID', (J (V $wev 'RealDropsBySsid')), 'Disconnects total', (V $wev 'Disconnected'), 'Location workaround', (V (V $wl 'LocationWorkaround') 'Result'))))
         }
-        $mf = @($flags | Where-Object { $_.Site -eq $name -and $_.Hostname -eq $hn } | Sort-Object @{ Expression = { SevRank $_.Severity } })
+        # Site-wide flags (network risks, email domain, the directory) are in the site's Findings, not here.
+        $mf = @($flags | Where-Object { $_.Site -eq $name -and $_.Hostname -eq $hn -and -not (Test-SiteWideFlag $_) } | Sort-Object @{ Expression = { SevRank $_.Severity } })
         if ($mf.Count) { [void]$mb.Append('<h4>Findings on this machine</h4>' + (New-Table $mf @('Severity', 'Category', 'Message|Finding'))) }
         $df = @($deviceFlags | Where-Object { $_.Site -eq $name -and $_.Hostname -eq $hn } | Sort-Object @{ Expression = { SevRank $_.Severity } })
         if ($df.Count) { [void]$mb.Append((New-Section ('About the laptop itself, not counted for this site ({0})' -f $df.Count) (New-Table $df @('Severity', 'Category', 'Message|Finding')))) }
@@ -2025,7 +2048,7 @@ $method = @'
 <li><b>Round trip to {HOSTED}</b> follows Microsoft's Azure Virtual Desktop guidance: under 150 ms is fine, 150 to 200 ms is acceptable for text work, over 200 ms degrades the experience. Microsoft's bandwidth figures assume under 0.1% packet loss.</li>
 <li><b>RDP disconnects</b> (client event 1026) are grouped by cause using Microsoft's reason codes. Network causes are 264, 516, 772, 1028, 1796, 2308 and the RD Gateway network errors. <b>RDP UDP</b> comes from client events 1102 (attempted), 1103 (established) and 1104 (failed: TCP only).</li>
 <li><b>Order of work</b>: bandwidth, traceroutes and the latency series run first and are saved before anything that probes the network (gateway ports, device discovery, subnet sweep). A run that was cut off during that last part still has its core results and is marked INCOMPLETE.</li>
-<li><b>Subnet sweep</b> (only with -Discovery) pings the machine's own subnet (up to a /22), then looks up a name and tries {SWEEPPORTS} common TCP ports on each device that answered. The type shown (printer, domain controller, camera, phone, Windows host) is a guess from the open ports, refined by what the device says about itself (web page, SNMP, vendor discovery).</li>
+<li><b>Subnet sweep</b> (only with -Discovery) pings the machine's own subnet (up to a /22), then looks up a name and tries {SWEEPPORTS} common TCP ports on each device that answered{OLDERPORTS}. The type shown (printer, domain controller, camera, phone, Windows host) is a guess from the open ports, refined by what the device says about itself (web page, SNMP, vendor discovery).</li>
 <li><b>Other subnets</b> are swept the same way, {MAXSUBNETS}: the ones listed in the collector's CONFIG, and any the operator picks at a prompt from the private subnets the PC already knows about (routes, DNS and DHCP servers, printer ports, private traceroute hops). None of those is swept unless it is picked. Addresses that ignore ping are tried on a few TCP ports. MAC addresses do not cross a router, so on other subnets they come from NetBIOS or the router's own ARP table.</li>
 <li><b>Follow-up checks</b>: what one step found decides what a later step looks at. The firewall's make points to its own VPN and admin pages, a switch that announces a management address is asked over SNMP, servers the PC depends on are tested across the tunnel, and server management controllers, VMware hosts, QNAP and Synology, RD Web and RD Gateway are asked only what they show before anyone signs in. No logon is attempted and no passwords are tried.</li>
 <li><b>SNMP</b> is read only, with one community string: 'public' unless the collector was set otherwise. That is the read-only default many devices ship with, so it is the one credential discovery does use; it can be turned off in the collector. Switches give their ports and neighbours, printers their serial number and page count, routers their ARP table, routes and WAN address, and UPS units their battery state, runtime and load.</li>
@@ -2056,7 +2079,7 @@ $method = @'
 </ul>
 <h4>Flag thresholds</h4>
 <ul class="ev">
-<li><b>What to fix first</b>, at the top of the report, lists every high and medium flag across all sites, high first, then the ones seen on the most machines and sites. The same flag on several machines is one line. Network risk, email domain and Active Directory flags describe the site rather than one machine, so each is kept once per site; when two machines' sweeps found a different number of devices for the same risk, the one that found more is kept.</li>
+<li><b>What to fix first</b>, at the top of the report, lists every high and medium flag across all sites, high first, then the ones seen on the most machines and sites. The same flag on several machines is one line. Network risks, email domain flags and flags about the directory's own layout describe the site rather than one machine, so each is kept once per site; when two machines found the same network risk, the flag names every device either of them found. Active Directory flags about one PC or its user name that machine.</li>
 <li>High: Windows 10, no TPM 2.0, packet loss 5%+, bufferbloat 100 ms+, 3+ network-caused RDP disconnects in 30 days, round trip to {HOSTED} over 200 ms, 30+ Wi-Fi drops, SSD wear 80%+, no enabled antivirus, phone tether.</li>
 <li>Medium: round trip to {HOSTED} 150 to 200 ms, 5+ unexpected RDP disconnects, network adapter errors, under 8 GB RAM, HDD, 5+ years old, wired link under 1 Gbps, weak or 2.4 GHz Wi-Fi, packet loss 1%+, jitter 30 ms+, upload under 5 Mbps, 10+ Wi-Fi drops, no Windows OS update in 45 days, clock off by 60 s+, BitLocker off, user is local admin, peripherals without matching RDP redirection, 3+ remote desktop client crashes or hangs, memory 90%+ in use or CPU 80%+ busy during the run.</li>
 <li>Low (shown per site and per machine): 1 or 2 client crashes, RDP UDP turned off on the client, display area of 8 megapixels or more (one 4K screen), adapter power saving on a Wi-Fi or USB adapter that has 3+ recorded drops.</li>
@@ -2066,7 +2089,10 @@ $method = $method.Replace('{HOSTED}', (Enc $HostedLabel))
 # The sweep's port count and subnet limit are collector settings, so they come from the runs themselves.
 $runOpt = { param($n) @($runs | ForEach-Object { V (V $_.Meta 'Options') $n } | Where-Object { $_ } | ForEach-Object { [int]$_ } | Sort-Object -Unique) }
 $portCounts = & $runOpt 'SweepPortCount'; $maxSubnets = & $runOpt 'RemoteSweepMaxSubnets'
+# Runs from before the count was recorded may have tried a different set of ports.
+$olderRuns = @($runs | Where-Object { $null -eq (V (V $_.Meta 'Options') 'SweepPortCount') }).Count
 $method = $method.Replace('{SWEEPPORTS}', $(if ($portCounts.Count) { $portCounts -join ' or ' } else { 'a set of' }))
+$method = $method.Replace('{OLDERPORTS}', $(if ($portCounts.Count -and $olderRuns) { ' (runs from older collectors may have used a different set)' } else { '' }))
 $method = $method.Replace('{MAXSUBNETS}', $(if ($maxSubnets.Count) { 'at most {0} per run' -f ($maxSubnets -join ' or ') } else { 'a limited number per run' }))
 [void]$sb.Append((New-Section 'Methodology' $method -Id 'method'))
 [void]$sb.Append("</main><script>$js</script></body></html>")
