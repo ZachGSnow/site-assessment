@@ -42,7 +42,8 @@
     server when 1.1.1.1 cannot be reached); connection tests to Microsoft 365, public STUN
     and NTP servers and portquiz.net. M-Lab and Vultr are used only when the Cloudflare
     speed test fails. M-Lab publishes every test, including the public IP, in its open
-    dataset: remove 'MLab' from $BandwidthProviders if the client would object.
+    dataset: remove 'MLab' from $BandwidthProviders if the client would object. Vultr only
+    tests download, so without M-Lab a failed Cloudflare upload test leaves no upload figure.
 
 .PARAMETER SiteName
     Site/office name. Prompted for when omitted.
@@ -2476,11 +2477,12 @@ function Get-AdSiteCheck {
 }
 
 function Get-AdSiteFlags {
-    # Severity, Category, Message rows for what Get-AdSiteCheck found.
+    # Severity, Category, Message rows for what Get-AdSiteCheck found. SiteWide is set only on what
+    # describes the directory itself; the rest is about this PC or this user, so the merge names the machine.
     param($C)
     if (-not $C) { return @() }
     $out = @()
-    $f = { param($sev, $msg) [pscustomobject]@{ Severity = $sev; Category = 'Active Directory'; Message = $msg } }
+    $f = { param($sev, $msg, [switch]$SiteWide) [pscustomobject]@{ Severity = $sev; Category = 'Active Directory'; Message = $msg; SiteWide = [bool]$SiteWide } }
     if ($C.Ip -and -not $C.AdSubnet) {
         $out += & $f 'Medium' "This PC's address $($C.Ip) is in no Active Directory subnet, so it logs on to whichever domain controller answers first, possibly across the WAN: add its subnet to the right site in AD Sites and Services"
     } elseif ($C.CurrentSite -and $C.SiteBySubnet -and $C.CurrentSite -ne $C.SiteBySubnet) {
@@ -2490,7 +2492,7 @@ function Get-AdSiteFlags {
     if ($C.LogonServer -and $C.LogonServerSite -and $mySite -and $C.LogonServerSite -ne $mySite -and $C.SiteHasDc) {
         $out += & $f 'Medium' "This user logged on to $($C.LogonServer) in site $($C.LogonServerSite), not to a domain controller in this PC's own site $mySite"
     }
-    foreach ($s in @($C.SitesWithoutDc)) { $out += & $f 'Low' "AD site $s has subnets but no domain controller, so its PCs log on across the WAN (fine when that is the design, worth knowing when the link goes down)" }
+    foreach ($s in @($C.SitesWithoutDc)) { $out += & $f 'Low' "AD site $s has subnets but no domain controller, so its PCs log on across the WAN (fine when that is the design, worth knowing when the link goes down)" -SiteWide }
     return $out
 }
 
@@ -3360,7 +3362,7 @@ function Get-DomainFlags {
     param($P)
     $d = "$(Get-Prop $P 'Domain')"
     $out = @()
-    $f = { param($sev, $msg) [pscustomobject]@{ Severity = $sev; Category = 'Email security'; Message = $msg } }
+    $f = { param($sev, $msg) [pscustomobject]@{ Severity = $sev; Category = 'Email security'; Message = $msg; SiteWide = $true } }
     $hasMx = @(Get-Prop $P 'Mx').Count -gt 0
     $spf = Get-Prop $P 'Spf'; $dm = Get-Prop $P 'Dmarc'
     if (-not (Get-Prop $spf 'Present')) { $out += & $f $(if ($hasMx) { 'Medium' } else { 'Low' }) "${d}: no SPF record, so anyone can send mail that claims to come from it" }
@@ -3388,46 +3390,64 @@ function Get-AccessType {
 
 # ---------------------------------------------------------------------
 # Network risks, read from what discovery already collected. Nothing extra is sent to any device.
-# Returns Severity, Category, Message rows for Add-Flag.
+# Each row is a flag (Severity, Category, Message) plus what the merge needs to combine the same risk
+# seen from two machines at a site: Kind (stable, never reworded), Template ({n} and {list} stand for
+# the count and the device list), Devices (every device, not only the six named) and SiteWide.
 # ---------------------------------------------------------------------
+function Format-RiskMessage {
+    # Template with {n} (the count) and {list} (the first six devices, then 'and N more') filled in.
+    # The merge has the same function, to rebuild a message from two machines' device lists.
+    param([string]$Template, $Devices = @(), [int]$Count = -1)
+    $a = @(@($Devices) | Where-Object { $_ } | ForEach-Object { "$_" })
+    if ($Count -lt 0) { $Count = $a.Count }
+    $t = (@($a | Select-Object -First 6)) -join ', '
+    if ($a.Count -gt 6) { $t += " and $($a.Count - 6) more" }
+    return $Template.Replace('{n}', "$Count").Replace('{list}', $t)
+}
+
 function Get-NetworkRiskFlags {
     param($R, [datetime]$Now = (Get-Date))
     $out = New-Object Collections.Generic.List[object]
-    $flag = { param($sev, $msg) $out.Add([pscustomobject]@{ Severity = $sev; Category = 'Network risk'; Message = $msg }) }
+    $flag = {
+        param($sev, $kind, $tpl, $labels, $count = -1)
+        $d = @(@($labels) | Where-Object { $_ } | ForEach-Object { "$_" })
+        $out.Add([pscustomobject]@{ Severity = $sev; Category = 'Network risk'; Message = (Format-RiskMessage $tpl $d $count)
+            Kind = $kind; Template = $tpl; Devices = $d; Count = $(if ($count -ge 0) { $count } else { $d.Count }); SiteWide = $true })
+    }
     $label = { param($d) $n = "$(Get-Prop $d 'Name')"; if ($n) { '{0} ({1})' -f (Get-Prop $d 'IP'), $n.Split('.')[0] } else { "$(Get-Prop $d 'IP')" } }
-    $list = { param($items) $a = @($items); $t = (@($a | Select-Object -First 6 | ForEach-Object { & $label $_ })) -join ', '; if ($a.Count -gt 6) { $t += " and $($a.Count - 6) more" }; $t }
+    $labels = { param($items) @(@($items) | ForEach-Object { & $label $_ }) }
     $devs = @(@(Get-Prop $R 'Identify', 'Devices') | Where-Object { $_ })
     $ports = { param($d) @(@(Get-Prop $d 'OpenPorts') | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ }) }
 
     $smb1 = @($devs | Where-Object { Get-Prop $_ 'Smb', 'Smb1Enabled' })
-    if ($smb1.Count) { & $flag 'High' "$($smb1.Count) device(s) still accept SMBv1, the file-sharing version WannaCry spread over: $(& $list $smb1)" }
+    if ($smb1.Count) { & $flag 'High' 'Smb1' '{n} device(s) still accept SMBv1, the file-sharing version WannaCry spread over: {list}' (& $labels $smb1) }
     $telnet = @($devs | Where-Object { (& $ports $_) -contains 23 })
-    if ($telnet.Count) { & $flag 'Medium' "$($telnet.Count) device(s) accept Telnet, where logins cross the network in clear text: $(& $list $telnet)" }
+    if ($telnet.Count) { & $flag 'Medium' 'Telnet' '{n} device(s) accept Telnet, where logins cross the network in clear text: {list}' (& $labels $telnet) }
     $ftp = @($devs | Where-Object { (& $ports $_) -contains 21 })
-    if ($ftp.Count) { & $flag 'Low' "$($ftp.Count) device(s) run FTP, where logins cross the network in clear text: $(& $list $ftp)" }
+    if ($ftp.Count) { & $flag 'Low' 'Ftp' '{n} device(s) run FTP, where logins cross the network in clear text: {list}' (& $labels $ftp) }
 
     # A web page only over plain HTTP: whatever is typed into its login crosses the network unencrypted.
     $httpOnly = @($devs | Where-Object {
         $w = @(@(Get-Prop $_ 'Web') | Where-Object { $_ -and (Get-Prop $_ 'Status') })
         @($w | Where-Object { "$(Get-Prop $_ 'Url')" -like 'http://*' }).Count -and -not @($w | Where-Object { "$(Get-Prop $_ 'Url')" -like 'https://*' }).Count
     })
-    if ($httpOnly.Count) { & $flag 'Low' "$($httpOnly.Count) device(s) offer their web page only over plain HTTP, so a login there is sent unencrypted: $(& $list $httpOnly)" }
+    if ($httpOnly.Count) { & $flag 'Low' 'HttpOnlyLogin' '{n} device(s) offer their web page only over plain HTTP, so a login there is sent unencrypted: {list}' (& $labels $httpOnly) }
 
     $expired = @($devs | Where-Object {
         @(@(Get-Prop $_ 'Web') | Where-Object { $na = "$(Get-Prop $_ 'CertNotAfter')"; $na -and ([datetime]$na) -lt $Now }).Count
     })
-    if ($expired.Count) { & $flag 'Low' "$($expired.Count) device(s) present an expired HTTPS certificate, which teaches people to click through certificate warnings: $(& $list $expired)" }
+    if ($expired.Count) { & $flag 'Low' 'ExpiredCertificate' '{n} device(s) present an expired HTTPS certificate, which teaches people to click through certificate warnings: {list}' (& $labels $expired) }
 
     # Remote Desktop and file sharing reachable from an office port across routing
     $remote = @($devs | Where-Object { Get-Prop $_ 'Remote' })
     $rdp = @($remote | Where-Object { (& $ports $_) -contains 3389 })
-    if ($rdp.Count) { & $flag 'Medium' "From an ordinary office port, Remote Desktop answers on $($rdp.Count) device(s) on other subnets, with nothing filtering in between: $(& $list $rdp)" }
+    if ($rdp.Count) { & $flag 'Medium' 'RdpAcrossSubnets' 'From an ordinary office port, Remote Desktop answers on {n} device(s) on other subnets, with nothing filtering in between: {list}' (& $labels $rdp) }
     $smb = @($remote | Where-Object { (& $ports $_) -contains 445 })
-    if ($smb.Count) { & $flag 'Medium' "From an ordinary office port, file sharing answers on $($smb.Count) device(s) on other subnets, the path ransomware spreads along: $(& $list $smb)" }
+    if ($smb.Count) { & $flag 'Medium' 'SmbAcrossSubnets' 'From an ordinary office port, file sharing answers on {n} device(s) on other subnets, the path ransomware spreads along: {list}' (& $labels $smb) }
 
     $snmpN = Get-Prop $R 'Snmp', 'Answered'
     if ($snmpN -and "$(Get-Prop $R 'Snmp', 'Community')" -eq 'public') {
-        & $flag 'Medium' "$snmpN device(s) answer SNMP with the default community 'public': anyone on the network can read their configuration, ARP tables and routes"
+        & $flag 'Medium' 'SnmpPublic' "{n} device(s) answer SNMP with the default community 'public': anyone on the network can read their configuration, ARP tables and routes" @() ([int]$snmpN)
     }
 
     # SSH servers from before 2017 (OpenSSH under 7.4, Dropbear before 2017)
@@ -3435,19 +3455,19 @@ function Get-NetworkRiskFlags {
         $b = "$(Get-Prop $_ 'SshBanner')"
         ($b -match 'OpenSSH_(\d+)\.(\d+)' -and ([int]$matches[1] -lt 7 -or ([int]$matches[1] -eq 7 -and [int]$matches[2] -lt 4))) -or ($b -match 'dropbear_(\d{4})' -and [int]$matches[1] -lt 2017)
     })
-    if ($oldSsh.Count) { & $flag 'Low' "$($oldSsh.Count) device(s) run an SSH server from before 2017, a sign of firmware that has not been updated in years: $(& $list $oldSsh)" }
+    if ($oldSsh.Count) { & $flag 'Low' 'OldSsh' '{n} device(s) run an SSH server from before 2017, a sign of firmware that has not been updated in years: {list}' (& $labels $oldSsh) }
 
     # Windows that no longer gets security updates, named by the file-sharing handshake
     $hosts = @(@(Get-Prop $R 'WindowsHosts', 'Hosts') | Where-Object { $_ })
     $dead = @($hosts | Where-Object { "$(Get-Prop $_ 'Os')" -match '^Windows (7|8)\b' })
-    if ($dead.Count) { & $flag 'High' "$($dead.Count) machine(s) on the network run Windows that no longer gets security updates (Windows 7 or 8, Server 2008 R2 or 2012): $((@($dead | Select-Object -First 6 | ForEach-Object { '{0} ({1}, {2})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'ComputerName'), (Get-Prop $_ 'Os') })) -join ', ')" }
+    if ($dead.Count) { & $flag 'High' 'WindowsUnsupported' '{n} machine(s) on the network run Windows that no longer gets security updates (Windows 7 or 8, Server 2008 R2 or 2012): {list}' @($dead | ForEach-Object { '{0} ({1}, {2})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'ComputerName'), (Get-Prop $_ 'Os') }) }
     $checks = @(@(Get-Prop $R 'LeadChecks', 'Checks') | Where-Object { $_ })
     $oldEsx = @($checks | Where-Object { "$(Get-Prop $_ 'Kind')" -eq 'Hypervisor' -and "$(Get-Prop $_ 'Version')" -match '^(5|6|7)\.' })
-    if ($oldEsx.Count) { & $flag 'High' "$($oldEsx.Count) VMware host(s) run a version out of general support (6.x ended 2022, 7.0 in October 2025): $((@($oldEsx | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'What') })) -join ', ')" }
+    if ($oldEsx.Count) { & $flag 'High' 'VmwareUnsupported' '{n} VMware host(s) run a version out of general support (6.x ended 2022, 7.0 in October 2025): {list}' @($oldEsx | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'What') }) }
     $bmc = @($checks | Where-Object { "$(Get-Prop $_ 'Kind')" -eq 'ServerManagement' })
-    if ($bmc.Count) { & $flag 'Medium' "$($bmc.Count) server management controller(s) (iDRAC, iLO and similar) can be reached from an ordinary office port; they belong on a management network: $((@($bmc | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'What') })) -join ', ')" }
+    if ($bmc.Count) { & $flag 'Medium' 'ServerManagement' '{n} server management controller(s) (iDRAC, iLO and similar) can be reached from an ordinary office port; they belong on a management network: {list}' @($bmc | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'What') }) }
     $w10 = @($hosts | Where-Object { "$(Get-Prop $_ 'Os')" -like 'Windows 10 (*' })
-    if ($w10.Count) { & $flag 'Medium' "$($w10.Count) machine(s) on the network run Windows 10, out of support since October 2025 unless they are LTSC or covered by Extended Security Updates: $((@($w10 | Select-Object -First 6 | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'ComputerName') })) -join ', ')" }
+    if ($w10.Count) { & $flag 'Medium' 'Windows10' '{n} machine(s) on the network run Windows 10, out of support since October 2025 unless they are LTSC or covered by Extended Security Updates: {list}' @($w10 | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'ComputerName') }) }
 
     return $out.ToArray()
 }
@@ -7518,12 +7538,14 @@ $Result['Findings'] = $script:Findings
 
 # ---------------- Flags ----------------
 try {
-    foreach ($dp in @(Get-Val $Result['Domains'] 'Domains')) { foreach ($df in @(Get-DomainFlags $dp)) { Add-Flag $df.Severity $df.Category $df.Message } }
-    foreach ($af in @(Get-AdSiteFlags (Get-AdSiteCheck $Result))) { Add-Flag $af.Severity $af.Category $af.Message }
+    # These rows keep their extra fields (SiteWide, and for network risks Kind, Template, Devices), which
+    # the merge uses to show a site-wide finding once per site.
+    foreach ($dp in @(Get-Val $Result['Domains'] 'Domains')) { $script:Flags += @(Get-DomainFlags $dp) }
+    $script:Flags += @(Get-AdSiteFlags (Get-AdSiteCheck $Result))
     $Result['RdpTransport'] = Get-RdpTransportCheck $Result
     foreach ($rf in @(Get-RdpTransportFlags $Result['RdpTransport'] ([bool]@($RdpHosts).Count))) { Add-Flag $rf.Severity $rf.Category $rf.Message }
     if ("$(Get-Prop $Result 'Ipv6', 'Status')" -eq 'Broken') { Add-Flag 'Medium' 'Network' 'IPv6 is offered but does not reach the internet (slow first connections)' }
-    foreach ($rf in @(Get-NetworkRiskFlags $Result)) { Add-Flag $rf.Severity $rf.Category $rf.Message }
+    $script:Flags += @(Get-NetworkRiskFlags $Result)
     foreach ($sd in @(Get-Val $Result['Snmp'] 'Devices')) {
         $u = Get-Prop $sd 'Ups'
         if (-not $u) { continue }

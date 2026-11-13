@@ -55,7 +55,8 @@ function New-FixtureRun {
         [string]$Model = 'OptiPlex 7010', [string]$Manufacturer = 'Dell Inc.', [double]$AgeYears = 2.5,
         [string]$Os = 'Microsoft Windows 11 Pro', [bool]$IsWindows10 = $false, [double]$RamGB = 16,
         [object[]]$Flags = @(), [string]$DataCheck = 'PASS', [string]$Ipv6 = 'Not offered',
-        [System.Collections.IDictionary]$Extra = @{}
+        [System.Collections.IDictionary]$Extra = @{},
+        [switch]$NoOptions   # a run from a collector that did not record its options
     )
     $bwStart = $RunStart.AddMinutes(1)
     $hops = New-FixtureHops -Gateway $Gateway -FirstPublicMs ([math]::Max(3, $InetAvgMs - 6))
@@ -107,6 +108,7 @@ function New-FixtureRun {
         Ipv6 = $(if ($Ipv6 -eq 'Working') { [ordered]@{ Status = 'Working'; GlobalPrefixes = @('2001:db8:20:1::/64'); TemporaryAddresses = $true; UniqueLocal = $false; DefaultRoute = $true; RouterIsLinkLocal = $true; DnsServers = @(); Egress = [ordered]@{ Reached = $true; Prefix = '2001:db8:20:1::/64'; SameAsPc = $true; Colo = 'ORD' }; Ping = [ordered]@{ Sent = 10; Received = 10; LossPct = 0; AvgMs = 14.2 }; AaaaLookup = $true } } else { [ordered]@{ Status = 'Not offered'; GlobalPrefixes = @(); DefaultRoute = $false; UniqueLocal = $false; AaaaLookup = $true } })
     }
     foreach ($k in $Extra.Keys) { $run[$k] = $Extra[$k] }
+    if ($NoOptions) { $run.Meta.Remove('Options') }
     return $run
 }
 

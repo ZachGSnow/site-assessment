@@ -231,11 +231,12 @@ function Get-AdSiteCheck {
 }
 
 function Get-AdSiteFlags {
-    # Severity, Category, Message rows for what Get-AdSiteCheck found.
+    # Severity, Category, Message rows for what Get-AdSiteCheck found. SiteWide is set only on what
+    # describes the directory itself; the rest is about this PC or this user, so the merge names the machine.
     param($C)
     if (-not $C) { return @() }
     $out = @()
-    $f = { param($sev, $msg) [pscustomobject]@{ Severity = $sev; Category = 'Active Directory'; Message = $msg } }
+    $f = { param($sev, $msg, [switch]$SiteWide) [pscustomobject]@{ Severity = $sev; Category = 'Active Directory'; Message = $msg; SiteWide = [bool]$SiteWide } }
     if ($C.Ip -and -not $C.AdSubnet) {
         $out += & $f 'Medium' "This PC's address $($C.Ip) is in no Active Directory subnet, so it logs on to whichever domain controller answers first, possibly across the WAN: add its subnet to the right site in AD Sites and Services"
     } elseif ($C.CurrentSite -and $C.SiteBySubnet -and $C.CurrentSite -ne $C.SiteBySubnet) {
@@ -245,6 +246,6 @@ function Get-AdSiteFlags {
     if ($C.LogonServer -and $C.LogonServerSite -and $mySite -and $C.LogonServerSite -ne $mySite -and $C.SiteHasDc) {
         $out += & $f 'Medium' "This user logged on to $($C.LogonServer) in site $($C.LogonServerSite), not to a domain controller in this PC's own site $mySite"
     }
-    foreach ($s in @($C.SitesWithoutDc)) { $out += & $f 'Low' "AD site $s has subnets but no domain controller, so its PCs log on across the WAN (fine when that is the design, worth knowing when the link goes down)" }
+    foreach ($s in @($C.SitesWithoutDc)) { $out += & $f 'Low' "AD site $s has subnets but no domain controller, so its PCs log on across the WAN (fine when that is the design, worth knowing when the link goes down)" -SiteWide }
     return $out
 }

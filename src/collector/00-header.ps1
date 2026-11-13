@@ -42,7 +42,8 @@
     server when 1.1.1.1 cannot be reached); connection tests to Microsoft 365, public STUN
     and NTP servers and portquiz.net. M-Lab and Vultr are used only when the Cloudflare
     speed test fails. M-Lab publishes every test, including the public IP, in its open
-    dataset: remove 'MLab' from $BandwidthProviders if the client would object.
+    dataset: remove 'MLab' from $BandwidthProviders if the client would object. Vultr only
+    tests download, so without M-Lab a failed Cloudflare upload test leaves no upload figure.
 
 .PARAMETER SiteName
     Site/office name. Prompted for when omitted.

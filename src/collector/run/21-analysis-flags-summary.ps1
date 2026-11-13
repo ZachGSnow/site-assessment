@@ -13,12 +13,14 @@ $Result['Findings'] = $script:Findings
 
 # ---------------- Flags ----------------
 try {
-    foreach ($dp in @(Get-Val $Result['Domains'] 'Domains')) { foreach ($df in @(Get-DomainFlags $dp)) { Add-Flag $df.Severity $df.Category $df.Message } }
-    foreach ($af in @(Get-AdSiteFlags (Get-AdSiteCheck $Result))) { Add-Flag $af.Severity $af.Category $af.Message }
+    # These rows keep their extra fields (SiteWide, and for network risks Kind, Template, Devices), which
+    # the merge uses to show a site-wide finding once per site.
+    foreach ($dp in @(Get-Val $Result['Domains'] 'Domains')) { $script:Flags += @(Get-DomainFlags $dp) }
+    $script:Flags += @(Get-AdSiteFlags (Get-AdSiteCheck $Result))
     $Result['RdpTransport'] = Get-RdpTransportCheck $Result
     foreach ($rf in @(Get-RdpTransportFlags $Result['RdpTransport'] ([bool]@($RdpHosts).Count))) { Add-Flag $rf.Severity $rf.Category $rf.Message }
     if ("$(Get-Prop $Result 'Ipv6', 'Status')" -eq 'Broken') { Add-Flag 'Medium' 'Network' 'IPv6 is offered but does not reach the internet (slow first connections)' }
-    foreach ($rf in @(Get-NetworkRiskFlags $Result)) { Add-Flag $rf.Severity $rf.Category $rf.Message }
+    $script:Flags += @(Get-NetworkRiskFlags $Result)
     foreach ($sd in @(Get-Val $Result['Snmp'] 'Devices')) {
         $u = Get-Prop $sd 'Ups'
         if (-not $u) { continue }
