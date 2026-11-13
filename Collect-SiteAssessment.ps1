@@ -1182,7 +1182,7 @@ function Get-HttpBannersBulk {
             $tasks = @($batch | Where-Object { $_[2] } | ForEach-Object { $_[2] })
             if ($tasks.Count) { try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$tasks, $TimeoutMs) } catch { } }
             foreach ($b in $batch) {
-                $r = [ordered]@{ Url = $b[0]; Status = $null; Server = $null; Title = $null; BodySample = $null; AuthRealm = $null; CertSubject = $null; CertIssuer = $null; Error = $null }
+                $r = [ordered]@{ Url = $b[0]; Status = $null; Server = $null; Title = $null; BodySample = $null; AuthRealm = $null; CertSubject = $null; CertIssuer = $null; CertNotAfter = $null; Error = $null }
                 $resp = $null
                 if (-not $b[2]) { $r.Error = 'request could not be started' }
                 elseif ("$($b[2].Status)" -eq 'RanToCompletion') { $resp = $b[2].Result }
@@ -1190,7 +1190,7 @@ function Get-HttpBannersBulk {
                     $ex = $b[2].Exception.GetBaseException()
                     if ($ex -is [Net.WebException] -and $ex.Response) { $resp = $ex.Response } else { $r.Error = $ex.Message }
                 } else { $r.Error = 'timed out'; try { $b[1].Abort() } catch { } }
-                try { if ($b[1] -and $b[1].ServicePoint -and $b[1].ServicePoint.Certificate) { $r.CertSubject = $b[1].ServicePoint.Certificate.Subject; $r.CertIssuer = $b[1].ServicePoint.Certificate.Issuer } } catch { }
+                try { if ($b[1] -and $b[1].ServicePoint -and $b[1].ServicePoint.Certificate) { $r.CertSubject = $b[1].ServicePoint.Certificate.Subject; $r.CertIssuer = $b[1].ServicePoint.Certificate.Issuer; $r.CertNotAfter = (New-Object Security.Cryptography.X509Certificates.X509Certificate2 $b[1].ServicePoint.Certificate).NotAfter.ToString('s') } } catch { }
                 if ($resp) {
                     try {
                         $r.Status = [int]$resp.StatusCode
@@ -2112,6 +2112,67 @@ function Get-RouterTables {
         Routes = $routes
         DefaultRoute = @($routes | Where-Object { $_.Destination -eq '0.0.0.0' -and $_.Prefix -eq 0 } | ForEach-Object { $_.NextHop } | Select-Object -First 1)
     }
+}
+
+# ---------------------------------------------------------------------
+# Network risks, read from what discovery already collected. Nothing extra is sent to any device.
+# Returns Severity, Category, Message rows for Add-Flag.
+# ---------------------------------------------------------------------
+function Get-NetworkRiskFlags {
+    param($R, [datetime]$Now = (Get-Date))
+    $out = New-Object Collections.Generic.List[object]
+    $flag = { param($sev, $msg) $out.Add([pscustomobject]@{ Severity = $sev; Category = 'Network risk'; Message = $msg }) }
+    $label = { param($d) $n = "$(Get-Prop $d 'Name')"; if ($n) { '{0} ({1})' -f (Get-Prop $d 'IP'), $n.Split('.')[0] } else { "$(Get-Prop $d 'IP')" } }
+    $list = { param($items) $a = @($items); $t = (@($a | Select-Object -First 6 | ForEach-Object { & $label $_ })) -join ', '; if ($a.Count -gt 6) { $t += " and $($a.Count - 6) more" }; $t }
+    $devs = @(@(Get-Prop $R 'Identify', 'Devices') | Where-Object { $_ })
+    $ports = { param($d) @(@(Get-Prop $d 'OpenPorts') | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ }) }
+
+    $smb1 = @($devs | Where-Object { Get-Prop $_ 'Smb', 'Smb1Enabled' })
+    if ($smb1.Count) { & $flag 'High' "$($smb1.Count) device(s) still accept SMBv1, the file-sharing version WannaCry spread over: $(& $list $smb1)" }
+    $telnet = @($devs | Where-Object { (& $ports $_) -contains 23 })
+    if ($telnet.Count) { & $flag 'Medium' "$($telnet.Count) device(s) accept Telnet, where logins cross the network in clear text: $(& $list $telnet)" }
+    $ftp = @($devs | Where-Object { (& $ports $_) -contains 21 })
+    if ($ftp.Count) { & $flag 'Low' "$($ftp.Count) device(s) run FTP, where logins cross the network in clear text: $(& $list $ftp)" }
+
+    # A web page only over plain HTTP: whatever is typed into its login crosses the network unencrypted.
+    $httpOnly = @($devs | Where-Object {
+        $w = @(@(Get-Prop $_ 'Web') | Where-Object { $_ -and (Get-Prop $_ 'Status') })
+        @($w | Where-Object { "$(Get-Prop $_ 'Url')" -like 'http://*' }).Count -and -not @($w | Where-Object { "$(Get-Prop $_ 'Url')" -like 'https://*' }).Count
+    })
+    if ($httpOnly.Count) { & $flag 'Low' "$($httpOnly.Count) device(s) offer their web page only over plain HTTP, so a login there is sent unencrypted: $(& $list $httpOnly)" }
+
+    $expired = @($devs | Where-Object {
+        @(@(Get-Prop $_ 'Web') | Where-Object { $na = "$(Get-Prop $_ 'CertNotAfter')"; $na -and ([datetime]$na) -lt $Now }).Count
+    })
+    if ($expired.Count) { & $flag 'Low' "$($expired.Count) device(s) present an expired HTTPS certificate, which teaches people to click through certificate warnings: $(& $list $expired)" }
+
+    # Remote Desktop and file sharing reachable from an office port across routing
+    $remote = @($devs | Where-Object { Get-Prop $_ 'Remote' })
+    $rdp = @($remote | Where-Object { (& $ports $_) -contains 3389 })
+    if ($rdp.Count) { & $flag 'Medium' "From an ordinary office port, Remote Desktop answers on $($rdp.Count) device(s) on other subnets, with nothing filtering in between: $(& $list $rdp)" }
+    $smb = @($remote | Where-Object { (& $ports $_) -contains 445 })
+    if ($smb.Count) { & $flag 'Medium' "From an ordinary office port, file sharing answers on $($smb.Count) device(s) on other subnets, the path ransomware spreads along: $(& $list $smb)" }
+
+    $snmpN = Get-Prop $R 'Snmp', 'Answered'
+    if ($snmpN -and "$(Get-Prop $R 'Snmp', 'Community')" -eq 'public') {
+        & $flag 'Medium' "$snmpN device(s) answer SNMP with the default community 'public': anyone on the network can read their configuration, ARP tables and routes"
+    }
+
+    # SSH servers from before 2017 (OpenSSH under 7.4, Dropbear before 2017)
+    $oldSsh = @($devs | Where-Object {
+        $b = "$(Get-Prop $_ 'SshBanner')"
+        ($b -match 'OpenSSH_(\d+)\.(\d+)' -and ([int]$matches[1] -lt 7 -or ([int]$matches[1] -eq 7 -and [int]$matches[2] -lt 4))) -or ($b -match 'dropbear_(\d{4})' -and [int]$matches[1] -lt 2017)
+    })
+    if ($oldSsh.Count) { & $flag 'Low' "$($oldSsh.Count) device(s) run an SSH server from before 2017, a sign of firmware that has not been updated in years: $(& $list $oldSsh)" }
+
+    # Windows that no longer gets security updates, named by the file-sharing handshake
+    $hosts = @(@(Get-Prop $R 'WindowsHosts', 'Hosts') | Where-Object { $_ })
+    $dead = @($hosts | Where-Object { "$(Get-Prop $_ 'Os')" -match '^Windows (7|8)\b' })
+    if ($dead.Count) { & $flag 'High' "$($dead.Count) machine(s) on the network run Windows that no longer gets security updates (Windows 7 or 8, Server 2008 R2 or 2012): $((@($dead | Select-Object -First 6 | ForEach-Object { '{0} ({1}, {2})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'ComputerName'), (Get-Prop $_ 'Os') })) -join ', ')" }
+    $w10 = @($hosts | Where-Object { "$(Get-Prop $_ 'Os')" -like 'Windows 10 (*' })
+    if ($w10.Count) { & $flag 'Medium' "$($w10.Count) machine(s) on the network run Windows 10, out of support since October 2025 unless they are LTSC or covered by Extended Security Updates: $((@($w10 | Select-Object -First 6 | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'ComputerName') })) -join ', ')" }
+
+    return $out.ToArray()
 }
 
 function Get-AssessmentFindings {
@@ -6482,6 +6543,7 @@ $Result['Findings'] = $script:Findings
 
 # ---------------- Flags ----------------
 try {
+    foreach ($rf in @(Get-NetworkRiskFlags $Result)) { Add-Flag $rf.Severity $rf.Category $rf.Message }
     foreach ($sd in @(Get-Val $Result['Snmp'] 'Devices')) {
         $u = Get-Prop $sd 'Ups'
         if (-not $u) { continue }
