@@ -772,3 +772,43 @@ Describe 'Collector build' {
         }
     }
 }
+
+Describe 'Active Directory site cross-check' {
+    BeforeAll {
+        $script:AdSites = @{ Forest = 'northwind.local'; CurrentSite = 'Main-Office'; LogonServer = 'NW-DC02'; Sites = @(
+            @{ Name = 'Main-Office'; Subnets = @('10.20.1.0/24'); Servers = @('nw-dc01.northwind.local') }
+            @{ Name = 'Warehouse'; Subnets = @('10.20.2.0/24'); Servers = @() }
+            @{ Name = 'Datacenter'; Subnets = @('10.20.0.0/24'); Servers = @('nw-dc02.northwind.local') }
+            @{ Name = 'Lab'; Subnets = @(); Servers = @() }
+        ) }
+        $script:Msg = { param($r) @(Get-AdSiteFlags (Get-AdSiteCheck $r)) | ForEach-Object Message }
+    }
+    It 'places this PC in the site its subnet belongs to' {
+        $c = Get-AdSiteCheck @{ Network = @{ SourceIp = '10.20.1.25' }; AdSites = $AdSites }
+        $c.AdSubnet | Should -Be '10.20.1.0/24'
+        $c.SiteBySubnet | Should -Be 'Main-Office'
+        $c.LogonServerSite | Should -Be 'Datacenter'
+        $c.SitesWithoutDc | Should -Be @('Warehouse') -Because 'Lab has no subnets, so no PC is placed there'
+    }
+    It 'flags a logon to a domain controller in another site when this site has its own' {
+        (& $Msg @{ Network = @{ SourceIp = '10.20.1.25' }; AdSites = $AdSites }) | Should -Contain 'This user logged on to NW-DC02 in site Datacenter, not to a domain controller in this PC''s own site Main-Office'
+    }
+    It 'flags a PC whose subnet AD does not know' {
+        $m = & $Msg @{ Network = @{ SourceIp = '10.20.7.40' }; AdSites = $AdSites }
+        @($m | Where-Object { $_ -like '*is in no Active Directory subnet*' }).Count | Should -Be 1
+    }
+    It 'says nothing about the logon server when it is in the PC''s own site' {
+        $ad = $AdSites.Clone(); $ad.LogonServer = 'NW-DC01'
+        @(& $Msg @{ Network = @{ SourceIp = '10.20.1.25' }; AdSites = $ad } | Where-Object { $_ -like '*logged on to*' }).Count | Should -Be 0
+    }
+    It 'notes a site with subnets but no domain controller' {
+        @(& $Msg @{ Network = @{ SourceIp = '10.20.1.25' }; AdSites = $AdSites } | Where-Object { $_ -like 'AD site Warehouse has subnets but no domain controller*' }).Count | Should -Be 1
+    }
+    It 'files them under one category the merge keeps once per site' {
+        @(Get-AdSiteFlags (Get-AdSiteCheck @{ Network = @{ SourceIp = '10.20.7.40' }; AdSites = $AdSites }) | ForEach-Object Category | Sort-Object -Unique) | Should -Be @('Active Directory')
+    }
+    It 'does nothing on a PC that is not in a domain' {
+        Get-AdSiteCheck @{ Network = @{ SourceIp = '10.20.1.25' } } | Should -BeNullOrEmpty
+        @(Get-AdSiteFlags $null).Count | Should -Be 0
+    }
+}

@@ -627,7 +627,13 @@ function Get-AssessmentFindings {
         if (Get-Prop $R 'AdSites', 'CurrentSite') { $t += " This PC belongs to site $(Get-Prop $R 'AdSites', 'CurrentSite')." }
         $empty = @($sites | Where-Object { -not @(Get-Prop $_ 'Subnets').Count })
         if ($empty.Count) { $t += " $($empty.Count) site(s) have no subnets, so their machines log on to whichever domain controller answers first." }
-        & $add 'Network layout' 'Confirmed' $t @('Read from Active Directory Sites and Services as the signed-in user')
+        $ac = Get-AdSiteCheck $R
+        $ev = @('Read from Active Directory Sites and Services as the signed-in user')
+        if ($ac) {
+            $ev += $(if ($ac.AdSubnet) { "This PC's address $($ac.Ip) is in AD subnet $($ac.AdSubnet) (site $($ac.SiteBySubnet))" } else { "This PC's address $($ac.Ip) is in no AD subnet" })
+            if ($ac.LogonServer) { $ev += "Logon server: $($ac.LogonServer)$(if ($ac.LogonServerSite) { " in site $($ac.LogonServerSite)" })" }
+        }
+        & $add 'Network layout' 'Confirmed' $t $ev
     }
 
     # ---- Follow-up checks on leads ----
