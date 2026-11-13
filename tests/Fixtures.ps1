@@ -54,13 +54,14 @@ function New-FixtureRun {
         [string[]]$SelectedTargets = @(), [object[]]$TcpSeries = @(), [object[]]$ExtraTraces = @(),
         [string]$Model = 'OptiPlex 7010', [string]$Manufacturer = 'Dell Inc.', [double]$AgeYears = 2.5,
         [string]$Os = 'Microsoft Windows 11 Pro', [bool]$IsWindows10 = $false, [double]$RamGB = 16,
-        [object[]]$Flags = @(), [string]$DataCheck = 'PASS'
+        [object[]]$Flags = @(), [string]$DataCheck = 'PASS',
+        [System.Collections.IDictionary]$Extra = @{}
     )
     $bwStart = $RunStart.AddMinutes(1)
     $hops = New-FixtureHops -Gateway $Gateway -FirstPublicMs ([math]::Max(3, $InetAvgMs - 6))
     $traces = @(New-FixtureTrace '1.1.1.1' $hops) + @($ExtraTraces)
     $wifi = if ($Connection -eq 'Wi-Fi') { [ordered]@{ SSID = 'Northwind-Staff'; Band = '5 GHz'; Channel = 36; SignalPct = 82; RadioType = '802.11ax'; ApVendor = 'Ubiquiti' } } else { $null }
-    [ordered]@{
+    $run = [ordered]@{
         Meta = [ordered]@{
             ScriptVersion = '1.0.0'; SiteName = $Site; Notes = ''; Hostname = $Hostname; RunStart = $RunStart.ToString('s')
             TimeZone = 'Eastern Standard Time'; RunAsUser = "NORTHWIND\$User"; InventoriedUser = "NORTHWIND\$User"; SameUser = $true
@@ -102,6 +103,8 @@ function New-FixtureRun {
         Validation = [ordered]@{ Overall = $DataCheck; Checks = @() }
         Errors = @()
     }
+    foreach ($k in $Extra.Keys) { $run[$k] = $Extra[$k] }
+    return $run
 }
 
 function Save-FixtureRun {
@@ -138,10 +141,28 @@ function New-MultiSiteFixture {
     $hd = @{ Profile = 'Custom'; Name = 'Contoso Cloud'; HostPattern = 'contosocloud\.com'; Targets = @('connect.contosocloud.com:443') }
     $portal = 'connect.contosocloud.com'
     $t0 = [datetime]'2026-03-10T09:00:00'
+    # With -Discovery, the front desk PC also swept the warehouse subnet across the site tunnel.
+    $remote = [ordered]@{
+        RemoteSubnets = [ordered]@{ Candidates = @([ordered]@{ Cidr = '10.20.2.0/24'; Reasons = @('route via 10.20.1.254'); Hosted = $false }); Answer = '1'
+                                    Selected = @([ordered]@{ Subnet = '10.20.2.0/24'; Reason = 'chosen at the prompt (route via 10.20.1.254)' }); Rejected = @() }
+        RemoteSweep = [ordered]@{
+            Subnets = @([ordered]@{ Subnet = '10.20.2.0/24'; Reason = 'chosen at the prompt (route via 10.20.1.254)'; AddressesSwept = 254; PingResponders = 1; TcpOnly = 1; Devices = 2; Seconds = 14.2 })
+            PortsChecked = @(22, 80, 443, 445, 3389, 9100); PresencePorts = @(22, 80, 443, 445, 3389)
+            RoleSummary = @('Printer: 1', 'Windows PC, server or NAS (file sharing on): 1')
+            Devices = @(
+                [ordered]@{ IP = '10.20.2.40'; Mac = $null; Vendor = $null; RespondedToPing = $true; Name = 'nw-dock-mfp.northwind.local'; OpenPorts = @(80, 443, 9100); Role = 'Printer'; Subnet = '10.20.2.0/24'; Remote = $true }
+                [ordered]@{ IP = '10.20.2.31'; Mac = $null; Vendor = $null; RespondedToPing = $false; Name = $null; OpenPorts = @(445); Role = 'Windows PC, server or NAS (file sharing on)'; Subnet = '10.20.2.0/24'; Remote = $true }
+            )
+        }
+        Identify = [ordered]@{ DeviceCount = 2; Devices = @(
+            [ordered]@{ IP = '10.20.2.40'; Mac = $null; MacVendor = $null; MacSource = $null; Subnet = '10.20.2.0/24'; Remote = $true; Name = 'nw-dock-mfp.northwind.local'; OpenPorts = @(80, 443, 9100); Kind = 'Printer'; Vendor = 'Contoso'; Model = 'MFP 400'; Confidence = 'Likely'; Evidence = @('web page title: Contoso MFP 400') }
+            [ordered]@{ IP = '10.20.2.31'; Mac = '00-15-5D-01-02-03'; MacVendor = 'Microsoft Corporation'; MacSource = 'NetBIOS'; Subnet = '10.20.2.0/24'; Remote = $true; Name = 'NW-DOCK02'; OpenPorts = @(445); Kind = 'Windows computer'; Vendor = 'Microsoft'; Confidence = 'Likely'; Evidence = @('NetBIOS name NW-DOCK02') }
+        ) }
+    }
     $runs = @(
         (New-FixtureRun -Site 'Main office' -Hostname 'NW-FRONT01' -Serial 'NWSN0001' -User 'jlee' -RunStart $t0 `
             -SourceIp '10.20.1.25' -Gateway '10.20.1.1' -PublicIp '203.0.113.40' -HostedDesktop $hd -SelectedTargets @($portal, 'rdp.example.com') `
-            -TcpSeries @((New-FixtureSeries $portal 38 0 3 180 443), (New-FixtureSeries 'rdp.example.com' 20 0 1 180 3389)))
+            -TcpSeries @((New-FixtureSeries $portal 38 0 3 180 443), (New-FixtureSeries 'rdp.example.com' 20 0 1 180 3389)) -Extra $remote)
         (New-FixtureRun -Site 'Main office' -Hostname 'NW-ACCT02' -Serial 'NWSN0002' -User 'mgarcia' -Connection 'Wi-Fi' -RunStart $t0.AddSeconds(20) `
             -SourceIp '10.20.1.61' -Gateway '10.20.1.1' -PublicIp '203.0.113.40' -DownMbps 210 -UpMbps 80 -HostedDesktop $hd -SelectedTargets @($portal) `
             -TcpSeries @((New-FixtureSeries $portal 44 0.6 6 180 443)) -Model 'Latitude 5440' -AgeYears 6.1 -Os 'Microsoft Windows 10 Pro' -IsWindows10 $true -RamGB 8 `

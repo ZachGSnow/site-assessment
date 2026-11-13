@@ -268,6 +268,27 @@ foreach ($r in $runs) {
 }
 foreach ($tn in ($testNames.Keys | Sort-Object)) { Write-Host ("Test device: {0} ({1}). Its own hardware, software, printers, history and unrelated RDP targets are left out; its network results are kept." -f $tn, $testNames[$tn]) -ForegroundColor Yellow }
 
+# Devices found across routing belong to the site that owns their subnet, when a machine there was on it.
+$siteNets = @()
+foreach ($r0 in $runs) {
+    foreach ($a in @(V $r0.Network 'Adapters')) {
+        if (-not $a -or $a.Status -ne 'Up') { continue }
+        $ipsA = @($a.IPv4) | Where-Object { Test-IPv4Text $_ }; $masks = @($a.SubnetMask) | Where-Object { Test-IPv4Text $_ }
+        for ($i = 0; $i -lt @($ipsA).Count; $i++) {
+            $ip0 = @($ipsA)[$i]; if ($ip0 -like '169.254.*') { continue }
+            $mask0 = if (@($masks).Count -gt $i) { @($masks)[$i] } else { '255.255.255.0' }
+            $siteNets += [pscustomobject]@{ Site = $siteDisplay[$r0._SiteKey]; Cidr = (Get-NetworkCidr $ip0 (Get-PrefixFromMask $mask0)) }
+        }
+    }
+}
+$siteNets = @($siteNets | Sort-Object Site, Cidr -Unique)
+function Get-OwnerSite {
+    param([string]$Ip)
+    $hit = @($siteNets | Where-Object { Test-InCidr $Ip $_.Cidr } | Sort-Object { [int]$_.Cidr.Split('/')[1] } -Descending | Select-Object -First 1)
+    if ($hit.Count) { return $hit[0].Site }
+    return $null
+}
+
 $endpoints = @(); $printers = @(); $periph = @(); $gear = @(); $flags = @(); $deviceFlags = @()
 $runFindings = @(); $devices = @()
 $software = @(); $traceRows = @(); $pingRows = @(); $rdpRows = @()
@@ -404,6 +425,13 @@ foreach ($r in $runs) {
             $gear += [pscustomobject][ordered]@{ Site = $site; SeenFrom = $hostName; Type = 'Subnet device'; Name = V $dv 'Name'; IP = $dv.IP; Mac = $dv.Mac; Vendor = $dv.Vendor; Detail = $detail }
         }
     }
+    foreach ($dv in @(V $r.RemoteSweep 'Devices')) {
+        if (-not $dv) { continue }
+        $owner = Get-OwnerSite "$($dv.IP)"
+        $ports = @(V $dv 'OpenPorts') | Where-Object { $null -ne $_ }
+        $detail = J @((V $dv 'Role'), $(if (@($ports).Count) { 'ports ' + (@($ports) -join ',') }), $(if ($dv.RespondedToPing) { 'answers ping' } else { 'TCP only' }), "subnet $($dv.Subnet)")
+        $gear += [pscustomobject][ordered]@{ Site = $(if ($owner) { $owner } else { $site }); SeenFrom = $(if ($owner -and $owner -ne $site) { "$hostName at $site, across routing" } else { "$hostName, across routing" }); Type = 'Device on another subnet'; Name = V $dv 'Name'; IP = $dv.IP; Mac = $null; Vendor = $null; Detail = $detail }
+    }
     foreach ($sv in $srvList) {
         $gear += [pscustomobject][ordered]@{ Site = $site; SeenFrom = $hostName; Type = 'Server in use by a PC'; Name = $sv.Name; IP = (J $sv.IPs ', '); Mac = $null; Vendor = $null; Detail = ('{0}; {1}' -f $sv.Location, (J $sv.Sources)) }
     }
@@ -417,8 +445,10 @@ foreach ($r in $runs) {
         if (-not $dv) { continue }
         $win = @(V (V $r 'WindowsHosts') 'Hosts') | Where-Object { $_ -and $_.IP -eq $dv.IP } | Select-Object -First 1
         $rn = @(V (V $r 'DnsDiscovery') 'ReverseNames') | Where-Object { $_ -and $_.IP -eq $dv.IP } | Select-Object -First 1
+        $owner = if (V $dv 'Remote') { Get-OwnerSite "$($dv.IP)" } else { $null }
         $devices += [pscustomobject][ordered]@{
-            Site = $site; SeenFrom = $hostName; IP = $dv.IP; Mac = $dv.Mac; MacVendor = $dv.MacVendor
+            Site = $(if ($owner) { $owner } else { $site }); SeenFrom = $(if (V $dv 'Remote') { "$hostName at $site, across routing" } else { $hostName })
+            IP = $dv.IP; Subnet = V $dv 'Subnet'; Mac = $dv.Mac; MacVendor = $dv.MacVendor; MacSource = V $dv 'MacSource'
             Name = $(if ($dv.Name) { $dv.Name } elseif ($rn) { $rn.Name } else { $null }); DnsName = $(if ($rn) { $rn.Name })
             Kind = $dv.Kind; Vendor = $dv.Vendor; Model = $dv.Model; Firmware = $dv.Firmware; Confidence = $dv.Confidence
             WindowsVersion = $(if ($win -and $win.Os) { '{0} ({1})' -f $win.Os, $win.OsVersion }); OpenPorts = (J @($dv.OpenPorts) ',')
@@ -439,7 +469,7 @@ foreach ($e in $endpoints) {
 # traceroute hops, RDP lookups). Nothing here sends any traffic.
 # ---------------------------------------------------------------------
 $subnetMap = [ordered]@{}
-$kindRank = @{ 'Local (machine is on it)' = 0; 'Route on a machine' = 1; 'Inferred /24 (from an address)' = 2 }
+$kindRank = @{ 'Local (machine is on it)' = 0; 'Route on a machine' = 1; 'Swept across routing' = 1; 'Inferred /24 (from an address)' = 2 }
 $epLocal = @{}
 function Add-Subnet {
     param([string]$Site, [string]$Cidr, [string]$Kind, [string]$Source, [string]$SeenFrom, [string]$Device, [string]$Note)
@@ -500,6 +530,17 @@ foreach ($r in $runs) {
         if ($onLink -and $locals -contains $cidr) { continue }
         $via = if ($onLink) { 'on-link' } else { "via $($rt.NextHop)" }
         Add-Subnet $site $cidr 'Route on a machine' ("{0} route {1} ({2})" -f $hn, $via, $rt.Interface) $hn $null $null
+    }
+}
+
+# Pass 1b: subnets swept across routing (with -Discovery), with how many devices answered.
+foreach ($r in $runs) {
+    $site = $siteDisplay[$r._SiteKey]; $hn = $r._Label
+    foreach ($sw in @(V (V $r 'RemoteSweep') 'Subnets')) {
+        if (-not $sw -or -not $sw.Subnet) { continue }
+        $net0 = "$($sw.Subnet)".Split('/')[0]
+        $owner = Get-OwnerSite $net0
+        Add-Subnet $(if ($owner) { $owner } else { $site }) "$($sw.Subnet)" 'Swept across routing' ("{0} swept it from {1} ({2})" -f $hn, $site, $sw.Reason) $hn $null ("{0} devices answered ({1} to ping, {2} only on TCP)" -f $sw.Devices, $sw.PingResponders, $sw.TcpOnly)
     }
 }
 
@@ -1618,9 +1659,11 @@ foreach ($s in $sites) {
     if ($rdpT.Count) { [void]$body.Append((New-Section 'RDP target reachability' (New-Table $rdpT $(if ($ipInfo.Count) { @('Hostname|Machine', 'Host|Target', 'ResolvedIPs|Resolves to', 'Owner|Registered to', 'AddressClass|Class', 'Port', 'Open', 'MedianMs|Median ms', 'JitterMs|Jitter ms') } else { @('Hostname|Machine', 'Host|Target', 'ResolvedIPs|Resolves to', 'AddressClass|Class', 'Port', 'Open', 'MedianMs|Median ms', 'JitterMs|Jitter ms') })) -Badge ("{0} checks" -f $rdpT.Count))) }
 
     $siteGear = @($gear | Where-Object { $_.Site -eq $name })
-    $mainGear = @($siteGear | Where-Object { $_.Type -ne 'Subnet device' })
+    $mainGear = @($siteGear | Where-Object { $_.Type -ne 'Subnet device' -and $_.Type -ne 'Device on another subnet' })
+    $remoteGear = @($siteGear | Where-Object { $_.Type -eq 'Device on another subnet' })
     $sweep = @($siteGear | Where-Object { $_.Type -eq 'Subnet device' })
     $gearBody = (New-Table $mainGear @('Type', 'Name', 'IP', 'Mac|MAC', 'Vendor', 'Detail', 'SeenFrom|Seen from'))
+    if ($remoteGear.Count) { $gearBody += (New-Section ("Devices on other subnets, swept across routing ({0})" -f $remoteGear.Count) (New-Table $remoteGear @('IP', 'Name', 'Detail|Type, open ports and subnet', 'SeenFrom|Found from')) -Open:($remoteGear.Count -le 40)) }
     if ($sweep.Count) { $gearBody += (New-Section ("Subnet sweep devices ({0})" -f $sweep.Count) (New-Table $sweep @('IP', 'Name', 'Detail|Type and open ports', 'Vendor', 'Mac|MAC', 'SeenFrom|Seen from')) -Open:($sweep.Count -le 40)) }
     [void]$body.Append((New-Section 'Network equipment' $gearBody -Badge ("{0} items" -f $siteGear.Count)))
 
