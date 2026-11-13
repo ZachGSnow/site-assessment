@@ -206,3 +206,15 @@ Describe 'Leads in the merged report' {
         ($GearL | Where-Object Type -eq 'VMware host').IP | Should -Be '10.20.1.40'
     }
 }
+
+Describe 'Email domains in the merged report' {
+    BeforeAll { $script:Doms = @(Import-Csv (Join-Path $MultiOut 'Domains.csv')); $script:HtmlM = [IO.File]::ReadAllText((Join-Path $MultiOut 'Report.html')) }
+    It 'lists each domain once, even when several machines checked it' {
+        $Doms.Count | Should -Be 1
+        $Doms[0].Domain | Should -Be 'northwindtraders.com'
+        $Doms[0].Dmarc | Should -Be 'p=none'
+    }
+    It 'shows the email domain table near the top of the report' {
+        $HtmlM | Should -Match 'Email and domain \(public DNS\)'
+    }
+}

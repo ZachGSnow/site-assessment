@@ -102,6 +102,7 @@ function New-FixtureRun {
         Flags = @($Flags)
         Validation = [ordered]@{ Overall = $DataCheck; Checks = @() }
         Errors = @()
+        Domains = [ordered]@{ Domains = @([ordered]@{ Domain = 'northwindtraders.com'; Mx = @('northwindtraders-com.mail.protection.outlook.com'); Provider = 'Microsoft 365'; Spf = [ordered]@{ Present = $true; Record = 'v=spf1 include:spf.protection.outlook.com -all'; All = '-all'; Lookups = 1; Multiple = $false }; Dmarc = [ordered]@{ Present = $true; Record = 'v=DMARC1; p=none'; Policy = 'none'; Pct = $null; Reports = $false }; DkimSelectors = @('selector1', 'selector2'); MtaSts = $false; TlsRpt = $false; Autodiscover = @('autodiscover.outlook.com') }) }
         Ipv6 = $(if ($Ipv6 -eq 'Working') { [ordered]@{ Status = 'Working'; GlobalPrefixes = @('2001:db8:20:1::/64'); TemporaryAddresses = $true; UniqueLocal = $false; DefaultRoute = $true; RouterIsLinkLocal = $true; DnsServers = @(); Egress = [ordered]@{ Reached = $true; Prefix = '2001:db8:20:1::/64'; SameAsPc = $true; Colo = 'ORD' }; Ping = [ordered]@{ Sent = 10; Received = 10; LossPct = 0; AvgMs = 14.2 }; AaaaLookup = $true } } else { [ordered]@{ Status = 'Not offered'; GlobalPrefixes = @(); DefaultRoute = $false; UniqueLocal = $false; AaaaLookup = $true } })
     }
     foreach ($k in $Extra.Keys) { $run[$k] = $Extra[$k] }
