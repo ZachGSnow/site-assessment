@@ -1,3 +1,15 @@
+function Get-AccessType {
+    # The kind of internet access, when the carrier's network name says it outright. $null when it does
+    # not (most telcos sell fiber, DSL and wireless under one name, so they are not guessed).
+    param([string]$Carrier)
+    $c = "$Carrier"
+    if ($c -match 'Space Exploration|Starlink|SpaceX') { return 'Starlink (low-orbit satellite)' }
+    if ($c -match 'Viasat|Hughes|EchoStar|Inmarsat') { return 'geostationary satellite' }
+    if ($c -match 'T-Mobile|Cellco|Verizon Wireless|AT&T Mobility|Sprint|UScellular|US Cellular') { return 'cellular or fixed wireless' }
+    if ($c -match 'Comcast|Charter|Spectrum|Cox Comm|Altice|Optimum|Mediacom|WideOpenWest|\bWOW\b|Sparklight|Cable One|Rogers|Shaw|Virgin Media|Liberty') { return 'cable' }
+    return $null
+}
+
 # ---------------------------------------------------------------------
 # Network risks, read from what discovery already collected. Nothing extra is sent to any device.
 # Returns Severity, Category, Message rows for Add-Flag.
@@ -151,7 +163,10 @@ function Get-AssessmentFindings {
             $ratio = [double]$up / [double]$down
             if ($capped -and [double]$up -gt 40) { & $add 'Internet service' 'Likely' "Upload reached $up Mbps even through the port limit, which rules out older cable and DSL tiers: a symmetrical service (fiber or a newer cable tier)." @("Download $down, upload $up Mbps") }
             elseif (-not $capped -and $ratio -ge 0.7) { & $add 'Internet service' 'Likely' "Upload is close to download ($up vs $down Mbps): a symmetrical service, typically fiber." @("Upload/download ratio $([math]::Round($ratio, 2))") }
-            elseif (-not $capped -and $ratio -le 0.25) { & $add 'Internet service' 'Likely' "Upload is a fraction of download ($up vs $down Mbps): an asymmetric service such as cable or DSL." @("Upload/download ratio $([math]::Round($ratio, 2))") }
+            elseif (-not $capped -and $ratio -le 0.25) {
+                $acc = Get-AccessType "$(Get-Prop $eg 'Carrier')"
+                & $add 'Internet service' 'Likely' "Upload is a fraction of download ($up vs $down Mbps): an asymmetric service, $(if ($acc) { "as expected on $acc" } else { 'such as cable, DSL, satellite or cellular' })." @("Upload/download ratio $([math]::Round($ratio, 2))")
+            }
         }
     }
 
@@ -300,13 +315,26 @@ function Get-AssessmentFindings {
         }
         if ($steps.Count) {
             $s2 = ($steps | Measure-Object -Minimum).Minimum
-            if ($s2 -ge 8) { & $add 'Internet service' 'Possible' "The second carrier hop is $s2 ms away. That latency step is typical of cable (DOCSIS) or fixed wireless access; fiber usually shows 1 to 4 ms there." @("Second public hop latency per trace: $($steps -join ', ') ms") }
+            $acc = Get-AccessType "$(Get-Prop $eg 'Carrier')"
+            # When the carrier's name already says satellite or cellular, the hop timing guess adds nothing
+            if ($acc -and $acc -notlike 'cable') { }
+            elseif ($s2 -ge 8) { & $add 'Internet service' 'Possible' "The second carrier hop is $s2 ms away. That latency step is typical of cable (DOCSIS) or fixed wireless access; fiber usually shows 1 to 4 ms there." @("Second public hop latency per trace: $($steps -join ', ') ms") }
             elseif ($s2 -le 4) { & $add 'Internet service' 'Possible' "The second carrier hop is only $s2 ms away, which is typical of a fiber hand-off." @("Second public hop latency per trace: $($steps -join ', ') ms") }
         }
     }
+    $accessType = Get-AccessType "$(Get-Prop $eg 'Carrier')"
+    if ($accessType) { & $add 'Internet service' 'Likely' "The circuit is $accessType, going by the carrier's network name ($(Get-Prop $eg 'Carrier'))." @() }
     $re = Get-Prop $R 'DnsDiscovery', 'ResolverEgress'
     if ($re -and (Get-Prop $re 'Ip') -and $pubIp -and "$(Get-Prop $re 'Ip')" -ne $pubIp) {
-        & $add 'DNS and DHCP' 'Confirmed' "Name lookups reach the internet from $(Get-Prop $re 'Ip') ($(Get-Prop $re 'Org'), $(Get-Prop $re 'City')), not from this office's own address ($pubIp): DNS is resolved at the far end of the tunnel, so content networks place these users there." @("whoami.akamai.net answered $(Get-Prop $re 'Ip')")
+        # Where name lookups leave depends on which DNS servers the PC uses. Public resolvers always look
+        # up names from their own servers; only a private DNS server exiting elsewhere means a tunnel.
+        $dnsSrv = @(@(Get-Prop $R 'NetworkExtra', 'DnsServers') | ForEach-Object { "$(Get-Prop $_ 'Server')" } | Where-Object { Test-IPv4 $_ })
+        $allPublic = $dnsSrv.Count -and -not @($dnsSrv | Where-Object { (Get-IpClass $_) -ne 'Public' }).Count
+        if ($allPublic) {
+            & $add 'DNS and DHCP' 'Confirmed' "Name lookups go straight to public resolvers ($($dnsSrv -join ', ')), so they reach the internet from the resolver's own servers ($(Get-Prop $re 'Ip'), $(Get-Prop $re 'Org')), not from this office. That is normal for public DNS." @("whoami.akamai.net answered $(Get-Prop $re 'Ip')")
+        } else {
+            & $add 'DNS and DHCP' 'Confirmed' "Name lookups reach the internet from $(Get-Prop $re 'Ip') ($(Get-Prop $re 'Org'), $(Get-Prop $re 'City')), not from this office's own address ($pubIp): the site's DNS server forwards them from somewhere else (the far end of a tunnel, or a filtering service), so content networks may place these users there." @("whoami.akamai.net answered $(Get-Prop $re 'Ip')", "DNS servers: $($dnsSrv -join ', ')")
+        }
     }
 
     # ---- Gateway ----
@@ -499,7 +527,10 @@ function Get-AssessmentFindings {
     $pubOk = $pubDns | Where-Object { (Get-Prop $_ 'Answered') -gt 0 -and $null -ne (Get-Prop $_ 'MedianMs') } | Sort-Object { [double](Get-Prop $_ 'MedianMs') } | Select-Object -First 1
     if ($dt.Count) {
         $ev = @($dt | ForEach-Object { "$(Get-Prop $_ 'Server') ($(Get-Prop $_ 'Role')): answered $(Get-Prop $_ 'Answered') of $(Get-Prop $_ 'Asked'), median $(Get-Prop $_ 'MedianMs') ms" })
-        if ($site -and $pubOk) {
+        if ($site -and (Get-IpClass "$(Get-Prop $site 'Server')") -eq 'Public') {
+            # The site's DNS servers are public resolvers already: no fallback advice to give
+            & $add 'DNS and DHCP' 'Confirmed' "DHCP hands out public resolvers as DNS servers; a lookup through $(Get-Prop $site 'Server') takes $(Get-Prop $site 'MedianMs') ms." $ev
+        } elseif ($site -and $pubOk) {
             & $add 'DNS and DHCP' 'Confirmed' "A name lookup through the site's DNS server takes $(Get-Prop $site 'MedianMs') ms; the same lookup sent straight to a public resolver takes $(Get-Prop $pubOk 'MedianMs') ms. Public DNS is reachable from this office, so listing a second DNS server in DHCP would keep internet working when the path to $(Get-Prop $site 'Server') is down." $ev
         } elseif ($site -and $pubDns.Count) {
             & $add 'DNS and DHCP' 'Confirmed' "Public DNS resolvers do not answer from this office (outbound DNS is blocked), so the site's DNS server ($(Get-Prop $site 'Server'), $(Get-Prop $site 'MedianMs') ms per lookup) is the only way to resolve names." $ev

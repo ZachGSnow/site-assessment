@@ -258,6 +258,8 @@ function Get-RouterTables {
     # A router's own addresses, ARP table and routes, read only. Returns $null when it is not a router.
     param([string]$Ip, [string]$Community, [bool]$Force = $false)
     $fw = Get-SnmpValues $Ip $Community @('1.3.6.1.2.1.4.1.0') 1500
+    # No SNMP answer at all: stop here. Walking the tables would only time out (about 45 s on a home router).
+    if ($null -eq $fw) { return $null }
     $isRouter = ($fw -and "$($fw['1.3.6.1.2.1.4.1.0'])" -eq '1')
     if (-not $isRouter -and -not $Force) { return $null }
     $addr = @(ConvertFrom-AddrRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.20.1.2' 100 1500) (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.20.1.3' 100 1500))

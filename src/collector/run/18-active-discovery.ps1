@@ -23,7 +23,8 @@ try {
     if ($EnableDiscovery -and $EnableSnmp -and $script:FullLanguage -and $Gateway -and $SnmpCommunity) {
         $Result['GatewayRouter'] = Invoke-Collector 'Gateway routes over SNMP (for the subnet list)' {
             $gt = Get-RouterTables "$Gateway" $SnmpCommunity $true
-            if (-not $gt) { throw 'the gateway did not answer SNMP' }
+            # A gateway without SNMP is normal (most small offices): note it, it is not a collector error
+            if (-not $gt) { return [ordered]@{ Status = 'no SNMP answer from the gateway' } }
             $gt
         }
     }

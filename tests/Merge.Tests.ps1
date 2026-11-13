@@ -269,3 +269,14 @@ Describe 'What to fix first' {
         $HtmlF | Should -Not -Match '<h2>Key findings</h2>'
     }
 }
+
+Describe 'Site diagram after the first real run' {
+    It 'shows the ISP box the modem check found and the devices on the local network' {
+        $t = [IO.File]::ReadAllText((Join-Path (Join-Path $MultiOut 'diagrams') 'Main_office.svg'))
+        $t | Should -Match '192\.168\.100\.1 - Northwind Fiber ONT'
+        $t | Should -Match '2 devices on the local network'
+        $t | Should -Match 'Contoso Printing'
+        $t | Should -Not -Match 'Randomized'
+        $t | Should -Match 'public 203\.0\.113\.40 - Northwind Fiber' -Because 'the address comes first so a long carrier name cannot hide it'
+    }
+}
