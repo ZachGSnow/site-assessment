@@ -30,15 +30,19 @@
     cameras, the ISP modem page, the gateway's admin ports and UPnP/NAT-PMP mappings, and
     follow-up checks chosen by what was found (the firewall's own VPN and admin pages,
     server management controllers, VMware hosts, QNAP and Synology, RD Web and RD Gateway).
-    No logon is attempted anywhere and no default passwords are tried. Only run discovery
-    on networks you are authorised to assess.
+    No logon is attempted anywhere and no passwords are tried. SNMP reads do use a community
+    string: one only, 'public' unless you set $SnmpCommunity, which is the read-only default
+    many devices ship with. Set $EnableSnmp = $false to leave it out. Only run discovery on
+    networks you are authorised to assess.
 
     Nothing sensitive is collected: no passwords, saved credentials, Wi-Fi keys, BitLocker
     recovery keys, browser data or file contents. What leaves the PC, when enabled: the
     public IP to Cloudflare (trace, speed test), ipinfo.io and rdap.org; MAC vendor prefixes
-    to api.macvendors.com; the email domain to public DNS (1.1.1.1); connection tests to
-    Microsoft 365, public STUN and NTP servers and portquiz.net. M-Lab and Vultr are used
-    only when the Cloudflare speed test fails.
+    to api.macvendors.com; the email domain to public DNS (1.1.1.1, or this PC's own DNS
+    server when 1.1.1.1 cannot be reached); connection tests to Microsoft 365, public STUN
+    and NTP servers and portquiz.net. M-Lab and Vultr are used only when the Cloudflare
+    speed test fails. M-Lab publishes every test, including the public IP, in its open
+    dataset: remove 'MLab' from $BandwidthProviders if the client would object.
 
 .PARAMETER SiteName
     Site/office name. Prompted for when omitted.

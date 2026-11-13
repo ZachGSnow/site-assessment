@@ -37,7 +37,8 @@ $HostedDesktopProfile = $null  # your own profile, used instead of a named one, 
 $ExtraTargets       = @()      # added to the profile's Targets: host or host:port, e.g. 'rdgw.example.com', '203.0.113.10:7765'
 
 # ---- Optional knowledge of the client network (used by discovery and the findings) ----
-$SiteSubnets        = @()      # one /24 per office (first 3 octets), e.g. @('10.10.1', '10.10.2'): reverse DNS and reachability
+$SiteSubnets        = @()      # one /24 per office (first 3 octets), e.g. @('10.10.1', '10.10.2'). With -Discovery:
+                                # reverse DNS, reachability and a full sweep of each, like $ScanSubnets
 $TunnelServers      = @()      # servers across a site tunnel to test from an office port, e.g. @('10.10.0.10')
 $ScanSubnets        = @()      # other subnets to sweep with -Discovery: 'a.b.c' (a /24) or 'a.b.c.d/22' to '/30',
                                 # e.g. @('10.10.2', '10.10.8.0/23'). $SiteSubnets are swept too. Subnets this PC can reach

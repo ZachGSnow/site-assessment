@@ -221,6 +221,25 @@ function Test-DeviceOnlyFlag {
     return $false
 }
 
+function Select-SiteWideFlags {
+    # Network risk, email domain and Active Directory flags describe the site, not one machine, so two
+    # machines at a site report the same thing: keep one per site. A network risk names the devices its
+    # own run's sweep found, so two runs can word it differently ('3 device(s) accept Telnet: ...' and
+    # '4 device(s) ...'). Those are matched with the numbers and the device list left out, and the run
+    # that found the most devices is kept.
+    param($Flags)
+    $kind = {
+        param($f)
+        $m = "$($f.Message)"
+        if ($f.Category -eq 'Network risk') { $m = ($m -replace ':\s[^:]*$', '') -replace '\d+', '#' }
+        '{0}|{1}|{2}' -f $f.Site, $f.Category, $m
+    }
+    $found = { param($f) if ("$($f.Message)" -match '\d+') { [int]$matches[0] } else { 0 } }
+    return @(@($Flags | Where-Object { $_ }) | Group-Object -Property { & $kind $_ } | ForEach-Object {
+        @($_.Group | Sort-Object @{ Expression = { & $found $_ }; Descending = $true }, @{ Expression = { "$($_.Message)".Length }; Descending = $true })[0]
+    } | Sort-Object Site, Message)
+}
+
 function Clear-RunList {
     param($Obj, [string]$Name)
     if ($null -ne $Obj -and $Obj -isnot [string] -and $Obj.PSObject.Properties[$Name]) { $Obj.$Name = @() }
@@ -486,7 +505,8 @@ foreach ($r in $runs) {
 }
 $gear = @($gear | Sort-Object Site, Type, IP, Mac -Unique)
 # Two machines at one site see the same network, so a network risk is kept once per site.
-$flags = @(@($flags | Where-Object { $_.Category -notin @('Network risk', 'Email security', 'Active Directory') }) + @($flags | Where-Object { $_.Category -in @('Network risk', 'Email security', 'Active Directory') } | Sort-Object Site, Message -Unique))
+$siteWide = @('Network risk', 'Email security', 'Active Directory')
+$flags = @(@($flags | Where-Object { $_.Category -notin $siteWide }) + @(Select-SiteWideFlags @($flags | Where-Object { $_.Category -in $siteWide })))
 # The client's email domains, once each, from whichever run looked them up last.
 $domainRows = @(foreach ($r in $runs) { foreach ($p in @(V (V $r 'Domains') 'Domains')) { if ($p) {
     [pscustomobject][ordered]@{ Domain = $p.Domain; Provider = $p.Provider; Mx = (J @($p.Mx) ', '); Spf = $(if (V $p.Spf 'Present') { V $p.Spf 'All' } else { 'missing' }); SpfLookups = V $p.Spf 'Lookups'
@@ -1999,18 +2019,18 @@ $method = @'
 <h4>How each machine was tested</h4>
 <ul class="ev">
 <li><b>Connection type</b> comes from the adapter that carries the default route (wired, Wi-Fi, USB/dock, phone tether, VPN).</li>
-<li><b>Bandwidth</b> runs 10 seconds per direction and ignores the first 2 seconds of ramp-up. Each direction fails over between providers: Cloudflare (4 parallel streams), then M-Lab NDT7 (a public measurement service, one WebSocket), then Vultr test files (download only, 4 streams). The provider used is shown next to every result; providers agree closely but not exactly. Latency under load is measured with ping to 1.1.1.1 while the test runs; the increase over idle is reported as <b>bufferbloat</b> (A under 30 ms, B under 100 ms, C under 250 ms, D above). Bufferbloat is the usual cause of laggy RDP sessions even on fast circuits.</li>
+<li><b>Bandwidth</b> runs 10 seconds per direction and ignores the first 2 seconds of ramp-up. Each direction fails over between providers: Cloudflare (4 parallel streams), then M-Lab NDT7 (a public measurement service, one WebSocket, which publishes every test with the public IP in its open dataset), then Vultr test files (download only, 4 streams). The provider used is shown next to every result; providers agree closely but not exactly. Latency under load is measured with ping to 1.1.1.1 while the test runs; the increase over idle is reported as <b>bufferbloat</b> (A under 30 ms, B under 100 ms, C under 250 ms, D above). Bufferbloat is the usual cause of laggy RDP sessions even on fast circuits.</li>
 <li><b>Latency and loss</b> are a 180-ping series (3 minutes) to the gateway, 1.1.1.1 and any RDP host that answers ping, plus a TCP connect series of the same length (one per second) to the first three remote desktop hosts. The TCP series measures hosts that ignore ping, which remote desktop gateways often do; one TCP connect takes one round trip.</li>
 <li><b>{HOSTED} targets</b>: every machine tests the fixed targets of its hosted desktop profile, then hosts found in RDP history, .rdp files, remote desktop shortcuts, the RDP client event log, names in the DNS cache that match the profile and live connections that reverse-resolve to it.</li>
 <li><b>Round trip to {HOSTED}</b> follows Microsoft's Azure Virtual Desktop guidance: under 150 ms is fine, 150 to 200 ms is acceptable for text work, over 200 ms degrades the experience. Microsoft's bandwidth figures assume under 0.1% packet loss.</li>
 <li><b>RDP disconnects</b> (client event 1026) are grouped by cause using Microsoft's reason codes. Network causes are 264, 516, 772, 1028, 1796, 2308 and the RD Gateway network errors. <b>RDP UDP</b> comes from client events 1102 (attempted), 1103 (established) and 1104 (failed: TCP only).</li>
 <li><b>Order of work</b>: bandwidth, traceroutes and the latency series run first and are saved before anything that probes the network (gateway ports, device discovery, subnet sweep). A run that was cut off during that last part still has its core results and is marked INCOMPLETE.</li>
-<li><b>Subnet sweep</b> (only with -Discovery) pings the machine's own subnet (up to a /22), then looks up a name and tries 22 common TCP ports on each device that answered. The type shown (printer, domain controller, camera, phone, Windows host) is a guess from the open ports, refined by what the device says about itself (web page, SNMP, vendor discovery).</li>
-<li><b>Other subnets</b> are swept the same way, at most 8 per run: the ones listed in the collector's CONFIG, and any the operator picks at a prompt from the private subnets the PC already knows about (routes, DNS and DHCP servers, printer ports, private traceroute hops). None of those is swept unless it is picked. Addresses that ignore ping are tried on a few TCP ports. MAC addresses do not cross a router, so on other subnets they come from NetBIOS or the router's own ARP table.</li>
-<li><b>Follow-up checks</b>: what one step found decides what a later step looks at. The firewall's make points to its own VPN and admin pages, a switch that announces a management address is asked over SNMP, servers the PC depends on are tested across the tunnel, and server management controllers, VMware hosts, QNAP and Synology, RD Web and RD Gateway are asked only what they show before anyone signs in. No logon is attempted and no default passwords are tried.</li>
-<li><b>SNMP</b> is read only, with one community string (public by default). Switches give their ports and neighbours, printers their serial number and page count, routers their ARP table, routes and WAN address, and UPS units their battery state, runtime and load.</li>
+<li><b>Subnet sweep</b> (only with -Discovery) pings the machine's own subnet (up to a /22), then looks up a name and tries {SWEEPPORTS} common TCP ports on each device that answered. The type shown (printer, domain controller, camera, phone, Windows host) is a guess from the open ports, refined by what the device says about itself (web page, SNMP, vendor discovery).</li>
+<li><b>Other subnets</b> are swept the same way, {MAXSUBNETS}: the ones listed in the collector's CONFIG, and any the operator picks at a prompt from the private subnets the PC already knows about (routes, DNS and DHCP servers, printer ports, private traceroute hops). None of those is swept unless it is picked. Addresses that ignore ping are tried on a few TCP ports. MAC addresses do not cross a router, so on other subnets they come from NetBIOS or the router's own ARP table.</li>
+<li><b>Follow-up checks</b>: what one step found decides what a later step looks at. The firewall's make points to its own VPN and admin pages, a switch that announces a management address is asked over SNMP, servers the PC depends on are tested across the tunnel, and server management controllers, VMware hosts, QNAP and Synology, RD Web and RD Gateway are asked only what they show before anyone signs in. No logon is attempted and no passwords are tried.</li>
+<li><b>SNMP</b> is read only, with one community string: 'public' unless the collector was set otherwise. That is the read-only default many devices ship with, so it is the one credential discovery does use; it can be turned off in the collector. Switches give their ports and neighbours, printers their serial number and page count, routers their ARP table, routes and WAN address, and UPS units their battery state, runtime and load.</li>
 <li><b>Network risk</b> flags come from the sweep and follow-up checks: SMBv1, Telnet or FTP still accepted, web pages only over plain HTTP or with an expired certificate, Remote Desktop or file sharing reachable on other subnets from an office port, SNMP answering to 'public', SSH servers from before 2017, Windows 7, 8 or 10 machines, VMware hosts out of support and server management controllers on the office network.</li>
-<li><b>Email domain</b>: the public domains the PC names (the user's sign-in name, the DNS search suffixes, the Windows domain and AD forest; internal names such as .local are skipped) are looked up in public DNS: MX (who handles the mail), SPF (counted term by term against the 10-lookup limit), DMARC policy and published DKIM selectors.</li>
+<li><b>Email domain</b>: the public domains the PC names (the user's sign-in name, the DNS search suffixes, the Windows domain and AD forest; internal names such as .local are skipped) are looked up in public DNS: MX (who handles the mail), SPF (counted term by term against the 10-lookup limit), DMARC policy, published DKIM selectors and MTA-STS. Lookups go to 1.1.1.1, or to the PC's own DNS server when 1.1.1.1 cannot be reached.</li>
 <li><b>IPv6</b>: whether the network offers it and whether it reaches the internet (Cloudflare over IPv6, ten pings, an AAAA lookup). Only /64 prefixes are kept, since the rest of an IPv6 address can identify the machine. Offered but broken IPv6 slows first connections.</li>
 <li><b>Active Directory sites</b> (domain PCs only) are read as the signed-in user and checked against where the PC really is: whether its address is in an AD subnet, whether that subnet's site matches the site Windows reports, and whether the user logged on to a domain controller in another site.</li>
 <li><b>RDP over UDP</b> is judged from what the run already holds: the client's own record of UDP attempts, the UDP policy, the STUN test (UDP 3478 out and how the NAT maps ports) and the things Microsoft lists as breaking RDP Shortpath (double NAT, carrier-grade NAT, a full-tunnel VPN, packet inspection). Sessions stuck on TCP feel slower and stall on loss.</li>
@@ -2036,13 +2056,18 @@ $method = @'
 </ul>
 <h4>Flag thresholds</h4>
 <ul class="ev">
-<li><b>What to fix first</b>, at the top of the report, lists every high and medium flag across all sites, high first, then the ones seen on the most machines and sites. The same flag on several machines is one line. Network risk, email domain and Active Directory flags count once per site, however many machines saw them.</li>
+<li><b>What to fix first</b>, at the top of the report, lists every high and medium flag across all sites, high first, then the ones seen on the most machines and sites. The same flag on several machines is one line. Network risk, email domain and Active Directory flags describe the site rather than one machine, so each is kept once per site; when two machines' sweeps found a different number of devices for the same risk, the one that found more is kept.</li>
 <li>High: Windows 10, no TPM 2.0, packet loss 5%+, bufferbloat 100 ms+, 3+ network-caused RDP disconnects in 30 days, round trip to {HOSTED} over 200 ms, 30+ Wi-Fi drops, SSD wear 80%+, no enabled antivirus, phone tether.</li>
 <li>Medium: round trip to {HOSTED} 150 to 200 ms, 5+ unexpected RDP disconnects, network adapter errors, under 8 GB RAM, HDD, 5+ years old, wired link under 1 Gbps, weak or 2.4 GHz Wi-Fi, packet loss 1%+, jitter 30 ms+, upload under 5 Mbps, 10+ Wi-Fi drops, no Windows OS update in 45 days, clock off by 60 s+, BitLocker off, user is local admin, peripherals without matching RDP redirection, 3+ remote desktop client crashes or hangs, memory 90%+ in use or CPU 80%+ busy during the run.</li>
 <li>Low (shown per site and per machine): 1 or 2 client crashes, RDP UDP turned off on the client, display area of 8 megapixels or more (one 4K screen), adapter power saving on a Wi-Fi or USB adapter that has 3+ recorded drops.</li>
 </ul>
 '@
 $method = $method.Replace('{HOSTED}', (Enc $HostedLabel))
+# The sweep's port count and subnet limit are collector settings, so they come from the runs themselves.
+$runOpt = { param($n) @($runs | ForEach-Object { V (V $_.Meta 'Options') $n } | Where-Object { $_ } | ForEach-Object { [int]$_ } | Sort-Object -Unique) }
+$portCounts = & $runOpt 'SweepPortCount'; $maxSubnets = & $runOpt 'RemoteSweepMaxSubnets'
+$method = $method.Replace('{SWEEPPORTS}', $(if ($portCounts.Count) { $portCounts -join ' or ' } else { 'a set of' }))
+$method = $method.Replace('{MAXSUBNETS}', $(if ($maxSubnets.Count) { 'at most {0} per run' -f ($maxSubnets -join ' or ') } else { 'a limited number per run' }))
 [void]$sb.Append((New-Section 'Methodology' $method -Id 'method'))
 [void]$sb.Append("</main><script>$js</script></body></html>")
 [IO.File]::WriteAllText((Join-Path $OutDir 'Report.html'), $sb.ToString(), (New-Object Text.UTF8Encoding $false))

@@ -30,15 +30,19 @@
     cameras, the ISP modem page, the gateway's admin ports and UPnP/NAT-PMP mappings, and
     follow-up checks chosen by what was found (the firewall's own VPN and admin pages,
     server management controllers, VMware hosts, QNAP and Synology, RD Web and RD Gateway).
-    No logon is attempted anywhere and no default passwords are tried. Only run discovery
-    on networks you are authorised to assess.
+    No logon is attempted anywhere and no passwords are tried. SNMP reads do use a community
+    string: one only, 'public' unless you set $SnmpCommunity, which is the read-only default
+    many devices ship with. Set $EnableSnmp = $false to leave it out. Only run discovery on
+    networks you are authorised to assess.
 
     Nothing sensitive is collected: no passwords, saved credentials, Wi-Fi keys, BitLocker
     recovery keys, browser data or file contents. What leaves the PC, when enabled: the
     public IP to Cloudflare (trace, speed test), ipinfo.io and rdap.org; MAC vendor prefixes
-    to api.macvendors.com; the email domain to public DNS (1.1.1.1); connection tests to
-    Microsoft 365, public STUN and NTP servers and portquiz.net. M-Lab and Vultr are used
-    only when the Cloudflare speed test fails.
+    to api.macvendors.com; the email domain to public DNS (1.1.1.1, or this PC's own DNS
+    server when 1.1.1.1 cannot be reached); connection tests to Microsoft 365, public STUN
+    and NTP servers and portquiz.net. M-Lab and Vultr are used only when the Cloudflare
+    speed test fails. M-Lab publishes every test, including the public IP, in its open
+    dataset: remove 'MLab' from $BandwidthProviders if the client would object.
 
 .PARAMETER SiteName
     Site/office name. Prompted for when omitted.
@@ -119,7 +123,8 @@ $HostedDesktopProfile = $null  # your own profile, used instead of a named one, 
 $ExtraTargets       = @()      # added to the profile's Targets: host or host:port, e.g. 'rdgw.example.com', '203.0.113.10:7765'
 
 # ---- Optional knowledge of the client network (used by discovery and the findings) ----
-$SiteSubnets        = @()      # one /24 per office (first 3 octets), e.g. @('10.10.1', '10.10.2'): reverse DNS and reachability
+$SiteSubnets        = @()      # one /24 per office (first 3 octets), e.g. @('10.10.1', '10.10.2'). With -Discovery:
+                                # reverse DNS, reachability and a full sweep of each, like $ScanSubnets
 $TunnelServers      = @()      # servers across a site tunnel to test from an office port, e.g. @('10.10.0.10')
 $ScanSubnets        = @()      # other subnets to sweep with -Discovery: 'a.b.c' (a /24) or 'a.b.c.d/22' to '/30',
                                 # e.g. @('10.10.2', '10.10.8.0/23'). $SiteSubnets are swept too. Subnets this PC can reach
@@ -4652,7 +4657,8 @@ $Result['Meta'] = [ordered]@{
     Options           = [ordered]@{
         SubnetSweep = $EnableSubnetSweep; GatewayProbe = $EnableGatewayProbe; IpInfo = $EnableIpInfo
         FirewallPorts = $EnableFirewallPorts; Ssdp = $EnableSsdp; PrinterProbe = $EnablePrinterProbe
-        SweepPorts = $EnableSweepPorts; RemoteSweep = $EnableRemoteSweep; TlsCheck = $EnableTlsCheck
+        SweepPorts = $EnableSweepPorts; SweepPortCount = @($SweepPorts).Count; RemoteSweep = $EnableRemoteSweep
+        RemoteSweepMaxSubnets = $RemoteSweepMaxSubnets; TlsCheck = $EnableTlsCheck
         OuiLookup = $EnableOuiLookup; Ipv6Check = $EnableIpv6Check; DomainCheck = $EnableDomainCheck; Bandwidth = $EnableBandwidth; BandwidthSeconds = $BandwidthSeconds
         BandwidthStreams = $BandwidthStreams; MaxTestMB = $MaxTestMB; PingCount = $PingCount; LookbackDays = $LookbackDays
         BandwidthRounds = $BandwidthRounds; VendorDiscovery = $EnableVendorDiscovery; MulticastDiscovery = $EnableMulticastDiscovery

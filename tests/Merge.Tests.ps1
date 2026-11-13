@@ -170,6 +170,46 @@ Describe 'Network risks in the merged report' {
     }
 }
 
+Describe 'Methodology' {
+    BeforeAll { $script:HtmlS = [IO.File]::ReadAllText((Join-Path $SingleOut 'Report.html')) }
+    It 'takes the sweep port count and subnet limit from the runs' {
+        $HtmlS | Should -Match 'tries 22 common TCP ports'
+        $HtmlS | Should -Match 'at most 8 per run'
+    }
+    It 'leaves no placeholder behind' {
+        $HtmlS | Should -Not -Match '\{(SWEEPPORTS|MAXSUBNETS|HOSTED)\}'
+    }
+}
+
+Describe 'Site-wide flags from two machines' {
+    BeforeAll {
+        . ([scriptblock]::Create((Get-ScriptFunctionText $MergePath)))
+        $f = { param($site, $cat, $msg) [pscustomobject]@{ Site = $site; Hostname = 'PC'; Severity = 'Medium'; Category = $cat; Message = $msg; Scope = 'Site' } }
+        $script:Kept = @(Select-SiteWideFlags @(
+            (& $f 'Main office' 'Network risk' '3 device(s) accept Telnet, where logins cross the network in clear text: 10.0.0.5, 10.0.0.6, 10.0.0.7'),
+            (& $f 'Main office' 'Network risk' '4 device(s) accept Telnet, where logins cross the network in clear text: 10.0.0.5, 10.0.0.6, 10.0.0.7, 10.0.0.8'),
+            (& $f 'Warehouse' 'Network risk' '1 device(s) accept Telnet, where logins cross the network in clear text: 10.0.1.5'),
+            (& $f 'Main office' 'Network risk' '2 device(s) still accept SMBv1, the file-sharing version WannaCry spread over: 10.0.0.9, 10.0.0.10'),
+            (& $f 'Main office' 'Email security' 'contoso.com: no DMARC record, so spoofed mail claiming to be from it is delivered'),
+            (& $f 'Main office' 'Email security' 'contoso.com: no DMARC record, so spoofed mail claiming to be from it is delivered'),
+            (& $f 'Main office' 'Email security' 'contoso.com: DMARC is set to p=none, which only reports and blocks nothing')))
+    }
+    It 'keeps one Telnet risk per site, from the run that found the most devices' {
+        $t = @($Kept | Where-Object { $_.Site -eq 'Main office' -and $_.Message -like '*Telnet*' })
+        $t.Count | Should -Be 1
+        $t[0].Message | Should -BeLike '4 device(s)*'
+    }
+    It 'keeps the same risk at another site' {
+        @($Kept | Where-Object { $_.Site -eq 'Warehouse' }).Count | Should -Be 1
+    }
+    It 'keeps different risks apart' {
+        @($Kept | Where-Object { $_.Message -like '*SMBv1*' }).Count | Should -Be 1
+    }
+    It 'keeps different email findings for one domain apart, and drops exact repeats' {
+        @($Kept | Where-Object { $_.Category -eq 'Email security' }).Count | Should -Be 2
+    }
+}
+
 Describe 'IPv6 in the merged report' {
     BeforeAll {
         $script:Eps6 = @(Import-Csv (Join-Path $MultiOut 'Endpoints.csv'))
