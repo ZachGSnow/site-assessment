@@ -214,3 +214,85 @@ Describe 'Bufferbloat grade' {
         $res['BufferbloatGrade'] | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Other subnets (Phase A)' {
+    It 'is off by default and on with -Discovery' {
+        (& $Config).EnableRemoteSweep | Should -BeFalse
+        (& $Config -Discovery).EnableRemoteSweep | Should -BeTrue
+    }
+    It 'reads <Text> as <Cidr>' -ForEach @(
+        @{ Text = '10.10.2'; Cidr = '10.10.2.0/24' }
+        @{ Text = '10.10.8.0/23'; Cidr = '10.10.8.0/23' }
+        @{ Text = '10.10.9.77/23'; Cidr = '10.10.8.0/23' }
+        @{ Text = ' 192.168.40.0/30 '; Cidr = '192.168.40.0/30' }
+    ) {
+        (ConvertTo-SubnetSpec $Text).Cidr | Should -Be $Cidr
+    }
+    It 'refuses <Text>' -ForEach @(
+        @{ Text = '10.0.0.0/16' }, @{ Text = '10.10' }, @{ Text = '300.1.1' }, @{ Text = '10.1.1.0/31' }, @{ Text = 'office' }
+    ) {
+        ConvertTo-SubnetSpec $Text | Should -BeNullOrEmpty
+    }
+    It 'lists every usable address of a subnet' {
+        $h = Get-SubnetHosts (ConvertTo-SubnetSpec '10.10.2')
+        $h.Count | Should -Be 254
+        $h[0] | Should -Be '10.10.2.1'
+        $h[-1] | Should -Be '10.10.2.254'
+    }
+    It 'finds the subnets this PC already knows about, without its own' {
+        $run = @{
+            Network      = @{ Adapters = @(@{ Status = 'Up'; DhcpServer = '10.20.1.1' }) }
+            NetworkExtra = @{
+                Routes     = @(@{ Prefix = '10.30.0.0/24'; NextHop = '10.20.1.254' }, @{ Prefix = '10.0.0.0/8'; NextHop = '10.20.1.254' }, @{ Prefix = '10.20.1.0/24'; NextHop = '0.0.0.0' })
+                DnsServers = @(@{ Server = '10.30.0.5' }, @{ Server = '1.1.1.1' })
+            }
+            Servers      = @{ Servers = @(@{ Name = 'fs01'; IPs = @('10.40.7.10') }) }
+            Peripherals  = @{ Printers = @(@{ Name = 'Front'; HostAddress = '10.20.1.50'; IsVirtual = $false }) }
+            Traceroutes  = @(@{ Target = '1.1.1.1'; Hops = @(@{ Hop = 1; IP = '10.20.1.1'; Class = 'Private' }, @{ Hop = 2; IP = '10.99.0.1'; Class = 'Private' }, @{ Hop = 3; IP = '100.64.0.1'; Class = 'CGNAT' }, @{ Hop = 4; IP = '172.16.0.1'; Class = 'Private' }) })
+            RdpPath      = @(@{ Host = 'rdgw.contoso.com'; ResolvedIPs = @('10.50.0.10') })
+            Rdp          = @{ ActiveTcp = @() }
+        }
+        $c = @(Get-CandidateSubnets $run @(ConvertTo-NetRange '10.20.1.25' 24))
+        $c.Cidr | Should -Be @('10.30.0.0/24', '10.40.7.0/24', '10.50.0.0/24', '10.99.0.0/24')
+        ($c | Where-Object Cidr -eq '10.30.0.0/24').Reasons | Should -Contain 'DNS server 10.30.0.5'
+        ($c | Where-Object Cidr -eq '10.50.0.0/24').Hosted | Should -BeTrue
+        ($c | Where-Object Cidr -eq '10.40.7.0/24').Hosted | Should -BeFalse
+    }
+    It 'sweeps only what is listed or picked, never this PC''s own subnet, and stops at the limit' {
+        $cands = @(
+            [pscustomobject]@{ Cidr = '10.30.0.0/24'; Reasons = @('route via 10.20.1.254'); Hosted = $false }
+            [pscustomobject]@{ Cidr = '10.40.7.0/24'; Reasons = @('server fs01'); Hosted = $false }
+            [pscustomobject]@{ Cidr = '10.50.0.0/24'; Reasons = @('remote desktop host'); Hosted = $true }
+        )
+        $local = @(ConvertTo-NetRange '10.20.1.25' 24)
+        $none = Select-ScanSubnets -Explicit @() -Candidates $cands -Answer '' -Exclude $local
+        @($none.Selected).Count | Should -Be 0 -Because 'inferred subnets are never swept on their own'
+        $some = Select-ScanSubnets -Explicit @('10.60.1', '10.20.1', 'bad') -Candidates $cands -Answer '1,3' -Exclude $local
+        @($some.Selected | ForEach-Object Cidr) | Should -Be @('10.60.1.0/24', '10.30.0.0/24', '10.50.0.0/24')
+        $some.Selected[0].Reason | Should -Be 'listed in CONFIG'
+        $some.Rejected | Should -Contain '10.20.1.0/24: this PC''s own subnet, covered by the local sweep'
+        @($some.Rejected | Where-Object { $_ -like 'bad:*' }).Count | Should -Be 1
+        @((Select-ScanSubnets -Candidates $cands -Answer '2-3' -Exclude $local).Selected | ForEach-Object Cidr) | Should -Be @('10.40.7.0/24', '10.50.0.0/24')
+        $capped = Select-ScanSubnets -Candidates $cands -Answer 'A' -Exclude $local -Max 2
+        @($capped.Selected).Count | Should -Be 2
+        @($capped.Rejected | Where-Object { $_ -like '*over the limit*' }).Count | Should -Be 1
+    }
+    It 'sweeps a subnet across routing: ping, then TCP on hosts that ignore ping, then the sweep ports' {
+        # Loopback stands in for the far subnet, so the test sends nothing onto a network.
+        $listener = New-Object Net.Sockets.TcpListener ([Net.IPAddress]::Loopback, 0)
+        $listener.Start()
+        try {
+            $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+            $spec = ConvertTo-SubnetSpec '127.0.0.0/30'
+            $spec.Reason = 'test'
+            $r = Invoke-RemoteSweep -Specs @($spec) -Ports @($port) -PresencePorts @($port) -TimeoutMs 1000
+            $r.Subnets[0].Subnet | Should -Be '127.0.0.0/30'
+            $r.Subnets[0].AddressesSwept | Should -Be 2
+            $one = $r.Devices | Where-Object IP -eq '127.0.0.1'
+            $one | Should -Not -BeNullOrEmpty
+            $one.Remote | Should -BeTrue
+            $one.OpenPorts | Should -Contain $port
+            $one.Subnet | Should -Be '127.0.0.0/30'
+        } finally { $listener.Stop() }
+    }
+}

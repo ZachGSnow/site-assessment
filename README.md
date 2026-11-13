@@ -18,7 +18,7 @@
 - **Hosted desktop profiles:** tell it which service the users work in (plain RDP, Azure Virtual Desktop, Windows 365, Citrix Cloud, or your own). It finds the client app, the hosts it talks to, and the round trip that matters, graded against Microsoft's Azure Virtual Desktop guidance.
 - **The PC itself:** hardware age, Windows version, TPM, BitLocker, disk health, RAM and CPU pressure during the run, Wi-Fi signal and drops, docks, monitors and peripherals, installed security and management tools, patch state, RDP disconnects and client crashes from the event logs.
 - **Findings, not just data:** each run ends with findings marked Confirmed, Likely or Possible, a data check that retries anything that failed, and a summary on the clipboard.
-- **Optional network discovery** (`-Discovery`, off by default): subnet sweep, vendor and multicast discovery, read-only SNMP, printer and camera models, gateway admin ports and UPnP mappings. No logon is attempted and no default passwords are tried.
+- **Optional network discovery** (`-Discovery`, off by default): subnet sweep, the same sweep and identification on other subnets you list or pick (across routing or a site tunnel, MAC addresses from NetBIOS), vendor and multicast discovery, read-only SNMP, printer and camera models, gateway admin ports and UPnP mappings. No logon is attempted and no default passwords are tried.
 - **As admin on a wired PC:** a passive listen on the wire for the switch model and port (LLDP/CDP), spanning tree, VLAN tags and DHCP servers. Nothing is sent.
 - **Merge and report:** one self-contained HTML report and a set of CSVs across every site and machine. It finds sites that share an egress address, warns when two bandwidth tests overlapped, and spots a test laptop carried from site to site so its own hardware does not pollute the client's figures.
 - Runs in **Windows PowerShell 5.1** (paste into ISE and press F5) or PowerShell 7, as a standard user. Admin adds the checks that need it.
@@ -58,7 +58,8 @@ Settings live in the CONFIG block at the top of the collector, so it still works
 | `$HostedDesktopProfile` | none | Your own profile: `Name`, `HostPattern`, `AppPattern`, `Targets`, `ProviderAsn` (see the example file) |
 | `$ExtraTargets` | none | More hosts to test on every machine, `host` or `host:port` |
 | `$SiteList` | none | A numbered site menu, so every machine at a site uses the same name |
-| `$SiteSubnets`, `$TunnelServers` | none | Office subnets and servers across a tunnel, for discovery and the findings |
+| `$SiteSubnets`, `$TunnelServers` | none | Office subnets and servers across a tunnel, for discovery and the findings. With `-Discovery`, `$SiteSubnets` are swept too |
+| `$ScanSubnets` | none | Other subnets to sweep with `-Discovery`: `'10.10.2'` (a /24) or `'10.10.8.0/23'` (/22 to /30). The subnets this PC already knows about are listed at the prompt, and none of them is swept unless you pick it. At most `$RemoteSweepMaxSubnets` (8) per run |
 | `$VoiceTargets` | `1.1.1.1` | Call-pace sample targets; add the phone system |
 | `$BandwidthProviders` | Cloudflare, M-Lab, Vultr | Tried in order per direction |
 | `$PingCount` | 180 | Samples in the loss and latency series, one per second |
@@ -93,7 +94,8 @@ Collect-SiteAssessment.ps1  (one run per PC, ~5 minutes)
   +-- background: traceroutes, 180-sample ping and TCP series
   +-- inventory: machine, identity, software, peripherals, Wi-Fi, event logs, patching
   +-- egress, path MTU, bandwidth (Cloudflare > M-Lab > Vultr), bufferbloat
-  +-- [ -Discovery ] gateway, sweep, vendor/multicast discovery, SNMP, IPP, RTSP, UPnP
+  +-- [ -Discovery ] gateway, sweep, other subnets (listed or picked), vendor/multicast
+  |                 discovery, SNMP, IPP, RTSP, UPnP
   +-- traffic design verdict + findings + data check (retries what failed)
   v
 SITE_HOST_yyyyMMdd-HHmm.zip  (assessment.json, summary.txt, traceroutes, transcript)
@@ -117,10 +119,10 @@ Install-Module Pester -RequiredVersion 6.2.0 -Scope CurrentUser -Force -SkipPubl
 .\tests\run-tests.ps1
 ```
 
-44 Pester tests run in CI on Windows, in both Windows PowerShell 5.1 and PowerShell 7:
+The Pester tests run in CI on Windows, in both Windows PowerShell 5.1 and PowerShell 7:
 
-- **Collector:** the CONFIG defaults (discovery off, no client values), `-Discovery`, `-HostedDesktop` and `-ConfigPath` with a custom profile, each built-in profile's host pattern, tracert and ping parsing, trace analysis (tunnel, double NAT, carrier-grade NAT), every traffic design verdict, and the bufferbloat grades. The collector's functions are loaded from the parsed script, so nothing is collected during tests.
-- **Merge:** fictional runs for a two-office company (`tests/Fixtures.ps1`, documentation IP ranges only) are zipped the way the collector writes them and merged with `-NoEnrich`. The tests check the one-machine report, the two-site report, test laptop detection, shared egress, overlapping bandwidth tests and the hosted desktop round trip.
+- **Collector:** the CONFIG defaults (discovery off, no client values), `-Discovery`, `-HostedDesktop` and `-ConfigPath` with a custom profile, each built-in profile's host pattern, tracert and ping parsing, trace analysis (tunnel, double NAT, carrier-grade NAT), every traffic design verdict, the bufferbloat grades, and the other-subnet sweep: subnet parsing, the subnets a PC already knows about, which ones get swept (never an inferred one on its own, never the PC's own), and a real sweep over loopback. The collector's functions are loaded from the parsed script, so nothing is collected during tests.
+- **Merge:** fictional runs for a two-office company (`tests/Fixtures.ps1`, documentation IP ranges only) are zipped the way the collector writes them and merged with `-NoEnrich`. The tests check the one-machine report, the two-site report, test laptop detection, shared egress, overlapping bandwidth tests, the hosted desktop round trip, and devices swept across routing filed under the site that owns their subnet.
 
 ### Used in the field
 

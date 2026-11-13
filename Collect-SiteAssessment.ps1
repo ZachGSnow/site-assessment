@@ -103,11 +103,17 @@ $ExtraTargets       = @()      # added to the profile's Targets: host or host:po
 # ---- Optional knowledge of the client network (used by discovery and the findings) ----
 $SiteSubnets        = @()      # one /24 per office (first 3 octets), e.g. @('10.10.1', '10.10.2'): reverse DNS and reachability
 $TunnelServers      = @()      # servers across a site tunnel to test from an office port, e.g. @('10.10.0.10')
+$ScanSubnets        = @()      # other subnets to sweep with -Discovery: 'a.b.c' (a /24) or 'a.b.c.d/22' to '/30',
+                                # e.g. @('10.10.2', '10.10.8.0/23'). $SiteSubnets are swept too. Subnets this PC can reach
+                                # are listed at the prompt, and none of those is swept unless you pick it.
+$RemoteSweepMaxSubnets = 8     # most other subnets swept in one run
+$RemoteSweepPresencePorts = @(22, 80, 443, 445, 3389)   # tried on addresses that ignore ping (hosts that block ICMP)
 $VoiceTargets       = @('1.1.1.1')   # call-pace sample targets: add the phone system's IP to test the path to it
 
 # ---- Active discovery (all off unless -Discovery or $EnableDiscovery; each switch can then turn one off) ----
 $EnableDiscovery    = $false
 $EnableSubnetSweep  = $true    # ping sweep of local subnet (up to /22) + ARP/vendor inventory
+$EnableRemoteSweep  = $true    # the same sweep and identification on $ScanSubnets, $SiteSubnets and subnets picked at the prompt
 $EnableSweepPorts   = $true    # after the sweep: name lookup + a few TCP ports on each device found (tells servers,
                                 # printers, cameras and phones apart). Set $false to keep the sweep to ping + ARP only.
 $SweepPorts         = @(21, 22, 23, 53, 80, 88, 135, 139, 389, 443, 445, 515, 554, 631, 1433, 3389, 5060, 5061, 8080, 8291, 8443, 9100)
@@ -173,7 +179,7 @@ if ($ConfigPath) {
 }
 if ($Discovery) { $EnableDiscovery = $true }
 if (-not $EnableDiscovery) {
-    foreach ($n in @('EnableSubnetSweep', 'EnableSweepPorts', 'EnableVendorDiscovery', 'EnableMulticastDiscovery', 'EnableDeviceIdentify',
+    foreach ($n in @('EnableSubnetSweep', 'EnableRemoteSweep', 'EnableSweepPorts', 'EnableVendorDiscovery', 'EnableMulticastDiscovery', 'EnableDeviceIdentify',
                      'EnableDnsDiscovery', 'EnableSiteReach', 'EnableSnmp', 'EnableModemPage', 'EnableWindowsBuild', 'EnablePrinterQuery',
                      'EnableCameraQuery', 'EnableGatewayServices', 'EnableTunnelReach', 'EnableDhcpRenew', 'EnableGatewayProbe',
                      'EnableFirewallPorts', 'EnableSsdp', 'EnablePrinterProbe')) {
@@ -1815,6 +1821,172 @@ function Measure-VoicePath {
     return $r
 }
 
+# ---------------------------------------------------------------------
+# Other subnets: which ones this PC knows it can reach, which ones to sweep, and the sweep itself.
+# Only subnets listed in CONFIG or chosen at the prompt are swept; inferred ones are only reported.
+# ---------------------------------------------------------------------
+function ConvertTo-IpNumber { param([string]$Ip) $o = "$Ip".Split('.'); return ([int64]$o[0] -shl 24) + ([int64]$o[1] -shl 16) + ([int64]$o[2] -shl 8) + [int64]$o[3] }
+function ConvertFrom-IpNumber { param([int64]$N) return '{0}.{1}.{2}.{3}' -f (($N -shr 24) -band 255), (($N -shr 16) -band 255), (($N -shr 8) -band 255), ($N -band 255) }
+
+function ConvertTo-NetRange {
+    # Network number and broadcast number of $Ip/$Prefix (any prefix).
+    param([string]$Ip, [int]$Prefix)
+    $maskInt = ([int64]4294967295 -shl (32 - $Prefix)) -band [int64]4294967295
+    $net = (ConvertTo-IpNumber $Ip) -band $maskInt
+    return [pscustomobject]@{ NetInt = $net; End = $net + ([int64]1 -shl (32 - $Prefix)) - 1; Prefix = $Prefix }
+}
+
+function ConvertTo-SubnetSpec {
+    # 'a.b.c' (taken as a /24) or 'a.b.c.d/nn' with nn from 22 to 30. Anything else returns $null.
+    param([string]$Text)
+    $t = "$Text".Trim()
+    if ($t -match '^\d{1,3}\.\d{1,3}\.\d{1,3}$') { $t = "$t.0/24" }
+    if ($t -notmatch '^(\d{1,3}(\.\d{1,3}){3})/(\d{1,2})$') { return $null }
+    $ip = $matches[1]; $prefix = [int]$matches[3]
+    if (@($ip.Split('.') | Where-Object { [int]$_ -gt 255 }).Count -or $prefix -lt 22 -or $prefix -gt 30) { return $null }
+    $r = ConvertTo-NetRange $ip $prefix
+    return [pscustomobject]@{ Cidr = '{0}/{1}' -f (ConvertFrom-IpNumber $r.NetInt), $prefix; NetInt = $r.NetInt; End = $r.End; First = $r.NetInt + 1; Last = $r.End - 1; Prefix = $prefix; Reason = $null }
+}
+
+function Get-SubnetHosts {
+    param($Spec)
+    $out = New-Object Collections.Generic.List[string]
+    for ($h = [int64]$Spec.First; $h -le [int64]$Spec.Last; $h++) { $out.Add((ConvertFrom-IpNumber $h)) }
+    return , $out.ToArray()
+}
+
+function Test-RangeOverlap { param($A, $B) return ([int64]$A.NetInt -le [int64]$B.End -and [int64]$B.NetInt -le [int64]$A.End) }
+
+function Get-CandidateSubnets {
+    # Private subnets this PC already knows about from data it collected (routes, DNS, DHCP and other
+    # servers, printer ports, private traceroute hops, remote desktop lookups). Nothing is sent to build it.
+    # $Exclude: ranges to leave out (this PC's own subnets). Hosted = a remote desktop target is in it,
+    # so it may be the provider's network rather than the client's.
+    param($R, $Exclude = @())
+    $found = [ordered]@{}
+    $note = {
+        param($spec, $why, [bool]$hosted)
+        if (-not $spec) { return }
+        foreach ($x in @($Exclude)) { if ($x -and (Test-RangeOverlap $spec $x)) { return } }
+        if (-not $found.Contains($spec.Cidr)) { $found[$spec.Cidr] = [pscustomobject]@{ Cidr = $spec.Cidr; NetInt = $spec.NetInt; End = $spec.End; Reasons = @(); Hosted = $false } }
+        $e = $found[$spec.Cidr]
+        if ($e.Reasons -notcontains $why) { $e.Reasons += $why }
+        if ($hosted) { $e.Hosted = $true }
+    }
+    $addIp = {
+        param([string]$ip, [string]$why, [bool]$hosted)
+        if (-not (Test-IPv4 $ip) -or (Get-IpClass $ip) -ne 'Private') { return }
+        $n = ConvertTo-IpNumber $ip
+        # An address inside a subnet already found from a route belongs to that subnet.
+        foreach ($k in @($found.Keys)) { $f = $found[$k]; if ($n -ge $f.NetInt -and $n -le $f.End) { & $note (ConvertTo-SubnetSpec $k) $why $hosted; return } }
+        & $note (ConvertTo-SubnetSpec ((@($ip.Split('.'))[0..2]) -join '.')) $why $hosted
+    }
+    foreach ($rt in @(Get-Prop $R 'NetworkExtra', 'Routes')) {
+        if (-not $rt -or "$(Get-Prop $rt 'Prefix')" -notmatch '^(\d{1,3}(\.\d{1,3}){3})/(\d+)$') { continue }
+        $pre = [int]$matches[3]
+        if ($pre -lt 22 -or $pre -gt 30 -or (Get-IpClass $matches[1]) -ne 'Private') { continue }
+        $hop = "$(Get-Prop $rt 'NextHop')"
+        & $note (ConvertTo-SubnetSpec "$($matches[1])/$pre") ("route " + $(if ($hop -and $hop -ne '0.0.0.0') { "via $hop" } else { 'on-link' })) $false
+    }
+    foreach ($d in @(Get-Prop $R 'NetworkExtra', 'DnsServers')) { if ($d) { & $addIp "$(Get-Prop $d 'Server')" "DNS server $(Get-Prop $d 'Server')" $false } }
+    foreach ($a in @(Get-Prop $R 'Network', 'Adapters')) { if ($a -and (Get-Prop $a 'DhcpServer')) { & $addIp "$(Get-Prop $a 'DhcpServer')" "DHCP server $(Get-Prop $a 'DhcpServer')" $false } }
+    foreach ($sv in @(Get-Prop $R 'Servers', 'Servers')) { if ($sv) { foreach ($ip in @(Get-Prop $sv 'IPs')) { & $addIp "$ip" "server $(Get-Prop $sv 'Name')" $false } } }
+    foreach ($p in @(Get-Prop $R 'Peripherals', 'Printers')) { if ($p -and -not (Get-Prop $p 'IsVirtual') -and (Get-Prop $p 'HostAddress')) { & $addIp "$(Get-Prop $p 'HostAddress')" "printer $(Get-Prop $p 'Name')" $false } }
+    foreach ($t in @(Get-Prop $R 'Traceroutes')) {
+        if (-not $t) { continue }
+        foreach ($hp in @(@(Get-Prop $t 'Hops') | Where-Object { $_ } | Sort-Object { [int](Get-Prop $_ 'Hop') })) {
+            $c = "$(Get-Prop $hp 'Class')"
+            if ($c -eq 'CGNAT' -or $c -eq 'Public') { break }
+            if ([int](Get-Prop $hp 'Hop') -gt 1 -and $c -eq 'Private') { & $addIp "$(Get-Prop $hp 'IP')" "traceroute hop to $(Get-Prop $t 'Target')" $false }
+        }
+    }
+    foreach ($rp in @(Get-Prop $R 'RdpPath')) { if ($rp) { foreach ($ip in @(Get-Prop $rp 'ResolvedIPs')) { & $addIp "$ip" "remote desktop host $(Get-Prop $rp 'Host')" $true } } }
+    foreach ($c in @(Get-Prop $R 'Rdp', 'ActiveTcp')) { if ($c) { & $addIp "$(Get-Prop $c 'RemoteAddress')" 'live remote desktop session' $true } }
+    return @($found.Values | Sort-Object NetInt | ForEach-Object { [pscustomobject]@{ Cidr = $_.Cidr; Reasons = @($_.Reasons); Hosted = $_.Hosted } })
+}
+
+function Select-ScanSubnets {
+    # The subnets to sweep: every valid entry from CONFIG, then the candidates picked at the prompt
+    # ('1,3', '2-4', 'A' for all, empty for none). This PC's own subnets and anything past $Max are left out.
+    param([string[]]$Explicit = @(), $Candidates = @(), [string]$Answer = '', $Exclude = @(), [int]$Max = 8)
+    $sel = New-Object Collections.Generic.List[object]; $rej = New-Object Collections.Generic.List[string]
+    $take = {
+        param($spec, [string]$reason)
+        if (@($sel | Where-Object { Test-RangeOverlap $_ $spec }).Count) { return }
+        foreach ($x in @($Exclude)) { if ($x -and (Test-RangeOverlap $spec $x)) { $rej.Add("$($spec.Cidr): this PC's own subnet, covered by the local sweep"); return } }
+        if ($sel.Count -ge $Max) { $rej.Add("$($spec.Cidr): over the limit of $Max subnets per run"); return }
+        $spec.Reason = $reason
+        $sel.Add($spec)
+    }
+    foreach ($e in @($Explicit | Where-Object { "$_".Trim() })) {
+        $s = ConvertTo-SubnetSpec $e
+        if ($s) { & $take $s 'listed in CONFIG' } else { $rej.Add("${e}: not a.b.c or a.b.c.d/22 to /30") }
+    }
+    $cands = @($Candidates | Where-Object { $_ })
+    $idx = @()
+    if ("$Answer" -match '^\s*(a|all)\s*$') { if ($cands.Count) { $idx = 0..($cands.Count - 1) } }
+    else {
+        foreach ($part in @("$Answer" -split '[,;\s]+' | Where-Object { $_ })) {
+            if ($part -match '^(\d+)-(\d+)$') { $idx += ([int]$matches[1] - 1)..([int]$matches[2] - 1) }
+            elseif ($part -match '^\d+$') { $idx += [int]$part - 1 }
+        }
+    }
+    foreach ($i in @($idx | Sort-Object -Unique)) {
+        if ($i -lt 0 -or $i -ge $cands.Count) { continue }
+        $s = ConvertTo-SubnetSpec $cands[$i].Cidr
+        if ($s) { & $take $s ('chosen at the prompt (' + (@($cands[$i].Reasons) | Select-Object -First 1) + ')') }
+    }
+    return [pscustomobject]@{ Selected = $sel.ToArray(); Rejected = $rej.ToArray() }
+}
+
+function Invoke-RemoteSweep {
+    # Sweeps subnets on the far side of a router: ping every address, try a few TCP ports on the ones
+    # that ignore ping, then a name lookup and the sweep ports on every device that answered. MAC
+    # addresses do not cross a router; they come later from NetBIOS or the router's own ARP table.
+    param($Specs, [int[]]$Ports = @(), [int[]]$PresencePorts = @(), [int]$TimeoutMs = 1000)
+    $devices = @(); $summary = @()
+    foreach ($sp in @($Specs)) {
+        $t0 = Get-Date
+        $hosts = Get-SubnetHosts $sp
+        $alive = @{}
+        # Smaller batches with a pause than the local sweep: this traffic crosses a router or a tunnel.
+        for ($b0 = 0; $b0 -lt $hosts.Count; $b0 += 128) {
+            $chunk = @($hosts[$b0..([math]::Min($b0 + 127, $hosts.Count - 1))])
+            $pingers = @(); $tasks = @()
+            foreach ($t in $chunk) { $p = New-Object Net.NetworkInformation.Ping; $pingers += $p; $tasks += $p.SendPingAsync($t, $TimeoutMs) }
+            try { [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$tasks, $TimeoutMs + 4000) | Out-Null } catch { }
+            for ($j = 0; $j -lt $tasks.Count; $j++) { if ($tasks[$j].IsCompleted -and -not $tasks[$j].IsFaulted -and $tasks[$j].Result.Status -eq 'Success') { $alive[$chunk[$j]] = $true } }
+            foreach ($p in $pingers) { $p.Dispose() }
+            Start-Sleep -Milliseconds 150
+        }
+        $tcpOnly = @{}
+        $silent = @($hosts | Where-Object { -not $alive.ContainsKey($_) })
+        if (@($PresencePorts).Count -and $silent.Count) { $pm = Test-TcpPortsBulk $silent $PresencePorts $TimeoutMs; foreach ($k in $pm.Keys) { $tcpOnly[$k] = @($pm[$k]) } }
+        $live = @(@($alive.Keys) + @($tcpOnly.Keys) | Sort-Object -Unique | Sort-Object { [version]$_ })
+        $minW = 0; $minIo = 0
+        [Threading.ThreadPool]::GetMinThreads([ref]$minW, [ref]$minIo)
+        [void][Threading.ThreadPool]::SetMinThreads([math]::Max($minW, 128), $minIo)
+        $nameTasks = @{}
+        foreach ($ip in $live) { try { $nameTasks[$ip] = [Net.Dns]::GetHostEntryAsync([string]$ip) } catch { } }
+        $open = if (@($Ports).Count -and $live.Count) { Test-TcpPortsBulk $live $Ports $TimeoutMs } else { @{} }
+        if ($nameTasks.Count) { try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($nameTasks.Values), 8000) } catch { } }
+        [void][Threading.ThreadPool]::SetMinThreads($minW, $minIo)
+        foreach ($ip in $live) {
+            $nt = $nameTasks[$ip]
+            $name = if ($nt -and "$($nt.Status)" -eq 'RanToCompletion' -and $nt.Result.HostName -and $nt.Result.HostName -ne $ip) { $nt.Result.HostName } else { $null }
+            $ports = @(@($open[$ip]) + @($tcpOnly[$ip]) | Where-Object { $null -ne $_ } | Sort-Object -Unique)
+            $devices += [pscustomobject]@{ IP = $ip; Mac = $null; Vendor = $null; RespondedToPing = $alive.ContainsKey($ip); Name = $name; OpenPorts = $ports; Role = (Get-DeviceRole $ports); Subnet = $sp.Cidr; Remote = $true }
+        }
+        $summary += [pscustomobject]@{ Subnet = $sp.Cidr; Reason = $sp.Reason; AddressesSwept = $hosts.Count; PingResponders = $alive.Count; TcpOnly = $tcpOnly.Count; Devices = $live.Count; Seconds = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1) }
+    }
+    return [ordered]@{
+        Subnets = $summary
+        PortsChecked = @($Ports); PresencePorts = @($PresencePorts)
+        RoleSummary = @($devices | Where-Object { $_.Role } | Group-Object Role | Sort-Object Count -Descending | ForEach-Object { '{0}: {1}' -f $_.Name, $_.Count })
+        Devices = $devices
+    }
+}
+
 function Get-AssessmentFindings {
     # Turns the collected evidence into plain statements, each with what it rests on and how sure it is:
     # Confirmed (measured directly), Likely (several signs agree), Possible (one sign, or an inference).
@@ -2311,6 +2483,21 @@ function Get-AssessmentFindings {
         } else { & $add 'Gateway' 'Confirmed' 'The gateway does not offer UPnP or NAT-PMP port mapping.' @() }
     }
 
+    # ---- Other subnets ----
+    $rsSubs = @(@(Get-Prop $R 'RemoteSweep', 'Subnets') | Where-Object { $_ })
+    if ($rsSubs.Count) {
+        $rsDev = @(@(Get-Prop $R 'RemoteSweep', 'Devices') | Where-Object { $_ })
+        $t = "Across routing, $($rsDev.Count) devices answered on $($rsSubs.Count) other subnet(s): $((@($rsSubs | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'Subnet'), (Get-Prop $_ 'Devices') })) -join ', ')."
+        $roles = @(Get-Prop $R 'RemoteSweep', 'RoleSummary' | Where-Object { $_ })
+        if ($roles.Count) { $t += " By open ports: $(($roles | Select-Object -First 5) -join '; ')." }
+        & $add 'Network layout' 'Confirmed' $t @($rsSubs | ForEach-Object { "$(Get-Prop $_ 'Subnet'): $(Get-Prop $_ 'PingResponders') answered ping, $(Get-Prop $_ 'TcpOnly') only on TCP, $(Get-Prop $_ 'Seconds') s ($(Get-Prop $_ 'Reason'))" })
+    }
+    $swept = @($rsSubs | ForEach-Object { "$(Get-Prop $_ 'Subnet')" })
+    $notSwept = @(@(Get-Prop $R 'RemoteSubnets', 'Candidates') | Where-Object { $_ -and $swept -notcontains "$(Get-Prop $_ 'Cidr')" })
+    if ($notSwept.Count) {
+        & $add 'Network layout' 'Possible' "This PC knows of $($notSwept.Count) other private subnet(s) that were not swept: $((@($notSwept | Select-Object -First 8 | ForEach-Object { Get-Prop $_ 'Cidr' })) -join ', '). Add the client's ones to `$ScanSubnets to sweep them with -Discovery." @($notSwept | ForEach-Object { "$(Get-Prop $_ 'Cidr'): $((@(Get-Prop $_ 'Reasons') | Select-Object -First 3) -join '; ')$(if (Get-Prop $_ 'Hosted') { ' (remote desktop target here)' })" })
+    }
+
     # ---- Reach across the tunnel ----
     $tr = @(@(Get-Prop $R 'TunnelReach', 'Servers') | Where-Object { $_ -and @(Get-Prop $_ 'OpenPorts' | Where-Object { $null -ne $_ }).Count })
     if ($tr.Count) {
@@ -2475,7 +2662,7 @@ $Result['Meta'] = [ordered]@{
     Options           = [ordered]@{
         SubnetSweep = $EnableSubnetSweep; GatewayProbe = $EnableGatewayProbe; IpInfo = $EnableIpInfo
         FirewallPorts = $EnableFirewallPorts; Ssdp = $EnableSsdp; PrinterProbe = $EnablePrinterProbe
-        SweepPorts = $EnableSweepPorts; TlsCheck = $EnableTlsCheck
+        SweepPorts = $EnableSweepPorts; RemoteSweep = $EnableRemoteSweep; TlsCheck = $EnableTlsCheck
         OuiLookup = $EnableOuiLookup; Bandwidth = $EnableBandwidth; BandwidthSeconds = $BandwidthSeconds
         BandwidthStreams = $BandwidthStreams; MaxTestMB = $MaxTestMB; PingCount = $PingCount; LookbackDays = $LookbackDays
         BandwidthRounds = $BandwidthRounds; VendorDiscovery = $EnableVendorDiscovery; MulticastDiscovery = $EnableMulticastDiscovery
@@ -5124,6 +5311,47 @@ $Result['Meta']['Retried'] = $script:Retried
 [void](Save-Json 'checkpoint: core data saved, active discovery not finished')
 Write-Step $(if ($EnableDiscovery) { 'Core data saved. Starting active discovery (gateway probes, device discovery, subnet sweep)' } else { 'Core data saved. Discovery is off: finishing the checks of this PC and its internet path' })
 
+# ---- Other subnets: what this PC can reach (no traffic), and which to sweep (-Discovery only) ----
+$script:ScanSpecs = @()
+try {
+    $localRanges = @()
+    foreach ($a in @(Get-Val $Result['Network'] 'Adapters')) {
+        if (-not $a -or $a.Status -ne 'Up') { continue }
+        $ips = @($a.IPv4); $masks = @($a.SubnetMask)
+        for ($q = 0; $q -lt $ips.Count; $q++) {
+            if (-not (Test-IPv4 "$($ips[$q])") -or "$($ips[$q])" -like '169.254.*') { continue }
+            $mk = if ($masks.Count -gt $q -and (Test-IPv4 "$($masks[$q])")) { "$($masks[$q])" } else { '255.255.255.0' }
+            $pre = 0; $mi = ConvertTo-IpNumber $mk; for ($bit = 31; $bit -ge 0; $bit--) { if (($mi -shr $bit) -band 1) { $pre++ } else { break } }
+            $localRanges += ConvertTo-NetRange "$($ips[$q])" $pre
+        }
+    }
+    $cands = @(Get-CandidateSubnets $Result $localRanges)
+    $rsOut = [ordered]@{ Candidates = $cands; Answer = $null; Selected = @(); Rejected = @() }
+    if ($EnableDiscovery -and $EnableRemoteSweep -and $script:FullLanguage) {
+        $explicit = @(@($ScanSubnets) + @($SiteSubnets) | Where-Object { $_ })
+        $explicitSpecs = @($explicit | ForEach-Object { ConvertTo-SubnetSpec $_ } | Where-Object { $_ })
+        $offer = @($cands | Where-Object { $c = ConvertTo-SubnetSpec $_.Cidr; -not @($explicitSpecs | Where-Object { Test-RangeOverlap $_ $c }).Count })
+        $answer = ''
+        if ($offer.Count -and -not $NoPrompt) {
+            Write-Host ''
+            Write-Host 'OTHER SUBNETS this PC can reach. None is swept unless you pick it:' -ForegroundColor White
+            for ($k = 0; $k -lt $offer.Count; $k++) {
+                $why = (@($offer[$k].Reasons) | Select-Object -First 3) -join '; '
+                Write-Host ('  {0,2}) {1,-18} {2}' -f ($k + 1), $offer[$k].Cidr, $why)
+                if ($offer[$k].Hosted) { Write-Host '                         a remote desktop target is here: this may be the provider''s network, not the client''s' -ForegroundColor Yellow }
+            }
+            $answer = Read-Host 'Sweep which? Numbers (1,3 or 2-4), A for all, Enter for none'
+        }
+        $sel = Select-ScanSubnets -Explicit $explicit -Candidates $offer -Answer $answer -Exclude $localRanges -Max $RemoteSweepMaxSubnets
+        $script:ScanSpecs = @($sel.Selected)
+        $rsOut['Answer'] = $answer
+        $rsOut['Selected'] = @($sel.Selected | ForEach-Object { [pscustomobject]@{ Subnet = $_.Cidr; Reason = $_.Reason } })
+        $rsOut['Rejected'] = @($sel.Rejected)
+        foreach ($rj in @($sel.Rejected)) { Write-Step "  Not swept: $rj" 'DarkYellow' }
+    }
+    $Result['RemoteSubnets'] = $rsOut
+} catch { $script:Errors += [pscustomobject]@{ Collector = 'Other subnets'; Error = $_.Exception.Message } }
+
 if ($EnableGatewayProbe -and $Gateway) {
     $Result['GatewayProbe'] = Invoke-Collector 'Gateway banner probe' {
         # A 1 s port check first, so a gateway that ignores web requests (guest Wi-Fi) costs seconds, not 10.
@@ -5322,6 +5550,12 @@ if ($EnableSubnetSweep) {
     }
 }
 
+if ($EnableRemoteSweep -and $script:FullLanguage -and @($script:ScanSpecs).Count) {
+    $Result['RemoteSweep'] = Invoke-Collector ("Other subnets ({0}): ping and TCP sweep across routing" -f ((@($script:ScanSpecs) | ForEach-Object { $_.Cidr }) -join ', ')) {
+        Invoke-RemoteSweep -Specs $script:ScanSpecs -Ports $(if ($EnableSweepPorts) { $SweepPorts } else { @() }) -PresencePorts $RemoteSweepPresencePorts -TimeoutMs 1000
+    }
+}
+
 # Runs after the sweep so printers the sweep found are identified too.
 if ($EnablePrinterProbe) {
     $Result['PrinterProbe'] = Invoke-Collector 'Network printer web pages' {
@@ -5408,7 +5642,7 @@ if ($EnableMulticastDiscovery -and $script:FullLanguage -and $srcIp) {
 
 if ($EnableDeviceIdentify -and $script:FullLanguage -and $srcIp) {
     $Result['Identify'] = Invoke-Collector 'Identify devices (web pages, banners, phone models, Windows names)' {
-        $sweepDevs = @(Get-Val $Result['SubnetSweep'] 'Devices' | Where-Object { $_ } | Select-Object -First $IdentifyMaxDevices)
+        $sweepDevs = @(@(Get-Val $Result['SubnetSweep'] 'Devices') + @(Get-Val $Result['RemoteSweep'] 'Devices') | Where-Object { $_ } | Select-Object -First $IdentifyMaxDevices)
         if (-not $sweepDevs.Count) { throw 'No devices from the subnet sweep to identify' }
         $has = { param($d, $port) @($d.OpenPorts) -contains $port }
         # What each device already said in the discovery steps, by address or MAC.
@@ -5458,13 +5692,17 @@ if ($EnableDeviceIdentify -and $script:FullLanguage -and $srcIp) {
 
         $rows = @()
         foreach ($d in $sweepDevs) {
-            $ip = "$($d.IP)"; $mac = "$($d.Mac)"
+            $ip = "$($d.IP)"; $mac = "$($d.Mac)"; $macVendor = $d.Vendor; $macSource = $(if ($mac) { 'ARP' } else { $null })
+            # Across a router there is no ARP entry; a Windows machine's NetBIOS reply carries its MAC.
+            if (-not $mac -and $nbns[$ip] -and "$($nbns[$ip].Mac)" -match '^([0-9A-F]{2}-){5}[0-9A-F]{2}$' -and "$($nbns[$ip].Mac)" -ne '00-00-00-00-00-00') {
+                $mac = "$($nbns[$ip].Mac)"; $macSource = 'NetBIOS'; $macVendor = Get-MacVendor $mac
+            }
             $discHit = if ($disc.ContainsKey($ip)) { $disc[$ip] } elseif ($discMac.ContainsKey($mac)) { $discMac[$mac] } else { $null }
             $rdpName = if ($rdp.ContainsKey($ip)) { $rdp[$ip].Name } else { $null }
-            $ev = @{ MacVendor = $d.Vendor; Name = $d.Name; Ports = @($d.OpenPorts); Disc = $discHit; Sip = $sip[$ip]; Ssdp = $ssdp[$ip]; Wsd = $wsd[$ip]; Mdns = $mdns[$ip]; Http = @($web[$ip] | Where-Object { $_ }); Ssh = $ssh[$ip]; Ftp = $ftp[$ip]; Nbns = $nbns[$ip]; Smb = $smb[$ip]; RdpName = $rdpName; DhcpClass = $dhcpClass[$mac]; Neighbor = $neigh[$mac] }
+            $ev = @{ MacVendor = $macVendor; Name = $d.Name; Ports = @($d.OpenPorts); Disc = $discHit; Sip = $sip[$ip]; Ssdp = $ssdp[$ip]; Wsd = $wsd[$ip]; Mdns = $mdns[$ip]; Http = @($web[$ip] | Where-Object { $_ }); Ssh = $ssh[$ip]; Ftp = $ftp[$ip]; Nbns = $nbns[$ip]; Smb = $smb[$ip]; RdpName = $rdpName; DhcpClass = $dhcpClass[$mac]; Neighbor = $neigh[$mac] }
             $id = Get-DeviceIdentity $ev
             $rows += [pscustomobject][ordered]@{
-                IP = $ip; Mac = $mac; MacVendor = $d.Vendor
+                IP = $ip; Mac = $mac; MacVendor = $macVendor; MacSource = $macSource; Subnet = $d.Subnet; Remote = [bool]$d.Remote
                 Name = $(if ($d.Name) { $d.Name } elseif ($rdpName) { $rdpName } elseif ($nbns[$ip]) { $nbns[$ip].Name } elseif ($discHit) { $discHit.Name } else { $null })
                 OpenPorts = @($d.OpenPorts); Kind = $id['Kind']; Vendor = $id['Vendor']; Model = $id['Model']; Firmware = $id['Firmware']; PassThrough = $id['PassThrough']; Confidence = $id['Confidence']; Evidence = $id['Evidence']
                 Web = @($web[$ip] | Where-Object { $_ }); SshBanner = $ssh[$ip]; FtpBanner = $ftp[$ip]; SipAgent = $sip[$ip]; NetBios = $nbns[$ip]; Smb = $smb[$ip]; Rdp = $rdp[$ip]
@@ -5610,7 +5848,7 @@ if ($EnableOwnerLookup -and (Get-Val $Result['Egress'] 'PublicIPv4')) {
 # nothing and runs after everything above is saved.
 # =====================================================================
 [void](Save-Json 'checkpoint: discovery saved, extra checks not finished')
-$sweepDevs = @(Get-Val $Result['SubnetSweep'] 'Devices' | Where-Object { $_ })
+$sweepDevs = @(@(Get-Val $Result['SubnetSweep'] 'Devices') + @(Get-Val $Result['RemoteSweep'] 'Devices') | Where-Object { $_ })
 $primaryAd = @(Get-Val $Result['Network'] 'Adapters' | Where-Object { $_ -and $_.Name -eq (Get-Val $Result['Network'] 'PhysicalAdapter') }) | Select-Object -First 1
 
 if ($EnableModemPage -and $script:FullLanguage -and $srcIp) {
@@ -6679,6 +6917,7 @@ try {
     $vs = @(Get-Val $Result['VendorDiscovery'] 'ModelSummary' | Where-Object { $_ }); if ($vs.Count) { $disco += "  Vendor discovery:  $($vs -join '; ')" }
     $rn = @(Get-Val $Result['DnsDiscovery'] 'SubnetSummary' | Where-Object { $_ } | ForEach-Object { '{0} {1} names' -f $_.Subnet, $_.Names }); if ($rn.Count) { $disco += "  Reverse DNS names: $($rn -join '; ')" }
     $cs = Get-Val $Result['Capture'] 'Frames'; if ($null -ne $cs) { $disco += ('  Wire capture:      {0} frames in {1} s, {2} broadcast/s, {3} LLDP, {4} CDP, {5} spanning tree, {6} DHCP server(s)' -f $cs, $Result['Capture']['Seconds'], $Result['Capture']['BroadcastPerSecond'], @($Result['Capture']['Lldp']).Count, @($Result['Capture']['Cdp']).Count, @($Result['Capture']['SpanningTree']).Count, @($Result['Capture']['DhcpServers']).Count) }
+    $rss = @(Get-Val $Result['RemoteSweep'] 'Subnets' | Where-Object { $_ }); if ($rss.Count) { $disco += "  Other subnets:     $((@($rss | ForEach-Object { '{0} {1} devices' -f $_.Subnet, $_.Devices })) -join '; ')" }
     $wo = @(Get-Val $Result['WindowsHosts'] 'OsSummary' | Where-Object { $_ }); if ($wo.Count) { $disco += "  Windows versions:  $($wo -join '; ')" }
     $sn = Get-Val $Result['Snmp'] 'Answered'; if ($null -ne $sn) { $disco += ('  SNMP:              {0} of {1} devices answered community {2}' -f $sn, $Result['Snmp']['Asked'], $Result['Snmp']['Community']) }
     $pqa = Get-Val $Result['PrinterQuery'] 'Answered'; if ($null -ne $pqa) { $disco += ('  Printers (IPP):    {0} of {1} described themselves' -f $pqa, $Result['PrinterQuery']['Asked']) }

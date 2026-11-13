@@ -100,3 +100,31 @@ Describe 'Two sites, a hosted desktop and a visiting laptop' {
         $Html | Should -Match 'Windows 10 \(out of support'
     }
 }
+
+Describe 'Devices swept across routing' {
+    BeforeAll {
+        $script:Devs = @(Import-Csv (Join-Path $MultiOut 'Devices.csv'))
+        $script:Subs = @(Import-Csv (Join-Path $MultiOut 'Subnets.csv'))
+        $script:Html = [IO.File]::ReadAllText((Join-Path $MultiOut 'Report.html'))
+    }
+    It 'files them under the site that owns their subnet' {
+        $mfp = $Devs | Where-Object IP -eq '10.20.2.40'
+        $mfp.Site | Should -Be 'Warehouse'
+        $mfp.SeenFrom | Should -Be 'NW-FRONT01 at Main office, across routing'
+        $mfp.Subnet | Should -Be '10.20.2.0/24'
+    }
+    It 'keeps a MAC learned from NetBIOS and says where it came from' {
+        $pc = $Devs | Where-Object IP -eq '10.20.2.31'
+        $pc.Mac | Should -Be '00-15-5D-01-02-03'
+        $pc.MacSource | Should -Be 'NetBIOS'
+    }
+    It 'records the swept subnet and what answered' {
+        $w = $Subs | Where-Object { $_.Subnet -eq '10.20.2.0/24' -and $_.Site -eq 'Warehouse' }
+        $w | Should -Not -BeNullOrEmpty
+        $w.Sources | Should -Match 'swept it from Main office'
+        $w.Notes | Should -Match '2 devices answered'
+    }
+    It 'lists them in their own table in the report' {
+        $Html | Should -Match 'Devices on other subnets, swept across routing \(2\)'
+    }
+}
