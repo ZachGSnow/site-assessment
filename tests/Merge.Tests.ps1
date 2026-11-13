@@ -251,3 +251,21 @@ Describe 'Remote desktop transport in the merged report' {
         (@(Import-Csv (Join-Path $MultiOut 'Sites.csv')) | Where-Object Site -eq 'Main office').RdpTransport | Should -Be 'UDP possible'
     }
 }
+
+Describe 'What to fix first' {
+    BeforeAll { $script:HtmlF = [IO.File]::ReadAllText((Join-Path $MultiOut 'Report.html')) }
+    It 'opens the report with the fix list, before the overview' {
+        $HtmlF.IndexOf('<h2 id="fix">What to fix first</h2>') | Should -BeGreaterThan 0
+        $HtmlF.IndexOf('<h2 id="fix">') | Should -BeLessThan $HtmlF.IndexOf('<h2 id="overview">')
+    }
+    It 'lists each high finding once, worst first, with where it was seen' {
+        $list = [regex]::Match($HtmlF, '(?s)<div class="fix"><ol>(.*?)</ol>').Groups[1].Value
+        @([regex]::Matches($list, '<li>')).Count | Should -Be 2
+        @([regex]::Matches($list, 'SMBv1')).Count | Should -Be 1 -Because 'two machines reported it, it is one line'
+        $list | Should -Match 'Windows 10 \(out of support since Oct 2025\) <span class="where">\(Main office - NW-ACCT02\)'
+    }
+    It 'puts the email domain table after the site comparison' {
+        $HtmlF.IndexOf('Email and domain (public DNS)') | Should -BeGreaterThan $HtmlF.IndexOf('Site comparison table')
+        $HtmlF | Should -Not -Match '<h2>Key findings</h2>'
+    }
+}
