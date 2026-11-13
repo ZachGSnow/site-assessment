@@ -859,7 +859,7 @@ Describe 'Remote desktop transport (UDP or TCP only)' {
     }
 }
 
-Describe 'Fixes from the first real -Discovery run (a home network on Starlink)' {
+Describe 'Fixes from the first real -Discovery run (a small network on satellite internet)' {
     It 'stops at once when the gateway gives no SNMP answer, even when asked to force it' {
         Mock Get-SnmpValues { $null }
         Mock Invoke-SnmpWalk { @() }
@@ -902,5 +902,44 @@ Describe 'Fixes from the first real -Discovery run (a home network on Starlink)'
         $f = @(Get-AssessmentFindings $r)
         @($f | Where-Object Finding -like '*cable (DOCSIS)*').Count | Should -Be 0
         @($f | Where-Object Finding -like 'The circuit is Starlink*').Count | Should -Be 1
+    }
+}
+
+Describe 'Data check on a healthy PC' {
+    BeforeAll {
+        $script:Base = {
+            param([hashtable]$Extra = @{})
+            $d = @{
+                Meta = @{ Hostname = 'NW-FRONT01'; RunStart = '2026-03-10T09:00:00'; SiteName = 'Main office'; HostedDesktop = @{ Profile = 'RDP'; Targets = @() } }
+                Network = @{ PhysicalClass = 'Wi-Fi'; SourceIp = '10.20.1.25'; Gateway = '10.20.1.1' }
+                Egress = @{ PublicIPv4 = '203.0.113.40'; Carrier = 'Northwind Fiber' }
+                Rdp = @{ SelectedTargets = @('203.0.113.80') }
+                PingSeries = @(@{ Target = '1.1.1.1'; Sent = 10; Received = 10; LossPct = 0; AvgMs = 12; JitterMs = 1 })
+                Wireless = @{ Current = @{ SSID = 'Northwind-Staff' }; LocationWorkaround = @{ Result = 'Blocked by policy (HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors\DisableLocation=1); not overridden' } }
+            }
+            foreach ($k in $Extra.Keys) { $d[$k] = $Extra[$k] }
+            $d
+        }
+        $script:Status = { param($rows, $check) ($rows | Where-Object Check -eq $check).Status }
+    }
+    It 'treats silent hosts from the RDP history as information, not a gap' {
+        $rows = @(Test-AssessmentData (& $Base) $TestDrive)
+        & $Status $rows 'Remote desktop loss / latency' | Should -Be 'INFO'
+        & $Status $rows 'Remote desktop reachability' | Should -Be 'INFO'
+    }
+    It 'still warns when the hosted desktop the profile names does not answer' {
+        $d = & $Base @{ Meta = @{ Hostname = 'NW-FRONT01'; RunStart = '2026-03-10T09:00:00'; SiteName = 'Main office'; HostedDesktop = @{ Profile = 'AzureVirtualDesktop'; Targets = @('rdweb.wvd.microsoft.com:443') } }; Rdp = @{ SelectedTargets = @('rdweb.wvd.microsoft.com') } }
+        $rows = @(Test-AssessmentData $d $TestDrive)
+        & $Status $rows 'Remote desktop loss / latency' | Should -Be 'WARN'
+    }
+    It 'reports Wi-Fi details blocked by policy as information' {
+        & $Status @(Test-AssessmentData (& $Base) $TestDrive) 'Wi-Fi details' | Should -Be 'INFO'
+    }
+    It 'still warns when Wi-Fi details are missing for a reason that can be fixed' {
+        $d = & $Base @{ Wireless = @{ Current = @{ SSID = 'Northwind-Staff' }; LocationWorkaround = @{ Result = 'Location services are off device-wide' } } }
+        & $Status @(Test-AssessmentData $d $TestDrive) 'Wi-Fi details' | Should -Be 'WARN'
+    }
+    It 'says plainly when the PC does not use remote desktop at all' {
+        & $Status @(Test-AssessmentData (& $Base @{ Rdp = @{ SelectedTargets = @() } }) $TestDrive) 'Remote desktop targets' | Should -Be 'INFO'
     }
 }
