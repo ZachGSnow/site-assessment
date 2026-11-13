@@ -214,7 +214,7 @@ if ($EnableDnsDiscovery -and $script:FullLanguage -and $srcIp) {
     }
 }
 
-if ($EnableSiteReach -and $srcIp) {
+if ($EnableSiteReach -and $srcIp -and @($SiteSubnets | Where-Object { $_ }).Count) {
     $Result['SiteReach'] = Invoke-Collector 'Other offices (ping and short traceroute)' {
         $localPre = (($srcIp -split '\.')[0..2]) -join '.'
         $targets = @($SiteSubnets | Where-Object { $_ -match '^\d+\.\d+\.\d+$' -and $_ -ne $localPre } | ForEach-Object { "$_.1" })

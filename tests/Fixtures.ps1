@@ -158,6 +158,11 @@ function New-MultiSiteFixture {
             )
         }
         RdpTransport = [ordered]@{ Verdict = 'UDP possible'; Shortpath = $false; Caveats = @(); Evidence = @('STUN on UDP: 3 of 3 servers answered') }
+        IspModem = [ordered]@{ Targets = @([ordered]@{ Address = '192.168.100.1'; Role = 'Modem management address'; OpenPorts = @(80); LooksLike = 'fiber terminal'; Pages = @([ordered]@{ Url = 'http://192.168.100.1/'; Status = 200; Title = 'Northwind Fiber ONT' }) }) }
+        SubnetSweep = [ordered]@{ Subnet = '10.20.1.0/24'; Devices = @(
+            [ordered]@{ IP = '10.20.1.50'; Mac = '00-11-22-33-44-50'; Vendor = 'Contoso Printing'; RespondedToPing = $true; Name = 'nw-mfp'; OpenPorts = @(80, 9100); Role = 'Printer' }
+            [ordered]@{ IP = '10.20.1.77'; Mac = 'DA-11-22-33-44-77'; Vendor = 'Randomized / locally administered'; RespondedToPing = $true; Name = $null; OpenPorts = @(); Role = $null }
+        ) }
         AdSites = [ordered]@{ Forest = 'northwind.local'; CurrentSite = 'Main-Office'; Sites = @(
             [ordered]@{ Name = 'Main-Office'; Location = ''; Subnets = @('10.20.1.0/24') }
             [ordered]@{ Name = 'Warehouse'; Location = ''; Subnets = @('10.20.2.0/24') }

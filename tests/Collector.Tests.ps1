@@ -858,3 +858,49 @@ Describe 'Remote desktop transport (UDP or TCP only)' {
         ($f | Where-Object Area -eq 'Remote desktop').Finding | Should -Match 'only use TCP'
     }
 }
+
+Describe 'Fixes from the first real -Discovery run (a home network on Starlink)' {
+    It 'stops at once when the gateway gives no SNMP answer, even when asked to force it' {
+        Mock Get-SnmpValues { $null }
+        Mock Invoke-SnmpWalk { @() }
+        Get-RouterTables '192.168.1.1' 'public' $true | Should -BeNullOrEmpty
+        Should -Invoke Invoke-SnmpWalk -Times 0 -Exactly -Because 'walking tables on a silent gateway cost 47 s'
+    }
+    It 'names the access type only when the carrier''s name says it: <Carrier>' -ForEach @(
+        @{ Carrier = 'AS14593 Space Exploration Technologies Corporation'; Type = 'Starlink (low-orbit satellite)' }
+        @{ Carrier = 'AS7922 Comcast Cable Communications, LLC'; Type = 'cable' }
+        @{ Carrier = 'AS21928 T-Mobile USA, Inc.'; Type = 'cellular or fixed wireless' }
+        @{ Carrier = 'AS7018 AT&T Services, Inc.'; Type = $null }
+    ) {
+        Get-AccessType $Carrier | Should -Be $Type
+    }
+    It 'does not call public DNS a tunnel' {
+        $r = @{ Egress = @{ PublicIPv4 = '203.0.113.40'; Carrier = 'AS14593 Space Exploration Technologies Corporation' }
+                NetworkExtra = @{ DnsServers = @(@{ Server = '8.8.8.8' }, @{ Server = '8.8.4.4' }) }
+                DnsDiscovery = @{ ResolverEgress = @{ Ip = '198.51.100.7'; Org = 'AS15169 Google LLC'; City = 'Council Bluffs' } } }
+        $f = @(Get-AssessmentFindings $r) | Where-Object Area -eq 'DNS and DHCP'
+        $f.Finding | Should -Match 'normal for public DNS'
+        $f.Finding | Should -Not -Match 'tunnel'
+    }
+    It 'still points at a tunnel or filter when a private DNS server exits elsewhere' {
+        $r = @{ Egress = @{ PublicIPv4 = '203.0.113.40' }; NetworkExtra = @{ DnsServers = @(@{ Server = '10.20.0.5' }) }
+                DnsDiscovery = @{ ResolverEgress = @{ Ip = '198.51.100.7'; Org = 'Contoso Cloud'; City = 'St. Louis' } } }
+        (@(Get-AssessmentFindings $r) | Where-Object Area -eq 'DNS and DHCP').Finding | Should -Match 'far end of a tunnel'
+    }
+    It 'gives no second-DNS-server advice when DHCP already hands out public resolvers' {
+        $r = @{ DnsTiming = @{ Servers = @(
+            @{ Server = '8.8.8.8'; Role = 'Site DNS server'; Answered = 20; Asked = 20; MedianMs = 31.3 }
+            @{ Server = '1.1.1.1'; Role = 'Public resolver (Cloudflare)'; Answered = 20; Asked = 20; MedianMs = 25.8 }
+        ) } }
+        $f = @(Get-AssessmentFindings $r) | Where-Object Area -eq 'DNS and DHCP'
+        $f.Finding | Should -Not -Match 'second DNS server'
+        $f.Finding | Should -Match 'public resolvers as DNS servers'
+    }
+    It 'skips the satellite hop-timing guess when the carrier is known' {
+        $hops = @(@{ Hop = 1; IP = '192.168.1.1'; Class = 'Private'; AvgMs = 3 }, @{ Hop = 2; IP = '198.51.100.10'; Class = 'Public'; AvgMs = 36 }, @{ Hop = 3; IP = '198.51.100.11'; Class = 'Public'; AvgMs = 30 })
+        $r = @{ Egress = @{ PublicIPv4 = '203.0.113.40'; Carrier = 'AS14593 Space Exploration Technologies Corporation' }; Traceroutes = @(@{ Target = '1.1.1.1'; Hops = $hops; Analysis = @{} }) }
+        $f = @(Get-AssessmentFindings $r)
+        @($f | Where-Object Finding -like '*cable (DOCSIS)*').Count | Should -Be 0
+        @($f | Where-Object Finding -like 'The circuit is Starlink*').Count | Should -Be 1
+    }
+}

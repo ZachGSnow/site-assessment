@@ -23,6 +23,8 @@ if ($EnableModemPage -and $script:FullLanguage -and $srcIp) {
             if ($hay -match 'DOCSIS|Cable Modem|Downstream|Upstream|Touchstone|SURFboard|Hitron|Ubee') { $looks = 'cable modem (DOCSIS)' }
             elseif ($hay -match '\bONT\b|GPON|Optical') { $looks = 'fiber terminal' }
             elseif ($hay -match 'VDSL|ADSL|\bDSL\b') { $looks = 'DSL modem' }
+            elseif ($hay -match 'Starlink') { $looks = 'Starlink dish (satellite terminal)' }
+            elseif (@($pages | Where-Object { $_.Title }).Count) { $looks = "ISP device, page titled '$(@($pages | Where-Object { $_.Title })[0].Title)'" }
             elseif ($hay.Trim()) { $looks = 'ISP device (type not stated on its page)' }
             $rows += [pscustomobject]@{ Address = $ip; Role = $(if ($ip -eq '192.168.100.1') { 'Modem management address' } else { 'ISP gateway of the static block' }); OpenPorts = $open; LooksLike = $looks; Pages = $pages }
         }

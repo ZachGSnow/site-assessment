@@ -1157,10 +1157,13 @@ function Get-SiteDiagramModel {
     $side = New-Object Collections.Generic.List[object]
     $node = { param($label, $sub, $kind) [pscustomobject]@{ Label = "$label"; Sub = "$sub"; Kind = $kind } }
     $wan = if ($Site.RouterWan) { "WAN $($Site.RouterWan)" } else { $null }
-    $spine.Add((& $node 'Internet' (J @($(if ($Site.Carrier) { $Site.Carrier }), $(if ($Site.PublicIPs) { "public $($Site.PublicIPs)" })) ' - ') 'cloud'))
+    $spine.Add((& $node 'Internet' (J @($(if ($Site.PublicIPs) { "public $($Site.PublicIPs)" }), $(if ($Site.Carrier) { ("$($Site.Carrier)" -replace '^AS\d+\s+', '') })) ' - ') 'cloud'))
     $modem = @($SiteGear | Where-Object { $_.Type -eq 'ISP modem or ONT' }) | Select-Object -First 1
     $dbl = @($SiteRuns | Where-Object { V (V (@($_.Traceroutes) | Where-Object { $_ -and $_.Target -eq '1.1.1.1' } | Select-Object -First 1) 'Analysis') 'DoubleNatLikely' }).Count
+    # The ISP's box: from a follow-up check, else from the modem-page check (192.168.100.1 and the like)
+    $ispPage = @($SiteRuns | ForEach-Object { @(V (V $_ 'IspModem') 'Targets') } | Where-Object { $_ -and @(V $_ 'Pages').Count }) | Select-Object -First 1
     if ($modem) { $spine.Add((& $node 'ISP modem or ONT' (J @($modem.IP, ($modem.Detail -split ';')[0]) ' - ') 'box')) }
+    elseif ($ispPage) { $spine.Add((& $node 'ISP modem or ONT' (J @((V $ispPage 'Address'), (@(V $ispPage 'Pages') | ForEach-Object { V $_ 'Title' } | Where-Object { $_ } | Select-Object -First 1)) ' - ') 'box')) }
     elseif ($dbl) { $spine.Add((& $node 'ISP modem or ONT' 'double NAT seen in the traceroute' 'box')) }
     $gwIps = J @($SiteRuns | ForEach-Object { V $_.Network 'Gateway' } | Where-Object { $_ } | Sort-Object -Unique) ', '
     # The gateway's name from the best evidence: its model, its own SNMP answer, the firewall make the
@@ -1180,6 +1183,8 @@ function Get-SiteDiagramModel {
     $wifi = @($Eps | Where-Object { "$($_.Connection)" -like 'Wi-Fi*' }).Count
     $ssids = J @($Eps | ForEach-Object { $_.WifiSsid } | Where-Object { $_ } | Sort-Object -Unique) ', '
     if ($ap.Count -or $wifi) { $spine.Add((& $node $(if ($Site.ApVendors) { "$($Site.ApVendors) Wi-Fi" } else { 'Wi-Fi' }) (J @($(if ($ap.Count) { "$($ap.Count) access point(s) seen" }), $(if ($ssids) { "SSID $ssids" })) ' - ') 'box')) }
+    $swept = @($SiteGear | Where-Object { $_.Type -eq 'Subnet device' })
+    if ($swept.Count) { $spine.Add((& $node ("{0} devices on the local network" -f $swept.Count) (J @($swept | ForEach-Object { $_.Vendor } | Where-Object { $_ -and $_ -notlike 'Randomized*' } | Group-Object | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { $_.Name -replace ',? (Inc|Corp|Co|Ltd|LLC|Corporation)\.?.*$', '' }) ', ') 'box')) }
     $spine.Add((& $node ("{0} machine(s) tested" -f @($Eps).Count) ("{0} wired, {1} Wi-Fi: {2}" -f $wired, $wifi, (J @($Eps | Select-Object -First 4 | ForEach-Object { $_.Hostname }) ', ')) 'endpoints'))
 
     # Off to the side of the gateway: the hosted desktop and how it is reached, other subnets, power
