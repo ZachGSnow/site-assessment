@@ -31,7 +31,6 @@ try {
     if ($pfAd -and @($pfAd.IPv4 | Where-Object { $_ -like '169.254.*' }).Count) { $pfNotes += 'The adapter has a 169.254 address: no DHCP server answered.' }
     if ($Net -is [System.Collections.IDictionary] -and $Net['VpnHoldsDefaultRoute']) { $pfNotes += "A VPN adapter holds the default route ($($Net['PrimaryAdapter'])): results would describe the VPN, not this site. Disconnect it and run again." }
     if ($Net -is [System.Collections.IDictionary] -and $Net['MultipleConnected']) { $pfNotes += "More than one adapter is connected ($(@($Net['ConnectedPhysical']) -join '; ')). Turn off the one you are not testing." }
-    $pfIp = if ($pfAd) { "$(@($pfAd.IPv4)[0])" } else { '' }
     $pfHosted = ($script:Preflight['IsVirtualMachine'])
     $script:Preflight['LooksLikeHostedDesktop'] = [bool]$pfHosted
     foreach ($nt in $pfNotes) { Write-Host "  NOTE      $nt" -ForegroundColor Yellow }

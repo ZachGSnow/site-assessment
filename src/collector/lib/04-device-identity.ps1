@@ -88,7 +88,7 @@ function Get-MacVendor {
 }
 
 # =====================================================================
-# v1.6.0 helpers: byte readers, vendor discovery parsers, the wire capture summary and the bulk
+# Helpers: byte readers, vendor discovery parsers, the wire capture summary and the bulk
 # probes used by the identify pass. The parsers only read bytes; each keeps the raw reply (hex)
 # so anything they miss can be worked out from the saved data afterwards.
 # =====================================================================

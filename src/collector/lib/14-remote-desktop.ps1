@@ -13,8 +13,8 @@ function Get-RdpTransportCheck {
     $stun = @(@(Get-Prop $R 'Cloud', 'Stun') | Where-Object { $_ })
     $answered = @($stun | Where-Object { Get-Prop $_ 'Answered' })
     $ports = @($answered | ForEach-Object { Get-Prop $_ 'MappedPort' } | Where-Object { $_ } | Select-Object -Unique)
-    $profile = "$(Get-Prop $R 'Meta', 'HostedDesktop', 'Profile')"
-    $shortpath = $profile -in @('AzureVirtualDesktop', 'Windows365')
+    $hdProfile = "$(Get-Prop $R 'Meta', 'HostedDesktop', 'Profile')"
+    $shortpath = $hdProfile -in @('AzureVirtualDesktop', 'Windows365')
     $inet = @(@(Get-Prop $R 'Traceroutes') | Where-Object { $_ -and "$(Get-Prop $_ 'Target')" -eq '1.1.1.1' }) | Select-Object -First 1
 
     $evidence = @()

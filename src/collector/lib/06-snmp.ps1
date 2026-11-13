@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------
-# v1.7.0 helpers: SNMP (read only), Windows build from the file-sharing handshake, IPP, RTSP, STUN,
+# Helpers: SNMP (read only), Windows build from the file-sharing handshake, IPP, RTSP, STUN,
 # NTP and the fast ping used for the voice sample.
 # ---------------------------------------------------------------------
 function ConvertTo-BerLength { param([int]$Len) if ($Len -lt 128) { return , ([byte[]]@($Len)) } elseif ($Len -lt 256) { return , ([byte[]]@(0x81, $Len)) } else { return , ([byte[]]@(0x82, ($Len -shr 8), ($Len -band 255))) } }

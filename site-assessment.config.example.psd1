@@ -24,6 +24,10 @@
     # Office subnets (first 3 octets, one /24 each): reverse DNS and reachability, with -Discovery
     SiteSubnets       = @('10.10.1', '10.10.2')
 
+    # Other subnets to sweep with -Discovery, without asking at the prompt: 'a.b.c' (a /24) or
+    # 'a.b.c.d/22' to '/30'. SiteSubnets are swept too. At most 8 per run.
+    ScanSubnets       = @('10.10.8.0/23')
+
     # Servers across a site tunnel to test from an office port, with -Discovery
     TunnelServers     = @('10.10.0.10', '10.10.0.11')
 
