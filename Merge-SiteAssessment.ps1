@@ -484,7 +484,7 @@ foreach ($r in $runs) {
 }
 $gear = @($gear | Sort-Object Site, Type, IP, Mac -Unique)
 # Two machines at one site see the same network, so a network risk is kept once per site.
-$flags = @(@($flags | Where-Object { $_.Category -notin @('Network risk', 'Email security') }) + @($flags | Where-Object { $_.Category -in @('Network risk', 'Email security') } | Sort-Object Site, Message -Unique))
+$flags = @(@($flags | Where-Object { $_.Category -notin @('Network risk', 'Email security', 'Active Directory') }) + @($flags | Where-Object { $_.Category -in @('Network risk', 'Email security', 'Active Directory') } | Sort-Object Site, Message -Unique))
 # The client's email domains, once each, from whichever run looked them up last.
 $domainRows = @(foreach ($r in $runs) { foreach ($p in @(V (V $r 'Domains') 'Domains')) { if ($p) {
     [pscustomobject][ordered]@{ Domain = $p.Domain; Provider = $p.Provider; Mx = (J @($p.Mx) ', '); Spf = $(if (V $p.Spf 'Present') { V $p.Spf 'All' } else { 'missing' }); SpfLookups = V $p.Spf 'Lookups'

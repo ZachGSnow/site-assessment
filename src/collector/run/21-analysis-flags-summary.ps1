@@ -14,6 +14,7 @@ $Result['Findings'] = $script:Findings
 # ---------------- Flags ----------------
 try {
     foreach ($dp in @(Get-Val $Result['Domains'] 'Domains')) { foreach ($df in @(Get-DomainFlags $dp)) { Add-Flag $df.Severity $df.Category $df.Message } }
+    foreach ($af in @(Get-AdSiteFlags (Get-AdSiteCheck $Result))) { Add-Flag $af.Severity $af.Category $af.Message }
     if ("$(Get-Prop $Result 'Ipv6', 'Status')" -eq 'Broken') { Add-Flag 'Medium' 'Network' 'IPv6 is offered but does not reach the internet (slow first connections)' }
     foreach ($rf in @(Get-NetworkRiskFlags $Result)) { Add-Flag $rf.Severity $rf.Category $rf.Message }
     foreach ($sd in @(Get-Val $Result['Snmp'] 'Devices')) {

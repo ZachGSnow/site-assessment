@@ -187,13 +187,64 @@ function Get-AdSites {
         Add-Type -AssemblyName System.DirectoryServices
         $f = [DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
         $cur = $null; try { $cur = [DirectoryServices.ActiveDirectory.ActiveDirectorySite]::GetComputerSite().Name } catch { }
-        [pscustomobject]@{ Forest = $f.Name; CurrentSite = $cur; Sites = @($f.Sites | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Location = $_.Location; Subnets = @($_.Subnets | ForEach-Object { $_.Name }) } }) }
+        [pscustomobject]@{ Forest = $f.Name; CurrentSite = $cur; Sites = @($f.Sites | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Location = $_.Location; Subnets = @($_.Subnets | ForEach-Object { $_.Name }); Servers = @($_.Servers | ForEach-Object { $_.Name }) } }) }
     })
     $h = $ps.BeginInvoke()
     try {
         if (-not $h.AsyncWaitHandle.WaitOne($TimeoutSec * 1000)) { try { $ps.Stop() } catch { }; throw "Active Directory did not answer within $TimeoutSec s" }
         $r = @($ps.EndInvoke($h))
         if (-not $r.Count) { throw "Active Directory did not answer: $(@($ps.Streams.Error) | Select-Object -First 1)" }
-        return [ordered]@{ Forest = $r[0].Forest; CurrentSite = $r[0].CurrentSite; Sites = @($r[0].Sites) }
+        # The domain controller this user's logon used (\\DC01), to compare with the PC's own site
+        return [ordered]@{ Forest = $r[0].Forest; CurrentSite = $r[0].CurrentSite; LogonServer = "$env:LOGONSERVER".TrimStart('\'); Sites = @($r[0].Sites) }
     } finally { $ps.Dispose() }
+}
+
+function Get-AdSiteCheck {
+    # Cross-checks Active Directory's sites against where this PC really is: which AD subnet its
+    # address falls in, which site that makes it, which domain controller it logged on to and where
+    # that DC lives. No traffic: it reads what Get-AdSites and the adapter check already collected.
+    param($R)
+    $sites = @(@(Get-Prop $R 'AdSites', 'Sites') | Where-Object { $_ })
+    if (-not $sites.Count) { return $null }
+    $ip = "$(Get-Prop $R 'Network', 'SourceIp')"
+    $best = $null; $bestPre = -1; $bestCidr = $null
+    foreach ($s in $sites) {
+        foreach ($sn in @(Get-Prop $s 'Subnets')) {
+            if ("$sn" -notmatch '^(\d{1,3}(\.\d{1,3}){3})/(\d{1,2})$' -or -not (Test-IPv4 $ip)) { continue }
+            $rg = ConvertTo-NetRange $matches[1] ([int]$matches[3])
+            $n = ConvertTo-IpNumber $ip
+            if ($n -ge $rg.NetInt -and $n -le $rg.End -and $rg.Prefix -gt $bestPre) { $best = $s; $bestPre = $rg.Prefix; $bestCidr = "$sn" }
+        }
+    }
+    $short = { param($n) ("$n".Split('.')[0]).ToUpperInvariant() }
+    $logon = "$(Get-Prop $R 'AdSites', 'LogonServer')"
+    $logonSite = $null
+    if ($logon) { $logonSite = @($sites | Where-Object { @(@(Get-Prop $_ 'Servers') | ForEach-Object { & $short $_ }) -contains (& $short $logon) }) | Select-Object -First 1 }
+    $pcSite = if ($best) { "$(Get-Prop $best 'Name')" } else { $null }
+    return [pscustomobject]@{
+        Ip = $ip; AdSubnet = $bestCidr; SiteBySubnet = $pcSite
+        CurrentSite = "$(Get-Prop $R 'AdSites', 'CurrentSite')"
+        SiteHasDc = $(if ($best) { [bool]@(Get-Prop $best 'Servers').Count } else { $null })
+        LogonServer = $logon; LogonServerSite = $(if ($logonSite) { "$(Get-Prop $logonSite 'Name')" } else { $null })
+        SitesWithoutDc = @($sites | Where-Object { @(Get-Prop $_ 'Subnets').Count -and -not @(Get-Prop $_ 'Servers').Count } | ForEach-Object { "$(Get-Prop $_ 'Name')" })
+    }
+}
+
+function Get-AdSiteFlags {
+    # Severity, Category, Message rows for what Get-AdSiteCheck found.
+    param($C)
+    if (-not $C) { return @() }
+    $out = @()
+    $f = { param($sev, $msg) [pscustomobject]@{ Severity = $sev; Category = 'Active Directory'; Message = $msg } }
+    if ($C.Ip -and -not $C.AdSubnet) {
+        $out += & $f 'Medium' "This PC's address $($C.Ip) is in no Active Directory subnet, so it logs on to whichever domain controller answers first, possibly across the WAN: add its subnet to the right site in AD Sites and Services"
+    } elseif ($C.CurrentSite -and $C.SiteBySubnet -and $C.CurrentSite -ne $C.SiteBySubnet) {
+        $out += & $f 'Low' "This PC reports AD site $($C.CurrentSite), but its subnet $($C.AdSubnet) belongs to site $($C.SiteBySubnet): overlapping or stale subnets in AD Sites and Services"
+    }
+    $mySite = if ($C.SiteBySubnet) { $C.SiteBySubnet } else { $C.CurrentSite }
+    if ($C.LogonServer -and $C.LogonServerSite -and $mySite -and $C.LogonServerSite -ne $mySite -and $C.SiteHasDc) {
+        $out += & $f 'Medium' "This user logged on to $($C.LogonServer) in site $($C.LogonServerSite), not to a domain controller in this PC's own site $mySite"
+    }
+    foreach ($s in @($C.SitesWithoutDc)) { $out += & $f 'Low' "AD site $s has subnets but no domain controller, so its PCs log on across the WAN (fine when that is the design, worth knowing when the link goes down)" }
+    return $out
 }
