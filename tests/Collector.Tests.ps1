@@ -564,3 +564,118 @@ Describe 'Ping and traceroute in any Windows language' {
         Invoke-IcmpText -Kind Ping -Target 'no-such-host.invalid' -Count 1 -WaitSec 30 | Should -Match 'Unable to resolve'
     }
 }
+
+Describe 'Leads: evidence that points at the next check' {
+    BeforeAll {
+        $script:LeadRun = @{
+            Network = @{ SourceIp = '10.20.1.25'; Gateway = '10.20.1.1'; PhysicalAdapter = 'Ethernet'; Adapters = @(@{ Name = 'Ethernet'; SubnetMask = @('255.255.255.0') }) }
+            NetworkExtra = @{ GatewayVendor = 'Fortinet, Inc.'; DnsServers = @(@{ Server = '10.20.0.5' }, @{ Server = '10.20.1.1' }) }
+            Capture = @{
+                DhcpServers = @(@{ Server = '10.20.1.1'; TftpServer = '10.20.0.20' })
+                Lldp = @(@{ Protocol = 'LLDP'; MgmtIP = '10.20.99.2' })
+            }
+            Traceroutes = @(@{ Target = '1.1.1.1'; Analysis = @{ DoubleNatLikely = $true }; Hops = @(@{ Hop = 1; IP = '10.20.1.1'; Class = 'Private' }, @{ Hop = 2; IP = '192.168.0.1'; Class = 'Private' }, @{ Hop = 3; IP = '198.51.100.10'; Class = 'Public' }) })
+            Servers = @{ Servers = @(@{ Name = 'nw-fs01'; IPs = @('10.20.0.10') }, @{ Name = 'printsrv'; IPs = @('10.20.1.30') }) }
+            Identify = @{ Devices = @(
+                @{ IP = '10.20.0.21'; OpenPorts = @(5060); SipAgent = 'Asterisk PBX 18.2' }
+                @{ IP = '10.20.0.50'; OpenPorts = @(443); Web = @(@{ Title = 'iDRAC9 - Login' }) }
+                @{ IP = '10.20.0.60'; OpenPorts = @(443, 902); Web = @(@{ Title = 'VMware ESXi' }) }
+                @{ IP = '10.20.0.70'; OpenPorts = @(8080); MacVendor = 'QNAP Systems, Inc.' }
+                @{ IP = '10.20.0.71'; OpenPorts = @(5001); Web = @(@{ Title = 'Synology DiskStation' }) }
+                @{ IP = '10.20.0.80'; OpenPorts = @(443, 445, 3389); Kind = 'Windows computer' }
+                @{ IP = '10.20.1.90'; OpenPorts = @(80); Web = @(@{ Title = 'Lobby printer' }) }
+            ) }
+        }
+        $script:Leads = @(Get-Leads $LeadRun)
+        $script:Of = { param($kind) @($Leads | Where-Object Kind -eq $kind | ForEach-Object Target) }
+    }
+    It 'finds the phone system from DHCP option 66/150 and from a SIP answer' {
+        & $Of 'PhoneSystem' | Should -Be @('10.20.0.20', '10.20.0.21')
+    }
+    It 'finds the ISP modem behind a double NAT' {
+        & $Of 'Modem' | Should -Be @('192.168.0.1')
+    }
+    It 'knows the firewall''s make from its MAC vendor' {
+        & $Of 'Firewall' | Should -Be @('10.20.1.1')
+        ($Leads | Where-Object Kind -eq 'Firewall').Why | Should -Match 'Fortinet'
+    }
+    It 'sends the switch''s announced management address to SNMP' {
+        & $Of 'Switch' | Should -Be @('10.20.99.2')
+    }
+    It 'lists servers on other subnets for the tunnel check, not ones on this subnet' {
+        & $Of 'Server' | Should -Be @('10.20.0.10', '10.20.0.5')
+    }
+    It 'picks out devices that deserve a specific look' {
+        & $Of 'ServerManagement' | Should -Be @('10.20.0.50')
+        & $Of 'Hypervisor' | Should -Be @('10.20.0.60')
+        & $Of 'Qnap' | Should -Be @('10.20.0.70')
+        & $Of 'Synology' | Should -Be @('10.20.0.71')
+        & $Of 'WindowsWeb' | Should -Be @('10.20.0.80')
+        @($Leads | Where-Object Target -eq '10.20.1.90').Count | Should -Be 0
+    }
+    It 'maps a make to its own VPN and admin pages' {
+        $f = Get-FirewallChecks 'FortiGate-60F'
+        $f.Vendor | Should -Be 'Fortinet'
+        @($f.Checks | Where-Object Path -eq '/remote/login').Count | Should -BeGreaterThan 0
+        Get-FirewallChecks 'Some unknown router' | Should -BeNullOrEmpty
+    }
+    It 'reads a Redfish service root' {
+        $r = ConvertFrom-RedfishRoot '{"@odata.id":"/redfish/v1","RedfishVersion":"1.11.0","Vendor":"Dell","Product":"Integrated Dell Remote Access Controller","Name":"Root Service"}'
+        $r.Vendor | Should -Be 'Dell'
+        $r.Product | Should -Match 'Remote Access'
+        ConvertFrom-RedfishRoot '<html>not json</html>' | Should -BeNullOrEmpty
+    }
+    It 'reads the vSphere API''s description of itself' {
+        $x = '<returnval><about><name>VMware ESXi</name><fullName>VMware ESXi 7.0.3 build-21930508</fullName><version>7.0.3</version><build>21930508</build><apiType>HostAgent</apiType></about></returnval>'
+        $v = ConvertFrom-VimAbout $x
+        $v.Version | Should -Be '7.0.3'
+        $v.ApiType | Should -Be 'HostAgent'
+    }
+    It 'reads a QNAP login check' {
+        $q = ConvertFrom-QnapLogin '<QDocRoot><model><modelName><![CDATA[TS-453D]]></modelName><displayModelName><![CDATA[TS-453D]]></displayModelName></model><firmware><version><![CDATA[5.1.4]]></version><build><![CDATA[20231128]]></build></firmware></QDocRoot>'
+        $q.Model | Should -Be 'TS-453D'
+        $q.Firmware | Should -Be '5.1.4'
+    }
+    It 'runs the follow-up checks and keeps the ones that answered' {
+        Mock Invoke-HttpText {
+            switch -Wildcard ($Url) {
+                'https://10.20.1.1/remote/login' { [pscustomobject]@{ Status = 200; Title = 'FortiGate SSL VPN'; Body = '' } }
+                'https://10.20.0.60/sdk' { [pscustomobject]@{ Status = 200; Body = '<about><fullName>VMware ESXi 7.0.3 build-1</fullName><version>7.0.3</version><build>1</build><apiType>HostAgent</apiType></about>' } }
+                'https://10.20.0.50/redfish/v1/' { [pscustomobject]@{ Status = 200; Body = '{"RedfishVersion":"1.11.0","Vendor":"Dell","Product":"iDRAC"}' } }
+                'https://10.20.0.80/remoteDesktopGateway/' { [pscustomobject]@{ Status = 401; Body = '' } }
+                default { [pscustomobject]@{ Status = 404; Body = '' } }
+            }
+        }
+        $rows = @(Invoke-LeadChecks $Leads)
+        ($rows | Where-Object Kind -eq 'Firewall').What | Should -Be 'Fortinet SSL-VPN portal'
+        ($rows | Where-Object Kind -eq 'Hypervisor').Version | Should -Be '7.0.3'
+        ($rows | Where-Object Kind -eq 'ServerManagement').What | Should -Be 'Dell iDRAC'
+        ($rows | Where-Object What -eq 'RD Gateway').IP | Should -Be '10.20.0.80'
+        @($rows | Where-Object Kind -eq 'Storage').Count | Should -Be 0 -Because 'nothing answered for the NAS checks'
+    }
+    It 'offers Active Directory''s subnets and the gateway''s routes at the subnet prompt' {
+        $run = @{ AdSites = @{ Sites = @(@{ Name = 'Branch'; Subnets = @('10.20.9.0/24', '10.0.0.0/8') }) }; GatewayRouter = @{ Routes = @(@{ Destination = '10.20.40.0'; Prefix = 24; NextHop = '10.20.1.254' }, @{ Destination = '0.0.0.0'; Prefix = 0; NextHop = '203.0.113.41' }) } }
+        $c = @(Get-CandidateSubnets $run @(ConvertTo-NetRange '10.20.1.25' 24))
+        $c.Cidr | Should -Be @('10.20.9.0/24', '10.20.40.0/24')
+        ($c | Where-Object Cidr -eq '10.20.9.0/24').Reasons | Should -Be @('Active Directory site Branch')
+        ($c | Where-Object Cidr -eq '10.20.40.0/24').Reasons | Should -Match 'route on the gateway via 10\.20\.1\.254'
+    }
+    It 'flags a VMware host out of support and a management controller on the office network' {
+        $r = @{ LeadChecks = @{ Checks = @(@{ Kind = 'Hypervisor'; IP = '10.20.0.60'; What = 'VMware ESXi 7.0.3 build-1'; Version = '7.0.3' }, @{ Kind = 'Hypervisor'; IP = '10.20.0.61'; What = 'VMware ESXi 8.0.2'; Version = '8.0.2' }, @{ Kind = 'ServerManagement'; IP = '10.20.0.50'; What = 'Dell iDRAC' }) } }
+        $f = @(Get-NetworkRiskFlags $r)
+        ($f | Where-Object Message -like '*VMware host*').Message | Should -Match '^1 VMware host'
+        ($f | Where-Object Message -like '*management controller*').Severity | Should -Be 'Medium'
+    }
+    It 'reports Active Directory sites and the follow-up checks as findings' {
+        $r = @{ AdSites = @{ Forest = 'northwind.local'; CurrentSite = 'Main-Office'; Sites = @(@{ Name = 'Main-Office'; Subnets = @('10.20.1.0/24') }, @{ Name = 'Lab'; Subnets = @() }) }
+                LeadChecks = @{ Checks = @(@{ Kind = 'Modem'; IP = '192.168.0.1'; What = 'ISP modem or ONT'; Detail = 'web page 200: Gateway'; Url = 'http://192.168.0.1/' }) } }
+        $f = @(Get-AssessmentFindings $r)
+        ($f | Where-Object Finding -like 'Active Directory*').Finding | Should -Match 'belongs to site Main-Office.*1 site\(s\) have no subnets'
+        ($f | Where-Object Finding -like 'ISP modem*').Area | Should -Be 'Internet service'
+    }
+    It 'checks leads only with -Discovery, and reads AD sites on every run' {
+        (& $Config).EnableLeadChecks | Should -BeFalse
+        (& $Config -Discovery).EnableLeadChecks | Should -BeTrue
+        (& $Config).EnableAdSites | Should -BeTrue
+    }
+}

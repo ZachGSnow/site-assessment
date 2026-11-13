@@ -186,3 +186,23 @@ Describe 'IPv6 in the merged report' {
         ($Sites6 | Where-Object Site -eq 'Warehouse').Ipv6 | Should -Be 'Not offered'
     }
 }
+
+Describe 'Leads in the merged report' {
+    BeforeAll {
+        $script:SubsL = @(Import-Csv (Join-Path $MultiOut 'Subnets.csv'))
+        $script:SitesL = @(Import-Csv (Join-Path $MultiOut 'Sites.csv'))
+        $script:GearL = @(Import-Csv (Join-Path $MultiOut 'NetworkGear.csv'))
+    }
+    It 'lists a subnet only Active Directory knows about' {
+        $b = $SubsL | Where-Object Subnet -eq '10.20.9.0/24'
+        $b.Kind | Should -Be 'Active Directory site'
+        $b.Site | Should -Be 'AD site Branch'
+    }
+    It 'shows the Active Directory site of each office' {
+        ($SitesL | Where-Object Site -eq 'Main office').AdSite | Should -Be 'Main-Office'
+    }
+    It 'adds what the follow-up checks found to the network equipment' {
+        ($GearL | Where-Object Type -eq 'Firewall page').Name | Should -Be 'Fortinet SSL-VPN portal'
+        ($GearL | Where-Object Type -eq 'VMware host').IP | Should -Be '10.20.1.40'
+    }
+}

@@ -156,6 +156,15 @@ function New-MultiSiteFixture {
                 [ordered]@{ IP = '10.20.2.31'; Mac = $null; Vendor = $null; RespondedToPing = $false; Name = $null; OpenPorts = @(445); Role = 'Windows PC, server or NAS (file sharing on)'; Subnet = '10.20.2.0/24'; Remote = $true }
             )
         }
+        AdSites = [ordered]@{ Forest = 'northwind.local'; CurrentSite = 'Main-Office'; Sites = @(
+            [ordered]@{ Name = 'Main-Office'; Location = ''; Subnets = @('10.20.1.0/24') }
+            [ordered]@{ Name = 'Warehouse'; Location = ''; Subnets = @('10.20.2.0/24') }
+            [ordered]@{ Name = 'Branch'; Location = ''; Subnets = @('10.20.9.0/24') }
+        ) }
+        LeadChecks = [ordered]@{ Leads = 3; Checks = @(
+            [ordered]@{ Kind = 'Firewall'; IP = '10.20.1.1'; What = 'Fortinet SSL-VPN portal'; Detail = 'port 443 answers 200: FortiGate SSL VPN'; Url = 'https://10.20.1.1/remote/login' }
+            [ordered]@{ Kind = 'Hypervisor'; IP = '10.20.1.40'; What = 'VMware ESXi 8.0.2 build-22380479'; Detail = 'version 8.0.2 build 22380479 (HostAgent)'; Url = 'https://10.20.1.40/sdk'; Version = '8.0.2' }
+        ) }
         Snmp = [ordered]@{ Community = 'public'; Asked = 6; Answered = 2; Routers = 1; ArpEntries = 2; WanAddresses = @('203.0.113.42'); Ups = 1; Devices = @(
             [ordered]@{ IP = '10.20.1.1'; SysName = 'nw-fw01'; SysDescr = 'Contoso Firewall 60'; Model = 'CF-60'; Serial = 'CF60X0001'
                 Router = [ordered]@{ Forwarding = $true

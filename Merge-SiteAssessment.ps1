@@ -427,6 +427,12 @@ foreach ($r in $runs) {
             $gear += [pscustomobject][ordered]@{ Site = $site; SeenFrom = $hostName; Type = 'Subnet device'; Name = V $dv 'Name'; IP = $dv.IP; Mac = $dv.Mac; Vendor = $dv.Vendor; Detail = $detail }
         }
     }
+    foreach ($lc in @(V (V $r 'LeadChecks') 'Checks')) {
+        if (-not $lc) { continue }
+        $owner = Get-OwnerSite "$($lc.IP)"
+        $lcType = switch ("$($lc.Kind)") { 'Firewall' { 'Firewall page' } 'Modem' { 'ISP modem or ONT' } 'ServerManagement' { 'Server management controller' } 'Hypervisor' { 'VMware host' } 'Storage' { 'Storage (NAS)' } 'RemoteDesktop' { 'RD Web / RD Gateway' } default { 'Follow-up check' } }
+        $gear += [pscustomobject][ordered]@{ Site = $(if ($owner) { $owner } else { $site }); SeenFrom = $hostName; Type = $lcType; Name = $lc.What; IP = $lc.IP; Mac = $null; Vendor = $null; Detail = (J @($lc.Detail, $lc.Url) '; ') }
+    }
     foreach ($sd in @(V (V $r 'Snmp') 'Devices')) {
         if (-not $sd) { continue }
         $owner = Get-OwnerSite "$($sd.IP)"
@@ -491,7 +497,7 @@ foreach ($e in $endpoints) {
 # traceroute hops, RDP lookups). Nothing here sends any traffic.
 # ---------------------------------------------------------------------
 $subnetMap = [ordered]@{}
-$kindRank = @{ 'Local (machine is on it)' = 0; 'Route on a machine' = 1; 'Swept across routing' = 1; 'Inferred /24 (from an address)' = 2 }
+$kindRank = @{ 'Local (machine is on it)' = 0; 'Route on a machine' = 1; 'Swept across routing' = 1; 'Active Directory site' = 1; 'Inferred /24 (from an address)' = 2 }
 $epLocal = @{}
 function Add-Subnet {
     param([string]$Site, [string]$Cidr, [string]$Kind, [string]$Source, [string]$SeenFrom, [string]$Device, [string]$Note)
@@ -563,6 +569,19 @@ foreach ($r in $runs) {
         $net0 = "$($sw.Subnet)".Split('/')[0]
         $owner = Get-OwnerSite $net0
         Add-Subnet $(if ($owner) { $owner } else { $site }) "$($sw.Subnet)" 'Swept across routing' ("{0} swept it from {1} ({2})" -f $hn, $site, $sw.Reason) $hn $null ("{0} devices answered ({1} to ping, {2} only on TCP)" -f $sw.Devices, $sw.PingResponders, $sw.TcpOnly)
+    }
+}
+
+# Pass 1c: the subnets Active Directory assigns to each site.
+foreach ($r in $runs) {
+    $hn = $r._Label
+    foreach ($ads in @(V (V $r 'AdSites') 'Sites')) {
+        foreach ($sn in @(V $ads 'Subnets')) {
+            if (-not ("$sn" -match '^(\d{1,3}(\.\d{1,3}){3})/(\d+)$') -or -not (Test-PrivateIp $matches[1])) { continue }
+            $cidr = Get-NetworkCidr $matches[1] ([int]$matches[3])
+            $owner = Get-OwnerSite $matches[1]
+            Add-Subnet $(if ($owner) { $owner } else { "AD site $(V $ads 'Name')" }) $cidr 'Active Directory site' ("Active Directory site {0} (read by {1})" -f (V $ads 'Name'), $hn) $hn $null $null
+        }
     }
 }
 
@@ -1040,6 +1059,7 @@ foreach ($g in ($endpoints | Group-Object Site | Sort-Object Name)) {
         RouterWan = J @($routerAddr | Where-Object { $_.Site -eq $g.Name -and $_.Class -eq 'Public' } | ForEach-Object { if ($_.Owner) { '{0} ({1})' -f $_.Address, $_.Owner } else { $_.Address } } | Sort-Object -Unique) ', '
         UpsCount = @($upsRows | Where-Object { $_.Site -eq $g.Name }).Count
         Ipv6 = J @($eps | ForEach-Object { $_.Ipv6 } | Where-Object { $_ } | Sort-Object -Unique) ', '
+        AdSite = J @($runs | Where-Object { $_._SiteKey -eq (SiteKey $g.Name) } | ForEach-Object { V (V $_ 'AdSites') 'CurrentSite' } | Where-Object { $_ } | Sort-Object -Unique) ', '
         ExposedPorts = J (@($ips | ForEach-Object { $x = $exposure[$_]; if ($x -and $x.Listed) { "$($_): $(@($x.Ports) -join ' ')" } elseif ($x -and -not $x.Error) { "$($_): none listed" } }))
         Notes = J $notes
     }
@@ -1673,7 +1693,7 @@ foreach ($s in $sites) {
         'Wired median down', $(if ($null -ne $s.WiredMedianDown) { "$($s.WiredMedianDown) Mbps" }), 'Wi-Fi median down', $(if ($null -ne $s.WifiMedianDown) { "$($s.WifiMedianDown) Mbps" }),
         'Firewall', $s.FirewallModel, 'Gateway MAC vendor', $s.GatewayVendors, 'Firewall (admin ports)', $s.FirewallHints, 'VPN client vendor on PCs', $s.VpnClientVendors,
         'Router WAN address (SNMP)', $(if ($s.RouterWan) { $s.RouterWan } else { $null }),
-        'IPv6', $(if ($s.Ipv6) { $s.Ipv6 } else { 'not checked' }),
+        'IPv6', $(if ($s.Ipv6) { $s.Ipv6 } else { 'not checked' }), 'Active Directory site', $(if ($s.AdSite) { $s.AdSite } else { $null }),
         'Wireless', $(if ($s.ApVendors) { "$($s.ApVendors) ($($s.ApBssids) BSSIDs seen)" } else { 'not identified' }), 'Switching', $(if ($s.Switches) { $s.Switches } else { 'not identified (needs admin run on a wired machine)' }))
     [void]$body.Append((New-Panel 'Site facts' ($facts + "<h4>Topology: $(Enc $s.Verdict)</h4>" + $ev.ToString())))
 
