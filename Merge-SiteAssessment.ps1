@@ -1145,6 +1145,98 @@ function New-Section {
     return "<details class=""$Class""$i$o><summary><span class=""s-title"">$(Enc $Title)</span>$b$Extra</summary><div class=""body"">$Body</div></details>"
 }
 
+# ---------------------------------------------------------------------
+# Site diagram: one simple top-down picture per site, drawn from what the runs found (carrier, modem,
+# gateway, switches, access points, machines, the hosted desktop, other subnets, UPS). Nothing is
+# hard-coded to a client: a box only appears when there is evidence for it.
+# ---------------------------------------------------------------------
+function Get-SiteDiagramModel {
+    param($Site, $Eps, $SiteGear, $SiteUps, $SiteRuns)
+    $spine = New-Object Collections.Generic.List[object]
+    $side = New-Object Collections.Generic.List[object]
+    $node = { param($label, $sub, $kind) [pscustomobject]@{ Label = "$label"; Sub = "$sub"; Kind = $kind } }
+    $wan = if ($Site.RouterWan) { "WAN $($Site.RouterWan)" } else { $null }
+    $spine.Add((& $node 'Internet' (J @($(if ($Site.Carrier) { $Site.Carrier }), $(if ($Site.PublicIPs) { "public $($Site.PublicIPs)" })) ' - ') 'cloud'))
+    $modem = @($SiteGear | Where-Object { $_.Type -eq 'ISP modem or ONT' }) | Select-Object -First 1
+    $dbl = @($SiteRuns | Where-Object { V (V (@($_.Traceroutes) | Where-Object { $_ -and $_.Target -eq '1.1.1.1' } | Select-Object -First 1) 'Analysis') 'DoubleNatLikely' }).Count
+    if ($modem) { $spine.Add((& $node 'ISP modem or ONT' (J @($modem.IP, ($modem.Detail -split ';')[0]) ' - ') 'box')) }
+    elseif ($dbl) { $spine.Add((& $node 'ISP modem or ONT' 'double NAT seen in the traceroute' 'box')) }
+    $gwIps = J @($SiteRuns | ForEach-Object { V $_.Network 'Gateway' } | Where-Object { $_ } | Sort-Object -Unique) ', '
+    # The gateway's name from the best evidence: its model, its own SNMP answer, the firewall make the
+    # follow-up check found, and only then the maker of its network card.
+    $gwList = @($SiteRuns | ForEach-Object { "$(V $_.Network 'Gateway')" } | Where-Object { $_ })
+    $snmpGw = @($SiteGear | Where-Object { $_.Type -eq 'Router (SNMP)' -and $gwList -contains "$($_.IP)" }) | Select-Object -First 1
+    $fwPage = @($SiteGear | Where-Object { $_.Type -eq 'Firewall page' }) | Select-Object -First 1
+    $gwName = if ($Site.FirewallModel) { $Site.FirewallModel }
+              elseif ($snmpGw) { ("{0} {1}" -f $snmpGw.Name, $(if ("$($snmpGw.Detail)" -match '^([^;]+)') { "($($matches[1].Trim()))" })).Trim() }
+              elseif ($fwPage) { "$((("$($fwPage.Name)") -split ' ')[0]) firewall" }
+              elseif ($Site.GatewayVendors) { "$($Site.GatewayVendors) gateway" } else { 'Gateway / firewall' }
+    $spine.Add((& $node $gwName (J @($gwIps, $wan) ' - ') 'box'))
+    $sw = @($SiteGear | Where-Object { $_.Type -like 'Switch*' } | Sort-Object IP, Name -Unique)
+    if ($sw.Count) { $spine.Add((& $node $(if ($sw.Count -eq 1) { "$($sw[0].Name)" } else { "$($sw.Count) switches" }) (J @($sw | Select-Object -First 3 | ForEach-Object { if ($_.IP) { $_.IP } else { $_.Type } }) ', ') 'box')) }
+    $ap = @($SiteGear | Where-Object { $_.Type -like 'Access point*' })
+    $wired = @($Eps | Where-Object { "$($_.Connection)" -like 'Wired*' }).Count
+    $wifi = @($Eps | Where-Object { "$($_.Connection)" -like 'Wi-Fi*' }).Count
+    $ssids = J @($Eps | ForEach-Object { $_.WifiSsid } | Where-Object { $_ } | Sort-Object -Unique) ', '
+    if ($ap.Count -or $wifi) { $spine.Add((& $node $(if ($Site.ApVendors) { "$($Site.ApVendors) Wi-Fi" } else { 'Wi-Fi' }) (J @($(if ($ap.Count) { "$($ap.Count) access point(s) seen" }), $(if ($ssids) { "SSID $ssids" })) ' - ') 'box')) }
+    $spine.Add((& $node ("{0} machine(s) tested" -f @($Eps).Count) ("{0} wired, {1} Wi-Fi: {2}" -f $wired, $wifi, (J @($Eps | Select-Object -First 4 | ForEach-Object { $_.Hostname }) ', ')) 'endpoints'))
+
+    # Off to the side of the gateway: the hosted desktop and how it is reached, other subnets, power
+    if ($null -ne $Site.HostedMedianMs -and "$($Site.HostedMedianMs)" -ne '') {
+        $how = switch -Wildcard ("$($Site.Verdict)") { 'Full backhaul*' { 'all traffic through a tunnel' } 'Split tunnel*' { 'tunnel; internet local' } 'Shared egress*' { 'shares an exit with another site' } default { 'over the internet' } }
+        $side.Add((& $node $HostedLabel ("{0} ms round trip, {1}" -f (Num $Site.HostedMedianMs), $how) 'cloud'))
+    }
+    # Devices swept across routing on subnets this site's own machines are not on
+    $ownNets = @($siteNets | Where-Object { $_.Site -eq $Site.Site } | ForEach-Object { $_.Cidr })
+    $remote = @($SiteGear | Where-Object { $_.Type -eq 'Device on another subnet' } | Where-Object { $dip = "$($_.IP)"; -not @($ownNets | Where-Object { Test-InCidr $dip $_ }).Count })
+    if ($remote.Count) {
+        $subs = @($remote | ForEach-Object { if ("$($_.Detail)" -match 'subnet (\S+)') { $matches[1] } } | Sort-Object -Unique)
+        $side.Add((& $node 'Other subnets' ("{0} devices on {1}" -f $remote.Count, ($subs -join ', ')) 'box'))
+    }
+    if (@($SiteUps).Count) { $side.Add((& $node 'UPS' (J @($SiteUps | ForEach-Object { "$($_.Model) $(if ($_.OnBattery -eq $true -or "$($_.OnBattery)" -eq 'True') { 'ON BATTERY' } elseif ($null -ne $_.MinutesRemaining -and "$($_.MinutesRemaining)" -ne '') { "$($_.MinutesRemaining) min" })".Trim() }) ', ') 'box')) }
+    return [pscustomobject]@{ Spine = $spine.ToArray(); Side = $side.ToArray() }
+}
+
+function New-SiteDiagramSvg {
+    # Top-down spine of boxes with side boxes off the gateway. -Standalone adds a white background and
+    # fixed colours for the .svg file; inline, the report's own colours (currentColor) are used.
+    param([string]$Title, $Model, [switch]$Standalone)
+    $spine = @($Model.Spine); $side = @($Model.Side)
+    $w = 760; $bx = 40; $bw = 330; $bh = 50; $gap = 26; $top = 44
+    $h = [math]::Max($top + $spine.Count * ($bh + $gap), $top + $side.Count * ($bh + $gap) + 80) + 10
+    $fg = if ($Standalone) { '#1f2328' } else { 'currentColor' }
+    $sb = New-Object Text.StringBuilder
+    [void]$sb.Append(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="100%" role="img" aria-label="{2}" font-family="Segoe UI, Arial, sans-serif">' -f $w, $h, (Enc $Title)))
+    if ($Standalone) { [void]$sb.Append(('<rect width="{0}" height="{1}" fill="#ffffff"/>' -f $w, $h)) }
+    [void]$sb.Append(('<text x="{0}" y="24" font-size="15" font-weight="600" fill="{1}">{2}</text>' -f $bx, $fg, (Enc $Title)))
+    $box = {
+        param($x, $y, $n)
+        $rx = if ($n.Kind -eq 'cloud') { 22 } else { 6 }
+        $stroke = switch ($n.Kind) { 'cloud' { '#2f81f7' } 'endpoints' { '#3fb950' } default { '#8b949e' } }
+        $label = "$($n.Label)"; if ($label.Length -gt 44) { $label = $label.Substring(0, 43) + '...' }
+        $sub = "$($n.Sub)"; if ($sub.Length -gt 52) { $sub = $sub.Substring(0, 51) + '...' }
+        '<rect x="{0}" y="{1}" width="{2}" height="{3}" rx="{4}" fill="none" stroke="{5}" stroke-width="1.6"/><text x="{6}" y="{7}" font-size="13" font-weight="600" fill="{8}">{9}</text><text x="{6}" y="{10}" font-size="11" fill="{8}" opacity="0.75">{11}</text>' -f $x, $y, $bw, $bh, $rx, $stroke, ($x + 12), ($y + 20), $fg, (Enc $label), ($y + 38), (Enc $sub)
+    }
+    $gwRow = -1
+    for ($i = 0; $i -lt $spine.Count; $i++) {
+        $y = $top + $i * ($bh + $gap)
+        if ($i -gt 0) { [void]$sb.Append(('<line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="{3}" stroke-width="1.4" opacity="0.6"/>' -f ($bx + $bw / 2), ($y - $gap), $y, $fg)) }
+        [void]$sb.Append((& $box $bx $y $spine[$i]))
+        if ($gwRow -lt 0 -and $spine[$i].Label -notin @('Internet', 'ISP modem or ONT')) { $gwRow = $i }
+    }
+    if ($side.Count) {
+        $gy = $top + [math]::Max(0, $gwRow) * ($bh + $gap) + $bh / 2
+        $sx = $bx + $bw + 40
+        for ($j = 0; $j -lt $side.Count; $j++) {
+            $y = $top + ([math]::Max(0, $gwRow) + $j) * ($bh + $gap)
+            [void]$sb.Append(('<path d="M {0} {1} H {2} V {3} H {4}" fill="none" stroke="{5}" stroke-width="1.2" stroke-dasharray="4 3" opacity="0.6"/>' -f ($bx + $bw), $gy, ($sx - 16), ($y + $bh / 2), $sx, $fg))
+            [void]$sb.Append((& $box $sx $y $side[$j]))
+        }
+    }
+    [void]$sb.Append('</svg>')
+    return $sb.ToString()
+}
+
 function New-Panel {
     # Always-visible titled block.
     param([string]$Title, [string]$Body, [string]$Sub, [string]$Class)
@@ -1642,6 +1734,11 @@ foreach ($s in $sites) {
     [void]$body.Append((New-Tile 'Packet loss to the internet' (Num $sv.WorstLoss) '%' "worst machine, $(if ($s.PingSamples) { $s.PingSamples } else { 'the' }) pings to 1.1.1.1" '' (Get-LossState $sv.WorstLoss)))
     [void]$body.Append((New-Tile 'Hops to the internet' $pathVal '' $pathSub))
     [void]$body.Append('</div>')
+    # Site diagram: inline for the report, and as its own .svg file for documents and tickets
+    $diagModel = Get-SiteDiagramModel $s $eps @($gear | Where-Object Site -eq $name) @($upsRows | Where-Object Site -eq $name) $siteRuns
+    [void]$body.Append((New-Panel 'Site diagram' (New-SiteDiagramSvg "$name" $diagModel) 'Drawn from what the runs found: a box appears only where there is evidence for it. Also saved in _merged\diagrams.'))
+    $diagDir = Join-Path $OutDir 'diagrams'; New-Item -ItemType Directory -Path $diagDir -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $diagDir ('{0}.svg' -f ($name -replace '[^A-Za-z0-9_-]', '_'))), (New-SiteDiagramSvg "$ClientName - $name" $diagModel -Standalone), (New-Object Text.UTF8Encoding $false))
     if ($s.Notes) {
         [void]$body.Append('<div class="note"><b>Notes for this site</b><ul>')
         foreach ($nt in ($s.Notes -split '; ')) { if ($nt) { [void]$body.Append('<li>' + (Enc $nt) + '</li>') } }
