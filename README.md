@@ -1,31 +1,46 @@
 # Site Assessment
 
-**Run one PowerShell script on a Windows PC at a client site and find out how its network really behaves: where the traffic leaves, how fast the circuit is, how the hosted desktop feels, and what is on the desk. Merge the runs from every office into one report.**
+**One PowerShell script, run on a Windows PC at a client site, finds out how the network really behaves: where the traffic leaves, how fast the circuit is, whether the hosted desktop can work well, what is on the network and what is risky. A second script merges every office into one report that opens with what to fix first.**
 
 [![CI](https://github.com/ZachGSnow/site-assessment/actions/workflows/ci.yml/badge.svg)](https://github.com/ZachGSnow/site-assessment/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-![Overview of a merged report for a fictional two-office company](docs/report-overview.png)
+![The top of a merged report for a fictional two-office company: what to fix first, then one card per site](docs/report-overview.png)
 
 ## Why
 
-"The remote desktop is slow" can mean a tired PC, bad Wi-Fi, a saturated circuit, a firewall that sends everything through another office, or a provider three states away. Finding out usually means a site visit, a speed test on someone's phone and a guess. This collector measures it all from the PC the user actually works on, in about five minutes, without installing anything. Then it says what the evidence adds up to, and how sure it is.
+"The remote desktop is slow" can mean a tired PC, bad Wi-Fi, a saturated circuit, a firewall that sends everything through another office, a NAT that forces the session onto TCP, or a provider three states away. Finding out usually means a site visit, a speed test on someone's phone and a guess. This measures it from the PC the user actually works on, in about five minutes, without installing anything, and says what the evidence adds up to and how sure it is.
 
-## Features
+## What it finds
 
-- **Traffic design verdict** for every machine: local breakout, split tunnel (remote desktop over a tunnel, internet local) or full backhaul. It's scored from traceroutes, path MTU, DNS servers, the egress network, remote desktop paths and VPN routes, and every signal is listed as evidence.
-- **Circuit and path:** download and upload with provider failover (Cloudflare, then M-Lab, then Vultr), bufferbloat (latency under load), a 3-minute loss and jitter series, traceroutes, carrier-grade NAT and double NAT detection, and who owns the public address.
-- **Email and domain:** the client's domain, taken from the user's sign-in name, the DNS suffixes and the AD forest (internal-only names left out), looked up in public DNS: where mail goes (Microsoft 365, Google, Proofpoint...), SPF and how it ends, DMARC policy, DKIM at the usual selectors, MTA-STS. Missing or weak SPF and DMARC become flags.
-- **IPv6:** whether the network offers it (global prefix, router advertisements, IPv6 DNS) and whether it reaches the internet (Cloudflare over IPv6, 10 pings, AAAA lookups). Working, broken (offered but going nowhere, which slows first connections), local only or not offered. Only /64 prefixes are kept, never a full address.
-- **Hosted desktop profiles:** tell it which service the users work in (plain RDP, Azure Virtual Desktop, Windows 365, Citrix Cloud, or your own). It finds the client app, the hosts it talks to, and the round trip that matters, graded against Microsoft's Azure Virtual Desktop guidance.
-- **The PC itself:** hardware age, Windows version, TPM, BitLocker, disk health, RAM and CPU pressure during the run, Wi-Fi signal and drops, docks, monitors and peripherals, installed security and management tools, patch state, RDP disconnects and client crashes from the event logs.
-- **Findings, not just data:** each run ends with findings marked Confirmed, Likely or Possible, a data check that retries anything that failed, and a summary on the clipboard.
-- **Optional network discovery** (`-Discovery`, off by default): subnet sweep, the same sweep and identification on other subnets you list or pick (across routing or a site tunnel, MAC addresses from NetBIOS), vendor and multicast discovery, read-only SNMP (switch ports, PoE, printer counters, and from routers their ARP table, so MAC addresses on every VLAN, their routes and their own addresses, so the WAN address and who owns it, even at a site where no machine was run), UPS battery, charge, runtime and load, printer and camera models, gateway admin ports and UPnP mappings. No logon is attempted and no default passwords are tried.
-- **One finding leads to the next check, instead of fixed lists.** What a step finds becomes a lead for another step: the phone system named by DHCP option 66/150 or a SIP answer becomes the voice-sample target; the ISP modem behind a double NAT and the firewall's own VPN and admin pages (chosen by its make) get checked; switches that announce a management address are asked over SNMP; servers this PC uses on other subnets are tested across the tunnel; on a domain PC, Active Directory's sites and subnets, and with `-Discovery` the gateway's own routes, join the subnet list. Active Directory is also checked against where the PC really is: a subnet AD does not know, a logon to a domain controller in another site, a site with no domain controller. Remote desktop sessions are checked for UDP, the faster transport: whether the RDP client has used it, whether a policy turns it off, whether UDP gets out and how the NAT maps it, and what Microsoft lists as breaking it (double NAT, carrier-grade NAT, a full-tunnel VPN, packet inspection). Devices that deserve a closer look get one, read only and without signing in: server management controllers (Redfish), VMware hosts (version and build), QNAP and Synology storage, RD Web and RD Gateway.
-- **Network risks from what discovery found** (nothing extra is sent): SMBv1 still offered, Telnet and FTP, web pages only on plain HTTP, expired certificates, Remote Desktop and file sharing reachable across routing from an office port, SNMP answering on `public`, SSH servers from before 2017, Windows that no longer gets security updates, VMware hosts out of general support, and server management controllers reachable from an office port. Each becomes a flag for the site, kept once even when several machines saw it.
-- **As admin on a wired PC:** a passive listen on the wire for the switch model and port (LLDP/CDP), spanning tree, VLAN tags and DHCP servers. Nothing is sent.
-- **Merge and report:** one self-contained HTML report and a set of CSVs across every site and machine, with a diagram per site (also saved as `.svg` in `_merged\diagrams`) drawn only from what the runs found: carrier, modem, gateway, switches, Wi-Fi, machines, the hosted desktop, other subnets and the UPS. It finds sites that share an egress address, warns when two bandwidth tests overlapped, and spots a test laptop carried from site to site so its own hardware does not pollute the client's figures.
-- Runs in **Windows PowerShell 5.1** (paste into ISE and press F5) or PowerShell 7, as a standard user. Admin adds the checks that need it.
+**The circuit and the path**
+- Download and upload (Cloudflare, falling back to M-Lab, then Vultr), latency under load (bufferbloat), a 3-minute loss and jitter series, traceroutes, path MTU, carrier-grade NAT and double NAT, and who owns the public address.
+- A **traffic design verdict** for every machine: local breakout, split tunnel or full backhaul, with every signal it rests on.
+- IPv6: offered or not, and whether it really reaches the internet (a broken IPv6 path slows every first connection).
+
+**The remote desktop**
+- Profiles for plain RDP, Azure Virtual Desktop, Windows 365, Citrix Cloud or your own provider: the client app, the hosts it talks to, and the round trip that matters.
+- Whether sessions can use **UDP**, the faster transport, or are stuck on TCP: from the RDP client's own history, the client policy, a STUN test of the NAT, and what Microsoft lists as breaking it.
+
+**The PC**
+- Hardware age, Windows version, TPM, BitLocker, disk health, memory and CPU pressure during the run, Wi-Fi signal and drops, docks and peripherals, security and management tools, patch state, RDP disconnects and client crashes.
+
+**The network** (with `-Discovery`, off by default)
+- A sweep of the local subnet and of the other subnets you list or pick, with names, open ports, web pages, banners, Windows builds and MAC vendors.
+- Read-only SNMP: switch ports and PoE, printers and their counters, and from routers their ARP table (MACs on every VLAN), routes and WAN address (the circuit of a site where no machine was run). UPS battery, runtime and load.
+- As administrator on a wired PC, a passive listen for the switch and port (LLDP/CDP), VLANs and DHCP servers.
+
+**One finding leads to the next check.** Nothing is a fixed list when the evidence can say better: the phone system named by DHCP or SIP becomes the voice-quality target; the modem behind a double NAT and the firewall's own VPN and admin pages, chosen by its make, get checked; switches that announce a management address are asked over SNMP; servers on other subnets are tested across the tunnel; Active Directory's sites and the gateway's routes feed the subnet list. Devices worth a closer look get one, without signing in: server management controllers (Redfish), VMware hosts (version), QNAP and Synology storage, RD Web and RD Gateway.
+
+**What it flags**
+- Network risks: SMBv1, Telnet and FTP, plain-HTTP admin pages, expired certificates, RDP and file sharing open across routing, SNMP on `public`, old SSH servers, Windows and VMware out of support, management controllers on the office network.
+- Email domain (public DNS): where mail goes, SPF, DMARC, DKIM, MTA-STS, with weak or missing records flagged.
+- Active Directory: a subnet AD does not know, a logon to a domain controller in another site, a site without one.
+
+**The report**
+- One self-contained HTML file and a set of CSVs for every site and machine, opening with **what to fix first**: the high and medium findings across all sites, each once, with where it was seen.
+- Per site: bandwidth, round trip, latency, the traceroute path, the traffic design, a **site diagram** drawn only from what was found, equipment, routers and UPS, findings and machine detail.
+- Across sites: shared exits, overlapping speed tests, and a test laptop carried between sites (its own hardware is kept out of the client's figures).
 
 ![Site diagram drawn from the runs of a fictional office](docs/site-diagram.png)
 
@@ -33,7 +48,7 @@
 
 On the PC you want to assess (or over your remote support tool, in the user's own session):
 
-1. Open PowerShell ISE. Run it as administrator if you can: that adds TPM, BitLocker, disk health and the switch port.
+1. Open PowerShell ISE, as administrator if you can (that adds TPM, BitLocker, disk health and the switch port).
 2. Paste [`Collect-SiteAssessment.ps1`](Collect-SiteAssessment.ps1) into a new tab and press F5. Type the site name when asked.
 3. About five minutes later, collect the zip from `C:\Users\Public\Documents\SiteAssessment\`.
 
@@ -42,103 +57,91 @@ Or from a prompt:
 ```powershell
 .\Collect-SiteAssessment.ps1 -SiteName 'Main office'
 .\Collect-SiteAssessment.ps1 -SiteName 'Main office' -HostedDesktop AzureVirtualDesktop
-.\Collect-SiteAssessment.ps1 -SiteName 'Main office' -Discovery     # only with the client's approval
+.\Collect-SiteAssessment.ps1 -SiteName 'Main office' -Discovery     # only on a network you are authorised to assess
 ```
 
-Then, with all the zips in one folder:
+Then, with every zip in one folder:
 
 ```powershell
 .\Merge-SiteAssessment.ps1 -Path C:\Assessments\Contoso -ClientName 'Contoso'
 ```
 
-Open `C:\Assessments\Contoso\_merged\Report.html`. One machine is a complete answer for that machine. Two per site (one wired, one Wi-Fi) let the report confirm the site's verdict and separate the circuit from the desk. [FieldChecklist.md](FieldChecklist.md) covers what to ask before the visit, how to run it, and what to photograph in the closet.
+Open `C:\Assessments\Contoso\_merged\Report.html`. One machine is a complete answer for that machine; two per site (one wired, one Wi-Fi) confirm the site's verdict and separate the circuit from the desk. [FieldChecklist.md](FieldChecklist.md) covers what to ask before a visit, how to run it, and what to photograph in the closet. Runs in Windows PowerShell 5.1 or PowerShell 7, as a standard user.
 
 ## Configuration
 
-Settings live in the CONFIG block at the top of the collector, so it still works as a single pasted file. For per-client settings, copy [`site-assessment.config.example.psd1`](site-assessment.config.example.psd1), edit it, and pass it with `-ConfigPath`. Your copies are git-ignored.
+Settings live in the CONFIG block at the top of the collector, so it still works as one pasted file. For per-client settings, copy [`site-assessment.config.example.psd1`](site-assessment.config.example.psd1), edit it, and pass it with `-ConfigPath` (your copies are git-ignored).
 
 | Setting | Default | What it does |
 |---|---|---|
-| `-Discovery` / `$EnableDiscovery` | off | Turns on active discovery of other devices on the network. Each check also has its own `$Enable...` switch |
-| `-HostedDesktop` / `$HostedDesktopName` | `RDP` | Built-in profile: `RDP`, `AzureVirtualDesktop`, `Windows365`, `CitrixCloud` |
-| `$HostedDesktopProfile` | none | Your own profile: `Name`, `HostPattern`, `AppPattern`, `Targets`, `ProviderAsn` (see the example file) |
+| `-Discovery` / `$EnableDiscovery` | off | Active discovery of other devices on the network. Each check also has its own `$Enable...` switch |
+| `-HostedDesktop` / `$HostedDesktopName` | `RDP` | `RDP`, `AzureVirtualDesktop`, `Windows365` or `CitrixCloud` |
+| `$HostedDesktopProfile` | none | Your own provider: `Name`, `HostPattern`, `AppPattern`, `Targets`, `ProviderAsn` (see the example file) |
 | `$ExtraTargets` | none | More hosts to test on every machine, `host` or `host:port` |
 | `$SiteList` | none | A numbered site menu, so every machine at a site uses the same name |
-| `$SiteSubnets`, `$TunnelServers` | none | Office subnets and servers across a tunnel, for discovery and the findings. With `-Discovery`, `$SiteSubnets` are swept too |
-| `$EnableLeadChecks` | on with `-Discovery` | The follow-up checks on what was found (firewall pages, modem, management controllers, VMware, storage, RD Web/Gateway) |
-| `$EnableAdSites` | on | On a domain PC, read Active Directory's sites and subnets as the signed-in user |
-| `$ScanSubnets` | none | Other subnets to sweep with `-Discovery`: `'10.10.2'` (a /24) or `'10.10.8.0/23'` (/22 to /30). The subnets this PC already knows about are listed at the prompt, and none of them is swept unless you pick it. At most `$RemoteSweepMaxSubnets` (8) per run |
-| `$VoiceTargets` | `1.1.1.1` | Call-pace sample targets; add the phone system |
-| `$BandwidthProviders` | Cloudflare, M-Lab, Vultr | Tried in order per direction |
+| `$ScanSubnets`, `$SiteSubnets` | none | Other subnets to sweep with `-Discovery` (`'10.10.2'` or `'10.10.8.0/23'`, /22 to /30, at most 8 per run). Subnets the PC already knows about are offered at a prompt; none is swept unless you pick it |
+| `$TunnelServers` | none | Servers across a tunnel to test from an office port (servers the PC uses on other subnets are added on their own) |
+| `$VoiceTargets` | `1.1.1.1` | Call-quality targets; a phone system found on the network is added with `-Discovery` |
+| `$EnableLeadChecks` | on with `-Discovery` | The follow-up checks on what was found |
+| `$EnableAdSites`, `$EnableDomainCheck`, `$EnableIpv6Check` | on | Active Directory sites (domain PCs), the email domain in public DNS, IPv6 |
 | `$PingCount` | 180 | Samples in the loss and latency series, one per second |
-| `$OutputRoot` | Public Documents | Where runs are written (local, not synced to OneDrive) |
 
-Merge options: `-NoEnrich` makes no network requests; `-TestDevice <host or serial>` names a visiting laptop; `-SiteMap @{ 'typo' = 'Name' }` fixes site names after the fact; `-TargetHint <regex>` adds remote desktop targets to treat as the hosted desktop (use it for runs that do not record a hosted desktop profile).
+Merge options: `-NoEnrich` makes no network requests; `-TestDevice <host or serial>` names a visiting laptop; `-SiteMap @{ 'typo' = 'Name' }` fixes site names; `-TargetHint <regex>` marks remote desktop targets for runs that recorded no profile.
 
-## Your data and privacy
+## Safe by default, and your data
 
-The collector reads, and writes to the run folder: host name, signed-in user name, group memberships, installed software, printers, mapped drives, Wi-Fi networks, RDP history, event log summaries and the network details above. It does **not** collect passwords, saved credentials, Wi-Fi keys, BitLocker recovery keys, browser data or file contents; `.rdp` files are read for connection settings only, with password and signature lines skipped. Everything is plain text (JSON, CSV, HTML) in a local folder, and it is client data: store and delete it the way your contracts say.
+A plain run looks only at the PC and its path to the internet. Everything that talks to other devices on the network needs `-Discovery`, and even then nothing signs in, no default password is tried, and SNMP is read-only. Use discovery only on networks you are authorised to assess.
 
-What leaves the PC, and to whom:
+The run folder holds host names, user names, group memberships, installed software, printers, mapped drives, Wi-Fi networks, RDP history, event log summaries and the network details above, in plain text (JSON, CSV, HTML). It does **not** collect passwords, saved credentials, Wi-Fi keys, BitLocker recovery keys, browser data or file contents; `.rdp` files are read for connection settings only. Treat the output as client data. IPv6 addresses are kept as /64 prefixes only.
+
+What leaves the PC:
 
 | Sent to | What | When |
 |---|---|---|
-| 1.1.1.1 (public DNS), then this PC's resolver | The client's email domain, for MX, SPF, DMARC and DKIM records | `$EnableDomainCheck` |
-| Cloudflare | Your public IP (trace, speed test), and over IPv6 when the PC has it | Always (`$EnableIpv6Check` for the IPv6 trace and pings) |
-| M-Lab | Your public IP; M-Lab publishes every test in its open dataset | Only when Cloudflare's speed test fails |
-| Vultr | A download of a public test file | Only when Cloudflare and M-Lab fail |
-| ipinfo.io, rdap.org | Your public IP | `$EnableIpInfo`, `$EnableOwnerLookup` |
-| api.macvendors.com | MAC vendor prefixes only (first half of the address) | `$EnableOuiLookup` |
-| Microsoft 365, public STUN and NTP servers, portquiz.net | Connection tests | `$EnableCloudCheck`, `$EnableOutboundCheck` |
+| Cloudflare | The public IP (trace, speed test), also over IPv6 when the PC has it | Always (`$EnableIpv6Check` for IPv6) |
+| M-Lab, Vultr | The public IP (M-Lab publishes its tests), a public test download | Only when the Cloudflare speed test fails |
+| ipinfo.io, rdap.org | The public IP | `$EnableIpInfo`, `$EnableOwnerLookup` |
+| 1.1.1.1 (public DNS) | The client's email domain | `$EnableDomainCheck` |
+| api.macvendors.com | MAC vendor prefixes only | `$EnableOuiLookup` |
+| Microsoft 365, STUN and NTP servers, portquiz.net | Connection tests | `$EnableCloudCheck`, `$EnableOutboundCheck` |
 
-The merge sends only public IP addresses (to Team Cymru, the RDAP registries and Shodan's InternetDB) and downloads the IEEE MAC list once. `-NoEnrich` turns all of it off. Deleting a run folder is an ordinary delete, not a secure erase.
+The merge sends only public IP addresses (Team Cymru, the RDAP registries, Shodan's InternetDB) and downloads the IEEE MAC list once; `-NoEnrich` turns that off.
 
 ## How it works
 
 ```
-Collect-SiteAssessment.ps1  (one run per PC, ~5 minutes)
+Collect-SiteAssessment.ps1   one run per PC, about 5 minutes (10 to 12 with discovery)
   |
-  +-- connection check: adapter, link speed, address, VPN, virtual machine
-  +-- remote desktop footprint -> the hosts to measure (profile targets first)
+  +-- connection check, remote desktop footprint -> the hosts to measure
   +-- background: traceroutes, 180-sample ping and TCP series
-  +-- inventory: machine, identity, software, peripherals, Wi-Fi, event logs, patching
-  +-- egress, path MTU, bandwidth (Cloudflare > M-Lab > Vultr), bufferbloat
-  +-- [ -Discovery ] gateway, sweep, other subnets (listed or picked), vendor/multicast
-  |                 discovery, SNMP, IPP, RTSP, UPnP
-  +-- traffic design verdict + findings + data check (retries what failed)
+  +-- inventory: machine, identity, software, peripherals, Wi-Fi, event logs, AD sites
+  +-- egress, IPv6, email domain, path MTU, bandwidth, bufferbloat
+  +-- [ -Discovery ] subnets (local, listed, picked), identification, follow-up checks,
+  |                  SNMP, printers, cameras, gateway services
+  +-- verdict, findings, flags, data check (retries anything critical that failed)
   v
-SITE_HOST_yyyyMMdd-HHmm.zip  (assessment.json, summary.txt, traceroutes, transcript)
+SITE_HOST_yyyyMMdd-HHmm.zip   assessment.json, summary.txt, traceroutes
   |
   v
-Merge-SiteAssessment.ps1  (all zips for a client)
-  |
-  +-- latest run per site + machine + connection; spot test laptops
-  +-- per-site rollup: majority verdict, shared egress, overlapping tests
-  +-- optional enrichment: who owns each public IP, MAC vendors, InternetDB
+Merge-SiteAssessment.ps1   every zip for a client
+  +-- latest run per site, machine and connection; spot test laptops
+  +-- per site: majority verdict, shared exits, overlapping tests, diagram
+  +-- optional: who owns each public IP, MAC vendors, what the internet sees
   v
-_merged\Report.html + Sites, Endpoints, Findings, Flags, Devices, RouterAddresses, Routes, Ups, ... .csv
+_merged\Report.html, diagrams\*.svg, Sites, Endpoints, Findings, Flags, Devices, ... .csv
 ```
 
-**The verdict.** Each machine scores backhaul signals (the egress network belongs to the hosted desktop provider, a client VPN holds the default route, slow private hops before the ISP, a reduced internet MTU, a distant first public hop that is not just access latency) against split-tunnel signals (the remote desktop host resolves to a private address, its trace crosses a tunnel the internet trace does not, DNS on another private subnet, a lower MTU on the remote desktop path). Carrier-grade NAT and satellite or cellular access latency are recognised and not counted as backhaul. The merge takes the most common verdict per site and turns "local breakout" into "shared egress" when two sites leave through the same public address.
+**The verdict.** Each machine scores backhaul signals (the internet leaves through the hosted desktop provider, a client VPN holds the default route, slow private hops before the ISP, a reduced MTU, a distant first public hop that is not just access latency) against split-tunnel signals (the remote desktop host resolves privately, its path crosses a tunnel the internet path does not, DNS on another private subnet). Carrier-grade NAT and satellite or cellular latency are recognised and not counted as backhaul. The merge takes the most common verdict per site, and two sites leaving through one public address become "shared egress".
 
 ## Working on the code
 
-`Collect-SiteAssessment.ps1` is built, not edited. It is used as one file (pasted into ISE, or copied to a PC on its own), but it is kept as small pieces under `src/collector`:
-
-| Path | What is in it |
-|---|---|
-| `00-header.ps1`, `10-config.ps1` | Help, parameters and the CONFIG block |
-| `lib/*.ps1` | Every function, by area: core, addresses and ports, web and TLS, device identity, wire capture, SNMP, other subnets, leads, path and bandwidth, IPv6, email domain, findings, this PC |
-| `run/*.ps1` | What a run does, in order: preflight, inventory, background traces and pings, egress, bandwidth, retries, discovery, identification and follow-up checks, analysis, data check |
-| `99-end.ps1` | The paste-check marker |
-
-Edit the pieces, rebuild, and commit both:
+`Collect-SiteAssessment.ps1` is built, not edited: it is used as one file, but kept as small pieces under `src/collector` (`00-header`, `10-config`, `lib/` for every function by area, `run/` for what a run does in order, `99-end`). Edit the pieces, rebuild, and commit both:
 
 ```powershell
 .\tools\Build-Collector.ps1
 ```
 
-A test fails when the committed `Collect-SiteAssessment.ps1` does not match what the pieces build. `Merge-SiteAssessment.ps1` is still a single file.
+A test fails when the committed script does not match what the pieces build. `Merge-SiteAssessment.ps1` is a single file.
 
 ## Testing
 
@@ -147,22 +150,13 @@ Install-Module Pester -RequiredVersion 6.2.0 -Scope CurrentUser -Force -SkipPubl
 .\tests\run-tests.ps1
 ```
 
-The Pester tests run in CI on Windows, in both Windows PowerShell 5.1 and PowerShell 7:
+The tests run in CI on Windows, in both Windows PowerShell 5.1 and PowerShell 7. The collector's functions are loaded from the parsed script, so nothing is collected: every verdict and parser, the configuration and profiles, the subnet choices (never an inferred subnet on its own), each lead and follow-up check with HTTP and SNMP mocked, the email, IPv6, AD and remote desktop checks with DNS and the network mocked, every risk rule including what it must leave alone, a real sweep and real pings and traces over loopback, and the build itself. The merge is tested on fictional runs for a two-office company (`tests/Fixtures.ps1`, documentation IP ranges only).
 
-- **Collector:** the CONFIG defaults (discovery off, no client values), `-Discovery`, `-HostedDesktop` and `-ConfigPath` with a custom profile, each built-in profile's host pattern, tracert and ping parsing, trace analysis (tunnel, double NAT, carrier-grade NAT), every traffic design verdict, the bufferbloat grades, and the other-subnet sweep: subnet parsing, the subnets a PC already knows about, which ones get swept (never an inferred one on its own, never the PC's own), and a real sweep over loopback; the SNMP router and UPS readers (both ARP table layouts, the CIDR and old route tables, UPS-MIB and the APC MIB) and the router step with SNMP mocked; the leads (phone system, modem, firewall make, switch, servers, devices worth a closer look), the parsers for Redfish, the vSphere API and QNAP, and the follow-up checks with HTTP mocked; the email domain (which domain, provider, SPF, DMARC, DKIM, including empty DKIM keys) with DNS mocked; each network risk rule, including the cases it must leave alone (a page that also has HTTPS, a current SSH server, server builds that are still supported); and the IPv6 check with the network calls mocked (working, broken, local only, not offered, and that no full address is kept). The collector's functions are loaded from the parsed script, so nothing is collected during tests.
-- **Merge:** fictional runs for a two-office company (`tests/Fixtures.ps1`, documentation IP ranges only) are zipped the way the collector writes them and merged with `-NoEnrich`. The tests check the one-machine report, the two-site report, test laptop detection, shared egress, overlapping bandwidth tests, the hosted desktop round trip, devices swept across routing filed under the site that owns their subnet, the router addresses, routes and UPS tables, and the site diagrams (valid SVG, the best name for each box, nothing drawn without evidence).
+**Used in the field.** The tool comes from a real multi-office client assessment (November 2026), run with the earlier private versions: a visiting laptop at two offices with every discovery check of that time on (Cloudflare bandwidth, traceroutes and loss series, sweeps of 100+ devices, SNMP, vendor and multicast discovery, printers, cameras, the wire capture), runs on the hosted desktops themselves, and the merge with every lookup on. All passed their data checks with no collector errors. This repository's merge, run on those six runs, reproduces their results exactly.
 
-### Used in the field
+**Checked against real data since:** the collector in this repository on Windows PowerShell 5.1 (passive runs), its .NET pings and traceroutes against `tracert.exe`, the remote desktop UDP verdict (UDP in use, STUN consistent, carrier-grade NAT noted), and the email domain check against real public DNS (which found and fixed two bugs). The Azure Virtual Desktop, Windows 365 and Citrix hosts follow Microsoft's and Citrix's published endpoint lists.
 
-This tool started as the collector and merge from a real multi-office client assessment (November 2026). Those runs were made with the earlier private versions this release is built from:
-
-- **A visiting laptop at two offices**, wired and as administrator, with every discovery check on: three runs of 8 to 12 minutes each, every one with a PASS data check and no collector errors. They exercised the Cloudflare bandwidth test (two rounds, both directions) and the bufferbloat grade, the traceroutes and 180-sample loss series, the ipinfo and RDAP lookups, the subnet sweep (100+ devices at the larger office), read-only SNMP, vendor and multicast discovery, IPP, RTSP, UPnP, the modem page, DNS timing, the Microsoft 365 and outbound checks, reachability across the site tunnel, the LLDP/CDP wire capture, and the traffic design verdict (split tunnel, high confidence).
-- **Three runs on the hosted desktops themselves**, as a standard user, where the verdict reads full backhaul, as expected for a desktop whose internet leaves through the provider.
-- **The merge with enrichment on**, over all six runs: Team Cymru, RDAP, reverse DNS, Shodan InternetDB and the IEEE MAC list all answered, and the visiting laptop was detected by its serial number at both offices.
-
-**This release against that field data.** The merge in this repository, run on the same six runs (with `-NoEnrich`, and `-TargetHint` because runs from the earlier versions do not record a hosted desktop profile), produces the same sites, verdicts, circuit figures, hosted desktop round trips and test-laptop detection, and the same number of rows in every CSV, as the merge they were made with. The collector in this repository was run in Windows PowerShell 5.1 (discovery and outside lookups off) and merged into a one-machine report. The built-in Azure Virtual Desktop and Windows 365 hosts were checked against Microsoft's "Required FQDNs and endpoints for Azure Virtual Desktop", and the Citrix Cloud domains against Citrix's connectivity pages (November 2026).
-
-**Not exercised yet:** the M-Lab and Vultr bandwidth fallbacks (Cloudflare never failed in the field), the api.macvendors.com lookup, and the built-in Azure Virtual Desktop, Windows 365 and Citrix Cloud profiles against a live tenant. Added after the field runs and so far tested with fixtures, mocks and a loopback sweep only: sweeping other subnets, the router and UPS tables over SNMP, the network risk flags, the IPv6 check on a network that has IPv6, the follow-up checks against real devices, and the Active Directory sites read on a domain PC (the test PC is Entra joined) (a passive run on an IPv4-only network reported it correctly as not offered). Pings and traceroutes are made with .NET and do not depend on the Windows display language; only in Constrained Language Mode does the collector fall back to ping.exe and tracert.exe, whose output is then read in English, German, French, Spanish and Russian forms (tested), not every language.
+**Not yet run against real devices:** the other-subnet sweep, router and UPS tables, the follow-up checks, the risk flags they feed, AD sites on a domain PC, and IPv6 on a network that has it. They are covered by tests on fictional data until then. The M-Lab and Vultr speed-test fallbacks and the MAC vendor lookup have never been needed in a real run (Cloudflare has always answered).
 
 ## License
 
