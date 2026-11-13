@@ -374,8 +374,81 @@ function Start-NativeAsync {
     return [pscustomobject]@{ Label = $Label; FilePath = $FilePath; Arguments = $Arguments; Process = $p; Task = $p.StandardOutput.ReadToEndAsync() }
 }
 
+function Start-IcmpJob {
+    # A ping series or a traceroute with .NET in a background runspace. The output is written the way
+    # English ping.exe and tracert.exe print it, so one parser serves every Windows display language.
+    # Constrained Language cannot create runspaces, so it falls back to the exes (see ConvertFrom-PingOutput).
+    param([ValidateSet('Ping', 'Trace')][string]$Kind, [string]$Target, [int]$Count = 4, [int]$MaxHops = 20, [int]$TimeoutMs = 1000, [string]$Label)
+    if (-not $script:FullLanguage) {
+        $args0 = if ($Kind -eq 'Ping') { "-n $Count -w $TimeoutMs $Target" } else { "-d -w $TimeoutMs -h $MaxHops $Target" }
+        return Start-NativeAsync $(if ($Kind -eq 'Ping') { 'ping.exe' } else { 'tracert.exe' }) $args0 $Label
+    }
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript({
+        param($kind, $target, $count, $maxHops, $timeout)
+        $lines = New-Object Collections.Generic.List[string]
+        $addr = $null; $parsed = $null
+        if ([Net.IPAddress]::TryParse("$target", [ref]$parsed)) { $addr = $parsed }
+        else { try { $addr = @([Net.Dns]::GetHostAddresses("$target") | Where-Object { $_.AddressFamily -eq 'InterNetwork' })[0] } catch { } }
+        if (-not $addr) { return "Unable to resolve target system name $target." }
+        $pinger = New-Object Net.NetworkInformation.Ping
+        $buf = New-Object byte[] 32
+        # One throwaway loopback ping first: the first send of a session runs a few ms slow.
+        try { [void]$pinger.Send([Net.IPAddress]::Loopback, 200) } catch { }
+        try {
+            if ($kind -eq 'Trace') {
+                $lines.Add(''); $lines.Add(('Tracing route to {0} [{1}]' -f $target, $addr)); $lines.Add("over a maximum of $maxHops hops:"); $lines.Add('')
+                for ($ttl = 1; $ttl -le $maxHops; $ttl++) {
+                    $cells = @(); $hop = $null; $done = $false
+                    for ($k = 0; $k -lt 3; $k++) {
+                        $sw = [Diagnostics.Stopwatch]::StartNew(); $r = $null
+                        try { $r = $pinger.Send($addr, $timeout, $buf, (New-Object Net.NetworkInformation.PingOptions($ttl, $false))) } catch { }
+                        # .NET reports 0 ms for a TTL-expired reply, so the stopwatch times every probe.
+                        $ms = [int][math]::Round($sw.Elapsed.TotalMilliseconds)
+                        if ($r -and ("$($r.Status)" -eq 'TtlExpired' -or "$($r.Status)" -eq 'Success')) {
+                            if ("$($r.Status)" -eq 'Success') { $ms = [int]$r.RoundtripTime; $done = $true }
+                            $cells += $(if ($ms -lt 1) { '<1 ms' } else { "$ms ms" })
+                            if (-not $hop) { $hop = "$($r.Address)" }
+                        } else { $cells += '*' }
+                    }
+                    $lines.Add(('{0,3}  {1,8}  {2,8}  {3,8}  {4}' -f $ttl, $cells[0], $cells[1], $cells[2], $(if ($hop) { $hop } else { 'Request timed out.' })))
+                    if ($done) { break }
+                }
+                $lines.Add(''); $lines.Add('Trace complete.')
+            } else {
+                $lines.Add(('Pinging {0} with 32 bytes of data:' -f $addr))
+                for ($i = 0; $i -lt $count; $i++) {
+                    $sw = [Diagnostics.Stopwatch]::StartNew(); $r = $null
+                    try { $r = $pinger.Send($addr, $timeout, $buf) } catch { }
+                    if ($r -and "$($r.Status)" -eq 'Success') {
+                        $tt = if ($r.RoundtripTime -lt 1) { 'time<1ms' } else { "time=$($r.RoundtripTime)ms" }
+                        $lines.Add(('Reply from {0}: bytes=32 {1} TTL={2}' -f $r.Address, $tt, $(if ($r.Options) { $r.Options.Ttl } else { 0 })))
+                    } else { $lines.Add('Request timed out.') }
+                    $rest = 1000 - $sw.ElapsedMilliseconds
+                    if ($i -lt $count - 1 -and $rest -gt 0) { Start-Sleep -Milliseconds ([int]$rest) }
+                }
+            }
+        } finally { $pinger.Dispose() }
+        return ($lines -join "`r`n")
+    }).AddArgument($Kind).AddArgument($Target).AddArgument($Count).AddArgument($MaxHops).AddArgument($TimeoutMs)
+    return [pscustomobject]@{ Label = $Label; FilePath = $null; Arguments = $null; Process = $null; Task = $null; PS = $ps; Async = $ps.BeginInvoke() }
+}
+
+function Invoke-IcmpText {
+    # Start-IcmpJob and wait for it: the text of one ping series or traceroute.
+    param([ValidateSet('Ping', 'Trace')][string]$Kind, [string]$Target, [int]$Count = 4, [int]$MaxHops = 20, [int]$TimeoutMs = 1000, [int]$WaitSec = 120)
+    return (Receive-NativeAsync (Start-IcmpJob -Kind $Kind -Target $Target -Count $Count -MaxHops $MaxHops -TimeoutMs $TimeoutMs -Label "$Kind $Target") $WaitSec)
+}
+
 function Receive-NativeAsync {
     param($Handle, [int]$TimeoutSec = 120)
+    if ($Handle.PSObject.Properties['PS'] -and $Handle.PS) {
+        if (-not $Handle.Async.AsyncWaitHandle.WaitOne($TimeoutSec * 1000)) { try { $Handle.PS.Stop() } catch { } }
+        $txt = ''
+        try { $txt = (@($Handle.PS.EndInvoke($Handle.Async)) -join "`r`n") } catch { }
+        try { $Handle.PS.Dispose() } catch { }
+        return $txt
+    }
     if ($null -eq $Handle.Process) {
         # Constrained Language fallback: run synchronously now.
         return (Invoke-Native -FilePath $Handle.FilePath -Arguments $Handle.Arguments -TimeoutSec $TimeoutSec)
@@ -3491,7 +3564,7 @@ $Targets = @('1.1.1.1', '8.8.8.8') + $RdpHosts
 $Jobs = @()
 Write-Step 'Starting background traceroutes and ping series'
 foreach ($t in $Targets) {
-    $Jobs += [pscustomobject]@{ Kind = 'Trace'; Target = $t; Handle = (Start-NativeAsync 'tracert.exe' "-d -w 750 -h 20 $t" "trace $t") }
+    $Jobs += [pscustomobject]@{ Kind = 'Trace'; Target = $t; Handle = (Start-IcmpJob -Kind Trace -Target $t -MaxHops 20 -TimeoutMs 750 -Label "trace $t") }
 }
 $PingTargets = @()
 if ($Gateway) { $PingTargets += $Gateway }
@@ -3511,7 +3584,7 @@ if ($script:FullLanguage) {
 }
 foreach ($t in $PingTargets) {
     if ($script:IcmpSilent -contains $t) { continue }
-    $Jobs += [pscustomobject]@{ Kind = 'Ping'; Target = $t; Handle = (Start-NativeAsync 'ping.exe' "-n $PingCount -w 1000 $t" "ping $t") }
+    $Jobs += [pscustomobject]@{ Kind = 'Ping'; Target = $t; Handle = (Start-IcmpJob -Kind Ping -Target $t -Count $PingCount -TimeoutMs 1000 -Label "ping $t") }
 }
 if ($script:IcmpSilent.Count) { Write-Step ("  No ICMP reply (ping series skipped, TCP series used): {0}" -f ($script:IcmpSilent -join ', ')) }
 
@@ -4776,9 +4849,18 @@ function Get-PathMtu {
     param([string]$Target)
     $probe = {
         param($size)
+        if ($script:FullLanguage) {
+            # Don't-fragment ping of $size bytes; PacketTooBig is the "needs to be fragmented" answer in any language.
+            try {
+                $r = (New-Object Net.NetworkInformation.Ping).Send($Target, 1500, (New-Object byte[] $size), (New-Object Net.NetworkInformation.PingOptions(64, $true)))
+                if ("$($r.Status)" -eq 'Success') { return 'ok' }
+                if ("$($r.Status)" -eq 'PacketTooBig') { return 'frag' }
+            } catch { }
+            return 'none'
+        }
         $o = Invoke-Native 'ping.exe' "-f -l $size -n 1 -w 1500 $Target" 6
         if ($o -match 'needs to be fragmented|Packet needs') { return 'frag' }
-        if ($o -match 'Reply from .*bytes=') { return 'ok' }
+        if ($o -match '[=<]\s*\d+\s*(ms|\u043c\u0441)') { return 'ok' }
         return 'none'
     }
     $first = & $probe 1472
@@ -4889,7 +4971,7 @@ function ConvertFrom-Tracert {
     param([string]$Text)
     $hops = @()
     foreach ($line in ($Text -split "`r?`n")) {
-        if ($line -match '^\s*(\d+)\s+(\*|<?\d+\s*ms)\s+(\*|<?\d+\s*ms)\s+(\*|<?\d+\s*ms)\s+(.+?)\s*$') {
+        if ($line -match '^\s*(\d+)\s+(\*|<?\s*\d+\s*(?:ms|\u043c\u0441))\s+(\*|<?\s*\d+\s*(?:ms|\u043c\u0441))\s+(\*|<?\s*\d+\s*(?:ms|\u043c\u0441))\s+(.+?)\s*$') {
             $hopNum = [int]$matches[1]
             $rtts = @($matches[2], $matches[3], $matches[4]) | Where-Object { $_ -ne '*' } | ForEach-Object { [int](($_ -replace '[^\d]', '')) }
             $addr = $matches[5].Trim()
@@ -4932,7 +5014,8 @@ function Get-TraceAnalysis {
 function ConvertFrom-PingOutput {
     param([string]$Text, [string]$Target, [int]$Sent)
     $times = @()
-    foreach ($m in [regex]::Matches($Text, 'time[=<](\d+)ms')) { $times += [int]$m.Groups[1].Value }
+    # 'time=12ms' in English, 'Zeit=12ms', 'temps=12 ms', 'tiempo<1 ms', Cyrillic 'ms'... the number after = or <, followed by ms.
+    foreach ($m in [regex]::Matches($Text, '[=<]\s*(\d+)\s*(?:ms|\u043c\u0441)\b')) { $times += [int]$m.Groups[1].Value }
     $recv = $times.Count
     $sorted = @($times | Sort-Object)
     $jit = $null
@@ -5566,7 +5649,7 @@ if (-not (Test-TraceUsable $tr1)) {
     Write-Step 'Retry: traceroute to 1.1.1.1' 'Yellow'
     $script:Retried += 'traceroute 1.1.1.1'
     try {
-        $newTr = ConvertTo-TraceResult '1.1.1.1' (Invoke-Native 'tracert.exe' '-d -w 1000 -h 20 1.1.1.1' 120)
+        $newTr = ConvertTo-TraceResult '1.1.1.1' (Invoke-IcmpText -Kind Trace -Target '1.1.1.1' -MaxHops 20 -TimeoutMs 1000 -WaitSec 120)
         if (Test-TraceUsable $newTr) { $Result['Traceroutes'] = @(@($Result['Traceroutes']) | Where-Object { $_ -and $_.Target -ne '1.1.1.1' }) + @($newTr) }
     } catch { $script:Errors += [pscustomobject]@{ Collector = 'Retry traceroute 1.1.1.1'; Error = $_.Exception.Message } }
 }
@@ -5576,7 +5659,7 @@ if (-not $pg1 -or -not $pg1.Received) {
     Write-Step 'Retry: ping series to 1.1.1.1 (30 pings)' 'Yellow'
     $script:Retried += 'ping 1.1.1.1'
     try {
-        $newPg = [pscustomobject](ConvertFrom-PingOutput (Invoke-Native 'ping.exe' '-n 30 -w 1000 1.1.1.1' 60) '1.1.1.1' 30)
+        $newPg = [pscustomobject](ConvertFrom-PingOutput (Invoke-IcmpText -Kind Ping -Target '1.1.1.1' -Count 30 -TimeoutMs 1000 -WaitSec 60) '1.1.1.1' 30)
         if ($newPg.Received) { $Result['PingSeries'] = @(@($Result['PingSeries']) | Where-Object { $_ -and $_.Target -ne '1.1.1.1' }) + @($newPg) }
         elseif ($script:FullLanguage) {
             # ICMP blocked on this network: measure loss and latency with TCP connects instead.
@@ -6118,7 +6201,7 @@ if ($EnableSiteReach -and $srcIp) {
         $targets = @($targets | Select-Object -Unique | Select-Object -First 12)
         if (-not $targets.Count) { throw 'No other site subnets configured' }
         $jobs = @()
-        foreach ($t in $targets) { $jobs += [pscustomobject]@{ Target = $t; Handle = (Start-NativeAsync 'tracert.exe' "-d -w 600 -h 8 $t" "site trace $t") } }
+        foreach ($t in $targets) { $jobs += [pscustomobject]@{ Target = $t; Handle = (Start-IcmpJob -Kind Trace -Target $t -MaxHops 8 -TimeoutMs 600 -Label "site trace $t") } }
         $rows = @()
         foreach ($t in $targets) {
             $ok = 0; $ms = @(); $pg = New-Object Net.NetworkInformation.Ping
@@ -6245,7 +6328,7 @@ if ($EnableDnsTiming -and $script:FullLanguage -and $primaryAd) {
 
 if ($EnableCloudCheck -and $script:FullLanguage) {
     $Result['Cloud'] = Invoke-Collector 'Microsoft 365, Teams media and NAT behaviour' {
-        $trace = Start-NativeAsync 'tracert.exe' '-d -w 600 -h 15 outlook.office365.com' 'trace outlook.office365.com'
+        $trace = Start-IcmpJob -Kind Trace -Target 'outlook.office365.com' -MaxHops 15 -TimeoutMs 600 -Label 'trace outlook.office365.com'
         $rows = @()
         foreach ($hn in @('outlook.office365.com', 'login.microsoftonline.com', 'teams.microsoft.com', 'graph.microsoft.com')) {
             $row = [ordered]@{ Host = $hn; Address = $null; ConnectMs = $null; Samples = 0 }

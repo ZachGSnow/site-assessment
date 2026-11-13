@@ -518,3 +518,49 @@ Describe 'IPv6 (Phase D)' {
         (@(Get-AssessmentFindings $none) | Where-Object { $_.Finding -like 'IPv6*' }).Finding | Should -Match 'not offered'
     }
 }
+
+Describe 'Ping and traceroute in any Windows language' {
+    It 'reads ping output in <Lang>' -ForEach @(
+        @{ Lang = 'German'; Line = 'Antwort von 1.1.1.1: Bytes=32 Zeit=12ms TTL=57' }
+        @{ Lang = 'French'; Line = 'Reponse de 1.1.1.1 : octets=32 temps=12 ms TTL=57' }
+        @{ Lang = 'Spanish'; Line = 'Respuesta desde 1.1.1.1: bytes=32 tiempo=12ms TTL=57' }
+        @{ Lang = 'Russian'; Line = ('Otvet ot 1.1.1.1: chislo bajt=32 vremya=12' + [char]0x043C + [char]0x0441 + ' TTL=57') }
+    ) {
+        $text = (@(1..4) | ForEach-Object { $Line }) -join "`r`n"
+        $p = ConvertFrom-PingOutput $text '1.1.1.1' 4
+        $p.Received | Should -Be 4
+        $p.AvgMs | Should -Be 12
+    }
+    It 'reads a sub-millisecond reply and does not count the byte count as a time' {
+        $p = ConvertFrom-PingOutput 'Antwort von 10.20.1.1: Bytes=32 Zeit<1ms TTL=64' '10.20.1.1' 1
+        $p.Received | Should -Be 1
+        $p.AvgMs | Should -Be 1
+    }
+    It 'reads tracert hops with Cyrillic milliseconds' {
+        $ms = [string][char]0x043C + [char]0x0441
+        $text = "  1    <1 $ms    <1 $ms    <1 $ms  10.20.1.1`r`n  2    12 $ms    11 $ms    13 $ms  198.51.100.10"
+        $hops = @(ConvertFrom-Tracert $text)
+        $hops.Count | Should -Be 2
+        $hops[1].AvgMs | Should -Be 12
+    }
+    It 'pings with .NET and writes it the way English ping.exe does' {
+        $script:FullLanguage = $true
+        $txt = Invoke-IcmpText -Kind Ping -Target '127.0.0.1' -Count 2 -TimeoutMs 1000 -WaitSec 30
+        $txt | Should -Match 'Reply from 127\.0\.0\.1: bytes=32 time'
+        $p = ConvertFrom-PingOutput $txt '127.0.0.1' 2
+        $p.Received | Should -Be 2
+        $p.LossPct | Should -Be 0
+    }
+    It 'traces with .NET and writes it the way English tracert does' {
+        $script:FullLanguage = $true
+        $txt = Invoke-IcmpText -Kind Trace -Target '127.0.0.1' -MaxHops 3 -TimeoutMs 500 -WaitSec 30
+        $txt | Should -Match 'Tracing route to 127\.0\.0\.1 \[127\.0\.0\.1\]'
+        $hops = @(ConvertFrom-Tracert $txt)
+        $hops.Count | Should -Be 1
+        $hops[0].IP | Should -Be '127.0.0.1'
+    }
+    It 'says so when a name does not resolve' {
+        $script:FullLanguage = $true
+        Invoke-IcmpText -Kind Ping -Target 'no-such-host.invalid' -Count 1 -WaitSec 30 | Should -Match 'Unable to resolve'
+    }
+}
