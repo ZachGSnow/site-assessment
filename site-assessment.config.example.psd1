@@ -21,7 +21,8 @@
     # Hosts tested on every machine in addition to the profile's own targets (host or host:port)
     ExtraTargets      = @('rdgw.contoso.com', '203.0.113.10:7765')
 
-    # Office subnets (first 3 octets, one /24 each): reverse DNS and reachability, with -Discovery
+    # Office subnets (first 3 octets, one /24 each). With -Discovery: reverse DNS, reachability
+    # and a full sweep of each (ping, ports, names, SNMP), like ScanSubnets below
     SiteSubnets       = @('10.10.1', '10.10.2')
 
     # Other subnets to sweep with -Discovery, without asking at the prompt: 'a.b.c' (a /24) or

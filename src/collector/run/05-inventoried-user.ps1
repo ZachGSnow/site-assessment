@@ -69,7 +69,8 @@ $Result['Meta'] = [ordered]@{
     Options           = [ordered]@{
         SubnetSweep = $EnableSubnetSweep; GatewayProbe = $EnableGatewayProbe; IpInfo = $EnableIpInfo
         FirewallPorts = $EnableFirewallPorts; Ssdp = $EnableSsdp; PrinterProbe = $EnablePrinterProbe
-        SweepPorts = $EnableSweepPorts; RemoteSweep = $EnableRemoteSweep; TlsCheck = $EnableTlsCheck
+        SweepPorts = $EnableSweepPorts; SweepPortCount = @($SweepPorts).Count; RemoteSweep = $EnableRemoteSweep
+        RemoteSweepMaxSubnets = $RemoteSweepMaxSubnets; TlsCheck = $EnableTlsCheck
         OuiLookup = $EnableOuiLookup; Ipv6Check = $EnableIpv6Check; DomainCheck = $EnableDomainCheck; Bandwidth = $EnableBandwidth; BandwidthSeconds = $BandwidthSeconds
         BandwidthStreams = $BandwidthStreams; MaxTestMB = $MaxTestMB; PingCount = $PingCount; LookbackDays = $LookbackDays
         BandwidthRounds = $BandwidthRounds; VendorDiscovery = $EnableVendorDiscovery; MulticastDiscovery = $EnableMulticastDiscovery

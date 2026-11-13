@@ -67,6 +67,7 @@ function New-FixtureRun {
             TimeZone = 'Eastern Standard Time'; RunAsUser = "NORTHWIND\$User"; InventoriedUser = "NORTHWIND\$User"; SameUser = $true
             IsElevated = $false; Discovery = $false; HostedDesktop = $HostedDesktop; AdminTierActive = $false; AdminDowngraded = $false
             LanguageMode = 'FullLanguage'; PSVersion = '5.1.26100.1'; PSHost = 'Windows PowerShell ISE Host'; Stage = 'complete'; RunSeconds = 312
+            Options = [ordered]@{ SweepPortCount = 22; RemoteSweepMaxSubnets = 8 }
         }
         Network = [ordered]@{
             Adapters = @([ordered]@{ Name = $Connection; Description = $(if ($Connection -eq 'Wired') { 'Intel(R) Ethernet Connection I219-LM' } else { 'Intel(R) Wi-Fi 6E AX211 160MHz' })
