@@ -154,6 +154,17 @@ function New-MultiSiteFixture {
                 [ordered]@{ IP = '10.20.2.31'; Mac = $null; Vendor = $null; RespondedToPing = $false; Name = $null; OpenPorts = @(445); Role = 'Windows PC, server or NAS (file sharing on)'; Subnet = '10.20.2.0/24'; Remote = $true }
             )
         }
+        Snmp = [ordered]@{ Community = 'public'; Asked = 6; Answered = 2; Routers = 1; ArpEntries = 2; WanAddresses = @('203.0.113.42'); Ups = 1; Devices = @(
+            [ordered]@{ IP = '10.20.1.1'; SysName = 'nw-fw01'; SysDescr = 'Contoso Firewall 60'; Model = 'CF-60'; Serial = 'CF60X0001'
+                Router = [ordered]@{ Forwarding = $true
+                    Addresses = @([ordered]@{ IP = '10.20.1.1'; Mask = '255.255.255.0'; Prefix = 24; IfIndex = 2; Class = 'Private' }, [ordered]@{ IP = '203.0.113.42'; Mask = '255.255.255.248'; Prefix = 29; IfIndex = 5; Class = 'Public' })
+                    WanAddresses = @('203.0.113.42')
+                    Arp = @([ordered]@{ IP = '10.20.1.25'; Mac = '00-11-22-33-44-01'; IfIndex = 2 }, [ordered]@{ IP = '10.20.1.61'; Mac = '00-11-22-33-44-02'; IfIndex = 2 })
+                    Routes = @([ordered]@{ Destination = '0.0.0.0'; Prefix = 0; NextHop = '203.0.113.41' }, [ordered]@{ Destination = '10.20.2.0'; Prefix = 24; NextHop = '10.20.1.254' })
+                    DefaultRoute = @('203.0.113.41') } }
+            [ordered]@{ IP = '10.20.1.5'; SysName = 'nw-ups01'; SysDescr = 'Contoso Power network card'
+                Ups = [ordered]@{ Source = 'UPS-MIB'; Manufacturer = 'Contoso Power'; Model = 'CP1500'; Battery = 'normal'; OnBattery = $true; ChargePct = 80; MinutesRemaining = 12; LoadPct = 40; ReplaceBattery = $null } }
+        ) }
         Identify = [ordered]@{ DeviceCount = 2; Devices = @(
             [ordered]@{ IP = '10.20.2.40'; Mac = $null; MacVendor = $null; MacSource = $null; Subnet = '10.20.2.0/24'; Remote = $true; Name = 'nw-dock-mfp.northwind.local'; OpenPorts = @(80, 443, 9100); Kind = 'Printer'; Vendor = 'Contoso'; Model = 'MFP 400'; Confidence = 'Likely'; Evidence = @('web page title: Contoso MFP 400') }
             [ordered]@{ IP = '10.20.2.31'; Mac = '00-15-5D-01-02-03'; MacVendor = 'Microsoft Corporation'; MacSource = 'NetBIOS'; Subnet = '10.20.2.0/24'; Remote = $true; Name = 'NW-DOCK02'; OpenPorts = @(445); Kind = 'Windows computer'; Vendor = 'Microsoft'; Confidence = 'Likely'; Evidence = @('NetBIOS name NW-DOCK02') }

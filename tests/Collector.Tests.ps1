@@ -296,3 +296,95 @@ Describe 'Other subnets (Phase A)' {
         } finally { $listener.Stop() }
     }
 }
+
+Describe 'Router and UPS tables over SNMP (Phase B)' {
+    It 'reads a MAC from an SNMP octet string' {
+        ConvertFrom-SnmpMac 'aa:bb:cc:dd:ee:0f' | Should -Be 'AA-BB-CC-DD-EE-0F'
+        ConvertFrom-SnmpMac '00-15-5D-01-02-03' | Should -Be '00-15-5D-01-02-03'
+        ConvertFrom-SnmpMac '00-00-00-00-00-00' | Should -BeNullOrEmpty
+        ConvertFrom-SnmpMac 'Lobby printer' | Should -BeNullOrEmpty
+    }
+    It 'reads both ARP table layouts' {
+        $old = @([pscustomobject]@{ Index = '3.10.20.2.31'; Value = '00-15-5D-01-02-03' }, [pscustomobject]@{ Index = '3.10.20.2.99'; Value = '00-00-00-00-00-00' })
+        $new = @([pscustomobject]@{ Index = '4.1.4.10.20.2.40'; Value = 'AC-DE-48-00-11-22' })
+        $a = @(ConvertFrom-ArpRows $old)
+        $a.Count | Should -Be 1
+        $a[0].IP | Should -Be '10.20.2.31'
+        $a[0].IfIndex | Should -Be 3
+        (ConvertFrom-ArpRows $new)[0].IP | Should -Be '10.20.2.40'
+    }
+    It 'reads a router''s own addresses and marks the public one' {
+        $if = @([pscustomobject]@{ Index = '10.20.1.1'; Value = 2 }, [pscustomobject]@{ Index = '203.0.113.42'; Value = 5 }, [pscustomobject]@{ Index = '127.0.0.1'; Value = 1 })
+        $mk = @([pscustomobject]@{ Index = '10.20.1.1'; Value = '255.255.255.0' }, [pscustomobject]@{ Index = '203.0.113.42'; Value = '255.255.255.248' })
+        $a = @(ConvertFrom-AddrRows $if $mk)
+        $a.Count | Should -Be 2
+        ($a | Where-Object IP -eq '203.0.113.42').Class | Should -Be 'Public'
+        ($a | Where-Object IP -eq '203.0.113.42').Prefix | Should -Be 29
+        ($a | Where-Object IP -eq '10.20.1.1').Prefix | Should -Be 24
+    }
+    It 'reads routes from the CIDR route table and from the old one' {
+        $cidr = @(
+            [pscustomobject]@{ Index = '10.20.2.0.255.255.255.0.0.10.20.1.254'; Value = '10.20.1.254' }
+            [pscustomobject]@{ Index = '0.0.0.0.0.0.0.0.0.203.0.113.41'; Value = '203.0.113.41' }
+        )
+        $r = @(ConvertFrom-RouteRows $cidr)
+        $r[0].Destination | Should -Be '0.0.0.0'
+        $r[0].Prefix | Should -Be 0
+        $r[1].Destination | Should -Be '10.20.2.0'
+        $r[1].Prefix | Should -Be 24
+        $r[1].NextHop | Should -Be '10.20.1.254'
+        $legacy = @(ConvertFrom-RouteRows @([pscustomobject]@{ Index = '10.30.0.0'; Value = '10.20.1.254' }) @([pscustomobject]@{ Index = '10.30.0.0'; Value = '255.255.0.0' }) -Legacy)
+        $legacy[0].Prefix | Should -Be 16
+    }
+    It 'reads a UPS from UPS-MIB, including running on battery' {
+        $m = Get-UpsOidMap
+        $v = @{ $m.Manufacturer = 'Contoso Power'; $m.Model = 'CP1500'; $m.BatteryStatus = 2; $m.MinutesRemaining = 42; $m.ChargePct = 100; $m.OutputSource = 3; $m.LoadPct = 31 }
+        $u = ConvertTo-UpsStatus $v $null
+        $u.Battery | Should -Be 'normal'
+        $u.OnBattery | Should -BeFalse
+        $u.MinutesRemaining | Should -Be 42
+        $v[$m.OutputSource] = 5
+        (ConvertTo-UpsStatus $v $null).OnBattery | Should -BeTrue
+    }
+    It 'reads an APC card that only answers the APC MIB' {
+        $m = Get-UpsOidMap -Apc
+        $u = ConvertTo-UpsStatus @{} @{ $m.Model = 'Smart-UPS 1500'; $m.BatteryStatus = 2; $m.ChargePct = 96; $m.RuntimeTicks = 270000; $m.ReplaceBattery = 2; $m.OutputStatus = 2; $m.LoadPct = 22 }
+        $u.Source | Should -Be 'APC'
+        $u.MinutesRemaining | Should -Be 45
+        $u.ReplaceBattery | Should -BeTrue
+        ConvertTo-UpsStatus @{} @{} | Should -BeNullOrEmpty
+    }
+    It 'reads a router''s tables, falling back to the old route table' {
+        Mock Get-SnmpValues { @{ '1.3.6.1.2.1.4.1.0' = 1 } }
+        Mock Invoke-SnmpWalk { @() }
+        Mock Invoke-SnmpWalk -ParameterFilter { $Base -eq '1.3.6.1.2.1.4.20.1.2' } { @([pscustomobject]@{ Index = '10.20.1.1'; Value = 2 }, [pscustomobject]@{ Index = '203.0.113.42'; Value = 5 }) }
+        Mock Invoke-SnmpWalk -ParameterFilter { $Base -eq '1.3.6.1.2.1.4.22.1.2' } { @([pscustomobject]@{ Index = '2.10.20.1.60'; Value = '00-15-5D-01-02-04' }) }
+        Mock Invoke-SnmpWalk -ParameterFilter { $Base -eq '1.3.6.1.2.1.4.21.1.7' } { @([pscustomobject]@{ Index = '0.0.0.0'; Value = '203.0.113.41' }) }
+        Mock Invoke-SnmpWalk -ParameterFilter { $Base -eq '1.3.6.1.2.1.4.21.1.11' } { @([pscustomobject]@{ Index = '0.0.0.0'; Value = '0.0.0.0' }) }
+        $t = Get-RouterTables '10.20.1.1' 'public'
+        $t.Forwarding | Should -BeTrue
+        $t.WanAddresses | Should -Be @('203.0.113.42')
+        @($t.Arp).Count | Should -Be 1
+        $t.DefaultRoute | Should -Be '203.0.113.41'
+    }
+    It 'leaves a device that does not route alone' {
+        Mock Get-SnmpValues { @{ '1.3.6.1.2.1.4.1.0' = 2 } }
+        Mock Invoke-SnmpWalk { @() }
+        Get-RouterTables '10.20.1.50' 'public' | Should -BeNullOrEmpty
+        Should -Invoke Invoke-SnmpWalk -Times 0 -Exactly
+    }
+    It 'turns router and UPS readings into findings' {
+        $r = @{
+            Egress = @{ PublicIPv4 = '198.51.100.7' }
+            Snmp = @{ Devices = @(
+                @{ IP = '10.20.1.1'; SysName = 'nw-fw01'; SysDescr = 'Contoso Firewall'; Router = @{ Addresses = @(@{ IP = '10.20.1.1'; Prefix = 24; Class = 'Private' }, @{ IP = '203.0.113.42'; Prefix = 29; Class = 'Public' }); WanAddresses = @('203.0.113.42'); Arp = @(1, 2, 3); Routes = @(1); DefaultRoute = @('203.0.113.41') } }
+                @{ IP = '10.20.1.5'; SysName = 'ups1'; Ups = @{ Source = 'UPS-MIB'; Manufacturer = 'Contoso Power'; Model = 'CP1500'; Battery = 'normal'; ChargePct = 80; MinutesRemaining = 12; LoadPct = 40; OnBattery = $true } }
+            ) }
+        }
+        $f = @(Get-AssessmentFindings $r)
+        $router = $f | Where-Object { $_.Finding -like 'Router nw-fw01*' }
+        $router.Finding | Should -Match 'WAN side is 203\.0\.113\.42'
+        $router.Finding | Should -Match 'leaves from 198\.51\.100\.7 instead'
+        ($f | Where-Object { $_.Finding -like 'UPS*' }).Finding | Should -Match 'RUNNING ON BATTERY'
+    }
+}
