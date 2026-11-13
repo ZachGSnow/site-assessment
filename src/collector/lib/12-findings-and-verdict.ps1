@@ -642,6 +642,21 @@ function Get-AssessmentFindings {
         & $add $area 'Confirmed' "$(Get-Prop $c 'What') at $(Get-Prop $c 'IP'): $(Get-Prop $c 'Detail')." @("Checked $(Get-Prop $c 'Url')")
     }
 
+    # ---- Remote desktop transport ----
+    $rt = Get-RdpTransportCheck $R
+    if ($rt -and $rt.Verdict -ne 'Not known' -and @(Get-Prop $R 'Rdp', 'SelectedTargets').Count) {
+        $t = switch -Wildcard ($rt.Verdict) {
+            'UDP in use' { 'Remote desktop sessions on this PC have been using UDP, the faster transport.' }
+            'UDP possible' { 'Remote desktop sessions here can use UDP: it gets out, and the NAT keeps one public port per connection.' }
+            'TCP only: UDP turned off*' { 'Remote desktop sessions on this PC can only use TCP: UDP is turned off for the RDP client.' }
+            'TCP only: outbound UDP blocked' { 'Remote desktop sessions here can only use TCP: outbound UDP is blocked, so they stall more on packet loss.' }
+            'Relayed UDP only*' { 'The NAT here gives each destination its own public port (symmetric NAT), so Azure Virtual Desktop can only use UDP through its TURN relay.' }
+            default { "Remote desktop UDP may fail here: $($rt.Verdict)." }
+        }
+        if (@($rt.Caveats).Count) { $t += " Microsoft lists these as getting in the way of a direct UDP path: $(@($rt.Caveats) -join '; ')." }
+        & $add 'Remote desktop' $(if ($rt.Verdict -in @('UDP in use', 'TCP only: outbound UDP blocked') -or $rt.Verdict -like 'TCP only*') { 'Confirmed' } else { 'Likely' }) $t @($rt.Evidence)
+    }
+
     # ---- Other subnets ----
     $rsSubs = @(@(Get-Prop $R 'RemoteSweep', 'Subnets') | Where-Object { $_ })
     if ($rsSubs.Count) {
