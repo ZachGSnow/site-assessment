@@ -83,6 +83,8 @@ Settings live in the CONFIG block at the top of the collector, so it still works
 | `$TunnelServers` | none | Servers across a tunnel to test from an office port (servers the PC uses on other subnets are added on their own) |
 | `$VoiceTargets` | `1.1.1.1` | Call-quality targets; a phone system found on the network is added with `-Discovery` |
 | `$EnableLeadChecks` | on with `-Discovery` | The follow-up checks on what was found |
+| `$EnableSnmp`, `$SnmpCommunity` | on with `-Discovery`, `public` | Read-only SNMP and the one community string it uses |
+| `$BandwidthProviders` | `Cloudflare`, `MLab`, `Vultr` | Speed-test providers, tried in order for each direction |
 | `$EnableAdSites`, `$EnableDomainCheck`, `$EnableIpv6Check` | on | Active Directory sites (domain PCs), the email domain in public DNS, IPv6 |
 | `$PingCount` | 180 | Samples in the loss and latency series, one per second |
 
@@ -90,7 +92,7 @@ Merge options: `-NoEnrich` makes no network requests; `-TestDevice <host or seri
 
 ## Safe by default, and your data
 
-A plain run looks only at the PC and its path to the internet. Everything that talks to other devices on the network needs `-Discovery`, and even then nothing signs in, no default password is tried, and SNMP is read-only. Use discovery only on networks you are authorised to assess.
+A plain run looks only at the PC and its path to the internet. Everything that talks to other devices on the network needs `-Discovery`, and even then nothing signs in and no password is tried. SNMP is read-only and uses one community string, `public` unless you set `$SnmpCommunity`: that is the read-only default many devices ship with, so it is the one credential discovery uses (`$EnableSnmp = $false` leaves SNMP out). Use discovery only on networks you are authorised to assess.
 
 The run folder holds host names, user names, group memberships, installed software, printers, mapped drives, Wi-Fi networks, RDP history, event log summaries and the network details above, in plain text (JSON, CSV, HTML). It does **not** collect passwords, saved credentials, Wi-Fi keys, BitLocker recovery keys, browser data or file contents; `.rdp` files are read for connection settings only. Treat the output as client data. IPv6 addresses are kept as /64 prefixes only.
 
@@ -99,9 +101,9 @@ What leaves the PC:
 | Sent to | What | When |
 |---|---|---|
 | Cloudflare | The public IP (trace, speed test), also over IPv6 when the PC has it | Always (`$EnableIpv6Check` for IPv6) |
-| M-Lab, Vultr | The public IP (M-Lab publishes its tests), a public test download | Only when the Cloudflare speed test fails |
+| M-Lab, Vultr | The public IP (M-Lab publishes every test, with the IP, in its open dataset), a public test download | Only when the Cloudflare speed test fails. Remove `MLab` from `$BandwidthProviders` to leave it out; Vultr only tests download, so a failed Cloudflare upload test then has no fallback |
 | ipinfo.io, rdap.org | The public IP | `$EnableIpInfo`, `$EnableOwnerLookup` |
-| 1.1.1.1 (public DNS) | The client's email domain | `$EnableDomainCheck` |
+| 1.1.1.1 (public DNS), or the PC's own DNS server when 1.1.1.1 cannot be reached | The client's email domain | `$EnableDomainCheck` |
 | api.macvendors.com | MAC vendor prefixes only | `$EnableOuiLookup` |
 | Microsoft 365, STUN and NTP servers, portquiz.net | Connection tests | `$EnableCloudCheck`, `$EnableOutboundCheck` |
 
