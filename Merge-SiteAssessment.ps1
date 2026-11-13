@@ -10,9 +10,11 @@
     _merged next to the zip) or one extracted run folder.
 
     CSVs:   Sites, Endpoints, Printers, Peripherals, NetworkGear, Flags, Findings, Devices,
-            Software, Traceroutes, PingSeries, RdpTargets, Subnets, IpOwners
-    Report: Report.html (self-contained; expand/collapse, search, sortable
-            tables, dark mode, prints fully expanded)
+            Software, Traceroutes, PingSeries, RdpTargets, Subnets, IpOwners,
+            RouterAddresses, Routes, Ups, Domains
+    Report: Report.html (self-contained; opens with "What to fix first", then
+            expand/collapse, search, sortable tables, dark mode, prints fully expanded)
+    Diagrams: diagrams\*.svg (one site diagram per site, also embedded in the report)
 
     The latest run is kept per site + machine + connection type, so one laptop
     tested wired and on Wi-Fi at the same site counts as two endpoints.
@@ -313,14 +315,14 @@ foreach ($r in $runs) {
     $m365 = V $pt 'M365'
     $wev = V $r.Wireless 'Events'
     $highFlags = @($r.Flags | Where-Object { $_ -and $_.Severity -eq 'High' }).Count
-    # Data check written by collector 1.3.0+; older runs have none.
+    # Runs made before the data check was added have none.
     $val = V $r 'Validation'
     # A run cut off part-way (session lost, PC isolated) leaves assessment.json at the stage it reached.
     $stage = "$(V $r.Meta 'Stage')"
     $dataCheck = if (V $val 'Overall') { V $val 'Overall' }
                  elseif ($stage -like 'checkpoint*') { 'INCOMPLETE (stopped during active discovery; bandwidth and traceroutes kept)' }
                  elseif ($stage) { 'INCOMPLETE (stopped before the data check)' }
-                 else { 'not checked (collector before 1.3.0)' }
+                 else { 'not checked (run made before the data check was added)' }
     $tlsInfo = V $r 'Tls'
     $httpsInspection = if (V $tlsInfo 'InspectionSuspected') { J (@(V $tlsInfo 'Checks') | Where-Object { $_ -and $_.Inspected } | ForEach-Object { '{0}: {1}' -f $_.Host, $_.Issuer }) } elseif ($tlsInfo) { 'Not seen' } else { $null }
     $srvList = @(V (V $r 'Servers') 'Servers') | Where-Object { $_ }
@@ -328,7 +330,7 @@ foreach ($r in $runs) {
     # Hosted desktop round trip: TCP series first (gateways often drop ping), then ping.
     $avSeries = @(@($r.TcpSeries) + @($r.PingSeries) | Where-Object { $_ -and (@($r._Hosted) -contains "$($_.Target)".ToLower()) -and $_.Received -gt 0 }) | Select-Object -First 1
     $udpInfo = V $rdpc 'Udp'
-    # Session health (collector 1.5.0+); display sizes are also in older runs.
+    # Session health; display sizes are also in runs made before it was added.
     $sess = V $r 'Session'
     $sessLoad = V $sess 'Load'; $sessUdp = V $sess 'UdpPolicy'; $sessPower = V $sess 'AdapterPower'
     $screenSizes = @(@(V $r.Peripherals 'Screens') | Where-Object { $_ -and $_.Width } | ForEach-Object { '{0}x{1}' -f $_.Width, $_.Height })
@@ -1998,17 +2000,25 @@ $method = @'
 <ul class="ev">
 <li><b>Connection type</b> comes from the adapter that carries the default route (wired, Wi-Fi, USB/dock, phone tether, VPN).</li>
 <li><b>Bandwidth</b> runs 10 seconds per direction and ignores the first 2 seconds of ramp-up. Each direction fails over between providers: Cloudflare (4 parallel streams), then M-Lab NDT7 (a public measurement service, one WebSocket), then Vultr test files (download only, 4 streams). The provider used is shown next to every result; providers agree closely but not exactly. Latency under load is measured with ping to 1.1.1.1 while the test runs; the increase over idle is reported as <b>bufferbloat</b> (A under 30 ms, B under 100 ms, C under 250 ms, D above). Bufferbloat is the usual cause of laggy RDP sessions even on fast circuits.</li>
-<li><b>Latency and loss</b> are a 180-ping series (3 minutes; older runs used 60) to the gateway, 1.1.1.1 and any RDP host that answers ping, plus a TCP connect series of the same length (one per second) to the first three remote desktop hosts. The TCP series measures hosts that ignore ping, which remote desktop gateways often do; one TCP connect takes one round trip.</li>
+<li><b>Latency and loss</b> are a 180-ping series (3 minutes) to the gateway, 1.1.1.1 and any RDP host that answers ping, plus a TCP connect series of the same length (one per second) to the first three remote desktop hosts. The TCP series measures hosts that ignore ping, which remote desktop gateways often do; one TCP connect takes one round trip.</li>
 <li><b>{HOSTED} targets</b>: every machine tests the fixed targets of its hosted desktop profile, then hosts found in RDP history, .rdp files, remote desktop shortcuts, the RDP client event log, names in the DNS cache that match the profile and live connections that reverse-resolve to it.</li>
 <li><b>Round trip to {HOSTED}</b> follows Microsoft's Azure Virtual Desktop guidance: under 150 ms is fine, 150 to 200 ms is acceptable for text work, over 200 ms degrades the experience. Microsoft's bandwidth figures assume under 0.1% packet loss.</li>
 <li><b>RDP disconnects</b> (client event 1026) are grouped by cause using Microsoft's reason codes. Network causes are 264, 516, 772, 1028, 1796, 2308 and the RD Gateway network errors. <b>RDP UDP</b> comes from client events 1102 (attempted), 1103 (established) and 1104 (failed: TCP only).</li>
 <li><b>Order of work</b>: bandwidth, traceroutes and the latency series run first and are saved before anything that probes the network (gateway ports, device discovery, subnet sweep). A run that was cut off during that last part still has its core results and is marked INCOMPLETE.</li>
-<li><b>Subnet sweep</b> pings the machine's own subnet (up to a /22), then looks up a name and tries 13 common TCP ports on each device that answered. The type shown (printer, domain controller, camera, phone, Windows host) is a guess from the open ports.</li>
+<li><b>Subnet sweep</b> (only with -Discovery) pings the machine's own subnet (up to a /22), then looks up a name and tries 22 common TCP ports on each device that answered. The type shown (printer, domain controller, camera, phone, Windows host) is a guess from the open ports, refined by what the device says about itself (web page, SNMP, vendor discovery).</li>
+<li><b>Other subnets</b> are swept the same way, at most 8 per run: the ones listed in the collector's CONFIG, and any the operator picks at a prompt from the private subnets the PC already knows about (routes, DNS and DHCP servers, printer ports, private traceroute hops). None of those is swept unless it is picked. Addresses that ignore ping are tried on a few TCP ports. MAC addresses do not cross a router, so on other subnets they come from NetBIOS or the router's own ARP table.</li>
+<li><b>Follow-up checks</b>: what one step found decides what a later step looks at. The firewall's make points to its own VPN and admin pages, a switch that announces a management address is asked over SNMP, servers the PC depends on are tested across the tunnel, and server management controllers, VMware hosts, QNAP and Synology, RD Web and RD Gateway are asked only what they show before anyone signs in. No logon is attempted and no default passwords are tried.</li>
+<li><b>SNMP</b> is read only, with one community string (public by default). Switches give their ports and neighbours, printers their serial number and page count, routers their ARP table, routes and WAN address, and UPS units their battery state, runtime and load.</li>
+<li><b>Network risk</b> flags come from the sweep and follow-up checks: SMBv1, Telnet or FTP still accepted, web pages only over plain HTTP or with an expired certificate, Remote Desktop or file sharing reachable on other subnets from an office port, SNMP answering to 'public', SSH servers from before 2017, Windows 7, 8 or 10 machines, VMware hosts out of support and server management controllers on the office network.</li>
+<li><b>Email domain</b>: the public domains the PC names (the user's sign-in name, the DNS search suffixes, the Windows domain and AD forest; internal names such as .local are skipped) are looked up in public DNS: MX (who handles the mail), SPF (counted term by term against the 10-lookup limit), DMARC policy and published DKIM selectors.</li>
+<li><b>IPv6</b>: whether the network offers it and whether it reaches the internet (Cloudflare over IPv6, ten pings, an AAAA lookup). Only /64 prefixes are kept, since the rest of an IPv6 address can identify the machine. Offered but broken IPv6 slows first connections.</li>
+<li><b>Active Directory sites</b> (domain PCs only) are read as the signed-in user and checked against where the PC really is: whether its address is in an AD subnet, whether that subnet's site matches the site Windows reports, and whether the user logged on to a domain controller in another site.</li>
+<li><b>RDP over UDP</b> is judged from what the run already holds: the client's own record of UDP attempts, the UDP policy, the STUN test (UDP 3478 out and how the NAT maps ports) and the things Microsoft lists as breaking RDP Shortpath (double NAT, carrier-grade NAT, a full-tunnel VPN, packet inspection). Sessions stuck on TCP feel slower and stall on loss.</li>
 <li><b>Servers a PC uses</b> come from its mapped drives, shared printers and domain, resolved on site: on this subnet (on-prem here), another private subnet (another site or a tunnel) or public (cloud).</li>
 <li><b>HTTPS inspection</b> is detected from who issued the certificate the PC is shown for Cloudflare and for each remote desktop host. A firewall, web filter or antivirus name as the issuer means the connection is being opened and re-signed.</li>
 <li><b>Data check</b>: before saving, each machine reads its own results back from disk and checks them. Anything critical that failed (bandwidth, traceroute, ping, public IP) is retried once, and the zip is opened again to confirm it holds the data. FAIL means a critical item is still missing; WARN means the data is usable with gaps.</li>
-<li><b>Session health</b> (collector 1.5.0 and later) covers the PC itself: crashes and hangs of the remote desktop client in the Application log (events 1000, 1002, 1026), whether RDP UDP is turned off on the client by policy or setting, the display sizes Windows reports, CPU and memory in use early in the run with the largest programs in memory, and whether Windows may power down the network adapter in use.</li>
-<li><b>Enrichment</b> happens when the report is built, not on site. MAC addresses with no maker are matched against the IEEE registry (downloaded once and kept; nothing is sent), and addresses that are locally administered are labelled as randomized. Each public IP address is looked up three ways: the network that announces it (Team Cymru), the whois record for its block (the regional registry's RDAP service) and its reverse DNS name. Only the IP addresses are sent. Answers are kept for 30 days. The merge can be run with -NoEnrich to make no requests at all.</li>
+<li><b>Session health</b> covers the PC itself: crashes and hangs of the remote desktop client in the Application log (events 1000, 1002, 1026), whether RDP UDP is turned off on the client by policy or setting, the display sizes Windows reports, CPU and memory in use early in the run with the largest programs in memory, and whether Windows may power down the network adapter in use.</li>
+<li><b>Enrichment</b> happens when the report is built, not on site. MAC addresses with no maker are matched against the IEEE registry (downloaded once and kept; nothing is sent), and addresses that are locally administered are labelled as randomized. Each public IP address is looked up three ways: the network that announces it (Team Cymru), the whois record for its block (the regional registry's RDAP service) and its reverse DNS name, and each site's own public address is checked against Shodan's InternetDB for what the internet can see on it. Only the IP addresses are sent. Answers are kept for 30 days. The merge can be run with -NoEnrich to make no requests at all.</li>
 <li><b>Test laptops</b>: a machine whose serial number appears at two or more sites (or that is named when the report is built) is a visiting test device, not a client PC. Its bandwidth, traceroute, latency and sweep results are used for the site. Its own hardware, software, printers, mapped drives, session history and any RDP targets that are not the hosted desktop are left out, findings about the laptop itself do not count toward a site's status, and it is not part of the fleet figures.</li>
 <li><b>Traceroutes</b> go to 1.1.1.1, 8.8.8.8 and each RDP target. The first public hop and its reverse DNS usually name the carrier.</li>
 <li><b>Circuit speed</b> on each site card is the best wired result, because Wi-Fi results measure the wireless network, not the internet line. A site with no wired run shows its best result and says so.</li>
@@ -2026,6 +2036,7 @@ $method = @'
 </ul>
 <h4>Flag thresholds</h4>
 <ul class="ev">
+<li><b>What to fix first</b>, at the top of the report, lists every high and medium flag across all sites, high first, then the ones seen on the most machines and sites. The same flag on several machines is one line. Network risk, email domain and Active Directory flags count once per site, however many machines saw them.</li>
 <li>High: Windows 10, no TPM 2.0, packet loss 5%+, bufferbloat 100 ms+, 3+ network-caused RDP disconnects in 30 days, round trip to {HOSTED} over 200 ms, 30+ Wi-Fi drops, SSD wear 80%+, no enabled antivirus, phone tether.</li>
 <li>Medium: round trip to {HOSTED} 150 to 200 ms, 5+ unexpected RDP disconnects, network adapter errors, under 8 GB RAM, HDD, 5+ years old, wired link under 1 Gbps, weak or 2.4 GHz Wi-Fi, packet loss 1%+, jitter 30 ms+, upload under 5 Mbps, 10+ Wi-Fi drops, no Windows OS update in 45 days, clock off by 60 s+, BitLocker off, user is local admin, peripherals without matching RDP redirection, 3+ remote desktop client crashes or hangs, memory 90%+ in use or CPU 80%+ busy during the run.</li>
 <li>Low (shown per site and per machine): 1 or 2 client crashes, RDP UDP turned off on the client, display area of 8 megapixels or more (one 4K screen), adapter power saving on a Wi-Fi or USB adapter that has 3+ recorded drops.</li>

@@ -126,7 +126,7 @@ function Get-AssessmentFindings {
         else { $others += "$label (CDP)"; $ip = "$(Get-Prop $n 'Address')"; if ($ip -and $srcIp -and -not (Test-SameSubnet $ip $srcIp $mask)) { $foreign += "$ip ($label)" } }
     }
     if (-not $haveCap) {
-        # Runs made before 1.6.0 only have the older neighbor list, without capabilities.
+        # Older runs only have the earlier neighbor list, without capabilities.
         foreach ($n in @(@(Get-Prop $R 'Lldp', 'Neighbors') | Where-Object { $_ })) {
             $label = (@("$(Get-Prop $n 'SystemName')", "$(Get-Prop $n 'SystemDescription')") | Where-Object { $_ }) -join ', '
             if ("$(Get-Prop $n 'Protocol')" -eq 'LLDP' -and "$(Get-Prop $n 'Port')" -notmatch '^eth\d') { $switches += [pscustomobject]@{ Label = $label; Port = "$(Get-Prop $n 'Port')"; Vlan = Get-Prop $n 'Vlan'; LinkMode = "$(Get-Prop $n 'LinkMode')"; MgmtIP = "$(Get-Prop $n 'MgmtIP')"; Proto = 'LLDP' } }
@@ -447,7 +447,7 @@ function Get-AssessmentFindings {
         & $add 'Directory' 'Confirmed' "The DNS server is domain controller $(Get-Prop $rd 'DnsHostName') for $(Get-Prop $rd 'DefaultNamingContext'), domain functional level $(Get-Prop $rd 'DomainLevel'), forest $(Get-Prop $rd 'ForestLevel')." @("Server object: $(Get-Prop $rd 'ServerName')", "Domain controllers in DNS: $((@(Get-Prop $R 'DnsDiscovery', 'DomainControllers') | Where-Object { $_ } | ForEach-Object { "$(Get-Prop $_ 'Target')" } | Select-Object -Unique) -join ', ')")
     }
 
-    # ================= v1.7.0 evidence =================
+    # ================= More facts from this port =================
     # ---- ISP modem page ----
     foreach ($m in @(@(Get-Prop $R 'IspModem', 'Targets') | Where-Object { $_ -and (Get-Prop $_ 'LooksLike') })) {
         $pg = @(@(Get-Prop $m 'Pages') | Where-Object { $_ }) | Select-Object -First 1

@@ -44,7 +44,7 @@ try {
     elseif ($tpmP -match '^(False|No)') { Add-Flag 'High' 'Lifecycle' 'No TPM detected (tpmtool)' }
     elseif ($tpmV -and $tpmV -notmatch '^2') { Add-Flag 'High' 'Lifecycle' "TPM version $tpmV" }
     foreach ($b in @(Get-Val $m 'Battery')) { if ($b -and $b.HealthPct -and $b.HealthPct -lt 60) { Add-Flag 'Medium' 'Lifecycle' "Battery health $($b.HealthPct)% of design" } }
-    foreach ($v in @(Get-Val $m 'Volumes')) { if ($v -and $v.FreePct -ne $null -and $v.FreePct -lt 10) { Add-Flag 'Low' 'Lifecycle' "Drive $($v.Drive) only $($v.FreePct)% free" } }
+    foreach ($v in @(Get-Val $m 'Volumes')) { if ($v -and $null -ne $v.FreePct -and $v.FreePct -lt 10) { Add-Flag 'Low' 'Lifecycle' "Drive $($v.Drive) only $($v.FreePct)% free" } }
 
     $n = $Result['Network']
     if ("$(Get-Val $n 'PhysicalClass')" -like 'Wired*' -and (Get-Val $n 'PhysicalLinkMbps') -and $n['PhysicalLinkMbps'] -lt 1000) { Add-Flag 'Medium' 'Network' "Wired link negotiated at $($n['PhysicalLinkMbps']) Mbps (cable/switch port)" }
@@ -52,7 +52,7 @@ try {
     if ("$(Get-Val $n 'PhysicalClass')" -eq 'Phone tether (USB)') { Add-Flag 'High' 'Network' 'Internet is via a phone tether' }
     $w = Get-Val $Result['Wireless'] 'Current'
     if ($w -is [System.Collections.IDictionary] -and "$(Get-Val $n 'PhysicalClass')" -eq 'Wi-Fi') {
-        if ($w['SignalPct'] -ne $null -and $w['SignalPct'] -lt 50) { Add-Flag 'Medium' 'Wireless' "Weak Wi-Fi signal ($($w['SignalPct'])%)" }
+        if ($null -ne $w['SignalPct'] -and $w['SignalPct'] -lt 50) { Add-Flag 'Medium' 'Wireless' "Weak Wi-Fi signal ($($w['SignalPct'])%)" }
         if ("$($w['Band'])" -like '2.4*') { Add-Flag 'Medium' 'Wireless' 'Connected on 2.4 GHz' }
         if ("$($w['RadioType'])" -match '802\.11[bgn]$') { Add-Flag 'Low' 'Wireless' "Legacy radio type $($w['RadioType'])" }
     }
@@ -102,7 +102,7 @@ try {
     foreach ($mt in @($Result['Mtu'])) { if ($mt -and $mt.MtuBytes -and $mt.MtuBytes -lt 1500) { Add-Flag 'Low' 'Path' "Reduced MTU $($mt.MtuBytes) to $($mt.Target)" } }
     $bw = $Result['Bandwidth']
     if ((Get-Val $bw 'BufferbloatMs') -ge 100) { Add-Flag 'High' 'Path' "Bufferbloat: latency rises $($bw['BufferbloatMs']) ms under load (RDP lag)" }
-    if ((Get-Val $bw 'UploadMbps') -ne $null -and $bw['UploadMbps'] -lt 5) { Add-Flag 'Medium' 'Path' "Low upload ($($bw['UploadMbps']) Mbps)" }
+    if ($null -ne (Get-Val $bw 'UploadMbps') -and $bw['UploadMbps'] -lt 5) { Add-Flag 'Medium' 'Path' "Low upload ($($bw['UploadMbps']) Mbps)" }
     if ($bw -is [System.Collections.IDictionary] -and $bw.Contains('DownloadOk') -and -not $bw['DownloadOk']) { Add-Flag 'High' 'Run' "Download bandwidth NOT measured by any provider ($($bw['DownloadFailure'])); re-run this machine" }
     if ($bw -is [System.Collections.IDictionary] -and $bw.Contains('UploadOk') -and -not $bw['UploadOk']) { Add-Flag 'High' 'Run' "Upload bandwidth NOT measured by any provider ($($bw['UploadFailure'])); re-run this machine" }
     $tlsF = $Result['Tls']

@@ -1,33 +1,44 @@
 <#
 .SYNOPSIS
-    Site assessment collector: endpoint inventory, connection type, remote desktop footprint,
-    path and traffic-design tests and a bandwidth test. Writes one zip per run.
+    Site assessment collector: measures this PC, its path to the internet and (with -Discovery)
+    the network around it, then writes one zip per run for Merge-SiteAssessment.ps1.
 
 .DESCRIPTION
-    Built for Windows PowerShell 5.1 in PowerShell ISE, runnable as a standard user.
-    Open in ISE and press F5 (or paste into a new Untitled tab and press F5).
-    Run ISE as administrator to add TPM, BitLocker, disk health, sign-ins and the
-    switch / wire capture; without it those checks are skipped on their own.
+    Built for Windows PowerShell 5.1 in PowerShell ISE (also runs in PowerShell 7), as a
+    standard user. Open in ISE and press F5, or paste into a new Untitled tab and press F5.
+    Run ISE as administrator to add TPM, BitLocker, disk health, sign-ins and a passive
+    listen on the wire (switch and port from LLDP/CDP, VLANs, DHCP servers); without it
+    those checks are skipped on their own. Nothing is installed.
 
-    Nothing is installed. Nothing sensitive is collected: no passwords, saved
-    credentials, Wi-Fi keys, BitLocker recovery keys, browser data or file contents.
-    The public IP is sent to Cloudflare (trace/meta/speed test), ipinfo.io, rdap.org
-    (whois for the address block) and api.macvendors.com (MAC vendor prefix only) when
-    those options are enabled.
+    A plain run looks at this PC and its path to the internet:
+    - inventory, Wi-Fi, event logs, patching, the remote desktop footprint and session health
+    - bandwidth (Cloudflare, then M-Lab, then Vultr), bufferbloat, a 3-minute loss and
+      jitter series, traceroutes, path MTU, carrier-grade NAT and double NAT
+    - a traffic-design verdict (local breakout, split tunnel or full backhaul)
+    - whether remote desktop sessions can use UDP or are stuck on TCP
+    - IPv6 (offered, and whether it reaches the internet; /64 prefixes only are kept)
+    - the client's email domain in public DNS (MX, SPF, DMARC, DKIM)
+    - on a domain PC, Active Directory's sites and subnets, checked against where the PC is
+    - Microsoft 365 reachability, outbound port filtering, DNS filtering and call quality
 
-    A plain run looks only at this PC and its path to the internet: inventory, Wi-Fi,
-    event logs, the remote desktop footprint, bandwidth, traceroutes, latency and loss,
-    and a traffic-design verdict (local breakout, split tunnel or full backhaul).
+    Active discovery of other devices is OFF unless you pass -Discovery (or set
+    $EnableDiscovery below). It adds: a sweep of this subnet and of the other subnets you
+    list or pick at a prompt (inferred subnets are never swept on their own), names, open
+    ports, web pages and banners, Windows builds, SIP phone models, vendor and multicast
+    discovery, read-only SNMP (switch ports, printers, and from routers their ARP table,
+    routes and WAN address; UPS battery and runtime), IPP and RTSP questions to printers and
+    cameras, the ISP modem page, the gateway's admin ports and UPnP/NAT-PMP mappings, and
+    follow-up checks chosen by what was found (the firewall's own VPN and admin pages,
+    server management controllers, VMware hosts, QNAP and Synology, RD Web and RD Gateway).
+    No logon is attempted anywhere and no default passwords are tried. Only run discovery
+    on networks you are authorised to assess.
 
-    Active discovery of other devices on the network is OFF unless you pass -Discovery
-    (or set $EnableDiscovery below). It adds: a subnet sweep with a few TCP ports per
-    device, vendor discovery (Ubiquiti, MikroTik, Netgear), mDNS, WS-Discovery and SSDP,
-    web page titles and SSH/FTP banners, SIP phone models, Windows names and builds,
-    read-only SNMP with the default community, IPP and RTSP questions to printers and
-    cameras, the ISP modem page, the gateway's admin ports and UPnP/NAT-PMP mappings,
-    reverse DNS for the office subnets you list, and reachability of servers you list.
-    No logon is attempted anywhere and no default passwords are tried. Only run
-    discovery on networks you are authorised to assess.
+    Nothing sensitive is collected: no passwords, saved credentials, Wi-Fi keys, BitLocker
+    recovery keys, browser data or file contents. What leaves the PC, when enabled: the
+    public IP to Cloudflare (trace, speed test), ipinfo.io and rdap.org; MAC vendor prefixes
+    to api.macvendors.com; the email domain to public DNS (1.1.1.1); connection tests to
+    Microsoft 365, public STUN and NTP servers and portquiz.net. M-Lab and Vultr are used
+    only when the Cloudflare speed test fails.
 
 .PARAMETER SiteName
     Site/office name. Prompted for when omitted.
@@ -40,17 +51,24 @@
 
 .PARAMETER NoPrompt
     Do not prompt or open Explorer; use SiteName/Notes as given (SiteName defaults to UNSPECIFIED).
+    With -Discovery, only the subnets listed in CONFIG are swept (no prompt).
 
 .PARAMETER Discovery
     Turns on active discovery of other devices on the network (see DESCRIPTION).
 
 .PARAMETER HostedDesktop
     Name of a built-in hosted desktop profile: RDP (default), AzureVirtualDesktop,
-    Windows365 or CitrixCloud. See $HostedDesktopProfiles below to add your own.
+    Windows365 or CitrixCloud. Set $HostedDesktopProfile below to describe your own.
 
 .PARAMETER ConfigPath
     A .psd1 file whose keys override the CONFIG values below for this run (see
     site-assessment.config.example.psd1).
+
+.EXAMPLE
+    .\Collect-SiteAssessment.ps1 -SiteName 'Main office'
+
+.EXAMPLE
+    .\Collect-SiteAssessment.ps1 -SiteName 'Main office' -HostedDesktop AzureVirtualDesktop -Discovery
 #>
 param(
     [string]$SiteName,
@@ -949,7 +967,7 @@ function Get-MacVendor {
 }
 
 # =====================================================================
-# v1.6.0 helpers: byte readers, vendor discovery parsers, the wire capture summary and the bulk
+# Helpers: byte readers, vendor discovery parsers, the wire capture summary and the bulk
 # probes used by the identify pass. The parsers only read bytes; each keeps the raw reply (hex)
 # so anything they miss can be worked out from the saved data afterwards.
 # =====================================================================
@@ -1785,7 +1803,7 @@ function ConvertFrom-NeighborCapture {
 }
 
 # ---------------------------------------------------------------------
-# v1.7.0 helpers: SNMP (read only), Windows build from the file-sharing handshake, IPP, RTSP, STUN,
+# Helpers: SNMP (read only), Windows build from the file-sharing handshake, IPP, RTSP, STUN,
 # NTP and the fast ping used for the voice sample.
 # ---------------------------------------------------------------------
 function ConvertTo-BerLength { param([int]$Len) if ($Len -lt 128) { return , ([byte[]]@($Len)) } elseif ($Len -lt 256) { return , ([byte[]]@(0x81, $Len)) } else { return , ([byte[]]@(0x82, ($Len -shr 8), ($Len -band 255))) } }
@@ -3479,7 +3497,7 @@ function Get-AssessmentFindings {
         else { $others += "$label (CDP)"; $ip = "$(Get-Prop $n 'Address')"; if ($ip -and $srcIp -and -not (Test-SameSubnet $ip $srcIp $mask)) { $foreign += "$ip ($label)" } }
     }
     if (-not $haveCap) {
-        # Runs made before 1.6.0 only have the older neighbor list, without capabilities.
+        # Older runs only have the earlier neighbor list, without capabilities.
         foreach ($n in @(@(Get-Prop $R 'Lldp', 'Neighbors') | Where-Object { $_ })) {
             $label = (@("$(Get-Prop $n 'SystemName')", "$(Get-Prop $n 'SystemDescription')") | Where-Object { $_ }) -join ', '
             if ("$(Get-Prop $n 'Protocol')" -eq 'LLDP' -and "$(Get-Prop $n 'Port')" -notmatch '^eth\d') { $switches += [pscustomobject]@{ Label = $label; Port = "$(Get-Prop $n 'Port')"; Vlan = Get-Prop $n 'Vlan'; LinkMode = "$(Get-Prop $n 'LinkMode')"; MgmtIP = "$(Get-Prop $n 'MgmtIP')"; Proto = 'LLDP' } }
@@ -3800,7 +3818,7 @@ function Get-AssessmentFindings {
         & $add 'Directory' 'Confirmed' "The DNS server is domain controller $(Get-Prop $rd 'DnsHostName') for $(Get-Prop $rd 'DefaultNamingContext'), domain functional level $(Get-Prop $rd 'DomainLevel'), forest $(Get-Prop $rd 'ForestLevel')." @("Server object: $(Get-Prop $rd 'ServerName')", "Domain controllers in DNS: $((@(Get-Prop $R 'DnsDiscovery', 'DomainControllers') | Where-Object { $_ } | ForEach-Object { "$(Get-Prop $_ 'Target')" } | Select-Object -Unique) -join ', ')")
     }
 
-    # ================= v1.7.0 evidence =================
+    # ================= More facts from this port =================
     # ---- ISP modem page ----
     foreach ($m in @(@(Get-Prop $R 'IspModem', 'Targets') | Where-Object { $_ -and (Get-Prop $_ 'LooksLike') })) {
         $pg = @(@(Get-Prop $m 'Pages') | Where-Object { $_ }) | Select-Object -First 1
@@ -4428,8 +4446,8 @@ function Get-RdpTransportCheck {
     $stun = @(@(Get-Prop $R 'Cloud', 'Stun') | Where-Object { $_ })
     $answered = @($stun | Where-Object { Get-Prop $_ 'Answered' })
     $ports = @($answered | ForEach-Object { Get-Prop $_ 'MappedPort' } | Where-Object { $_ } | Select-Object -Unique)
-    $profile = "$(Get-Prop $R 'Meta', 'HostedDesktop', 'Profile')"
-    $shortpath = $profile -in @('AzureVirtualDesktop', 'Windows365')
+    $hdProfile = "$(Get-Prop $R 'Meta', 'HostedDesktop', 'Profile')"
+    $shortpath = $hdProfile -in @('AzureVirtualDesktop', 'Windows365')
     $inet = @(@(Get-Prop $R 'Traceroutes') | Where-Object { $_ -and "$(Get-Prop $_ 'Target')" -eq '1.1.1.1' }) | Select-Object -First 1
 
     $evidence = @()
@@ -4510,7 +4528,7 @@ foreach ($vendor in $ouiSeed.Keys) {
 }
 $script:OuiOnlineCount = 0
 
-# (end of v1.6.0 helpers)
+# (end of helpers)
 
 # =====================================================================
 # PREFLIGHT
@@ -4778,7 +4796,6 @@ try {
     if ($pfAd -and @($pfAd.IPv4 | Where-Object { $_ -like '169.254.*' }).Count) { $pfNotes += 'The adapter has a 169.254 address: no DHCP server answered.' }
     if ($Net -is [System.Collections.IDictionary] -and $Net['VpnHoldsDefaultRoute']) { $pfNotes += "A VPN adapter holds the default route ($($Net['PrimaryAdapter'])): results would describe the VPN, not this site. Disconnect it and run again." }
     if ($Net -is [System.Collections.IDictionary] -and $Net['MultipleConnected']) { $pfNotes += "More than one adapter is connected ($(@($Net['ConnectedPhysical']) -join '; ')). Turn off the one you are not testing." }
-    $pfIp = if ($pfAd) { "$(@($pfAd.IPv4)[0])" } else { '' }
     $pfHosted = ($script:Preflight['IsVirtualMachine'])
     $script:Preflight['LooksLikeHostedDesktop'] = [bool]$pfHosted
     foreach ($nt in $pfNotes) { Write-Host "  NOTE      $nt" -ForegroundColor Yellow }
@@ -7072,7 +7089,7 @@ if ($EnableOwnerLookup -and (Get-Val $Result['Egress'] 'PublicIPv4')) {
 }
 
 # =====================================================================
-# PHASE 6e (v1.7.0): more facts from this port. Each step is independent, reads only, logs in to
+# PHASE 6e: more facts from this port. Each step is independent, reads only, logs in to
 # nothing and runs after everything above is saved.
 # =====================================================================
 [void](Save-Json 'checkpoint: discovery saved, extra checks not finished')
@@ -7526,7 +7543,7 @@ try {
     elseif ($tpmP -match '^(False|No)') { Add-Flag 'High' 'Lifecycle' 'No TPM detected (tpmtool)' }
     elseif ($tpmV -and $tpmV -notmatch '^2') { Add-Flag 'High' 'Lifecycle' "TPM version $tpmV" }
     foreach ($b in @(Get-Val $m 'Battery')) { if ($b -and $b.HealthPct -and $b.HealthPct -lt 60) { Add-Flag 'Medium' 'Lifecycle' "Battery health $($b.HealthPct)% of design" } }
-    foreach ($v in @(Get-Val $m 'Volumes')) { if ($v -and $v.FreePct -ne $null -and $v.FreePct -lt 10) { Add-Flag 'Low' 'Lifecycle' "Drive $($v.Drive) only $($v.FreePct)% free" } }
+    foreach ($v in @(Get-Val $m 'Volumes')) { if ($v -and $null -ne $v.FreePct -and $v.FreePct -lt 10) { Add-Flag 'Low' 'Lifecycle' "Drive $($v.Drive) only $($v.FreePct)% free" } }
 
     $n = $Result['Network']
     if ("$(Get-Val $n 'PhysicalClass')" -like 'Wired*' -and (Get-Val $n 'PhysicalLinkMbps') -and $n['PhysicalLinkMbps'] -lt 1000) { Add-Flag 'Medium' 'Network' "Wired link negotiated at $($n['PhysicalLinkMbps']) Mbps (cable/switch port)" }
@@ -7534,7 +7551,7 @@ try {
     if ("$(Get-Val $n 'PhysicalClass')" -eq 'Phone tether (USB)') { Add-Flag 'High' 'Network' 'Internet is via a phone tether' }
     $w = Get-Val $Result['Wireless'] 'Current'
     if ($w -is [System.Collections.IDictionary] -and "$(Get-Val $n 'PhysicalClass')" -eq 'Wi-Fi') {
-        if ($w['SignalPct'] -ne $null -and $w['SignalPct'] -lt 50) { Add-Flag 'Medium' 'Wireless' "Weak Wi-Fi signal ($($w['SignalPct'])%)" }
+        if ($null -ne $w['SignalPct'] -and $w['SignalPct'] -lt 50) { Add-Flag 'Medium' 'Wireless' "Weak Wi-Fi signal ($($w['SignalPct'])%)" }
         if ("$($w['Band'])" -like '2.4*') { Add-Flag 'Medium' 'Wireless' 'Connected on 2.4 GHz' }
         if ("$($w['RadioType'])" -match '802\.11[bgn]$') { Add-Flag 'Low' 'Wireless' "Legacy radio type $($w['RadioType'])" }
     }
@@ -7584,7 +7601,7 @@ try {
     foreach ($mt in @($Result['Mtu'])) { if ($mt -and $mt.MtuBytes -and $mt.MtuBytes -lt 1500) { Add-Flag 'Low' 'Path' "Reduced MTU $($mt.MtuBytes) to $($mt.Target)" } }
     $bw = $Result['Bandwidth']
     if ((Get-Val $bw 'BufferbloatMs') -ge 100) { Add-Flag 'High' 'Path' "Bufferbloat: latency rises $($bw['BufferbloatMs']) ms under load (RDP lag)" }
-    if ((Get-Val $bw 'UploadMbps') -ne $null -and $bw['UploadMbps'] -lt 5) { Add-Flag 'Medium' 'Path' "Low upload ($($bw['UploadMbps']) Mbps)" }
+    if ($null -ne (Get-Val $bw 'UploadMbps') -and $bw['UploadMbps'] -lt 5) { Add-Flag 'Medium' 'Path' "Low upload ($($bw['UploadMbps']) Mbps)" }
     if ($bw -is [System.Collections.IDictionary] -and $bw.Contains('DownloadOk') -and -not $bw['DownloadOk']) { Add-Flag 'High' 'Run' "Download bandwidth NOT measured by any provider ($($bw['DownloadFailure'])); re-run this machine" }
     if ($bw -is [System.Collections.IDictionary] -and $bw.Contains('UploadOk') -and -not $bw['UploadOk']) { Add-Flag 'High' 'Run' "Upload bandwidth NOT measured by any provider ($($bw['UploadFailure'])); re-run this machine" }
     $tlsF = $Result['Tls']

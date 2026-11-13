@@ -1,5 +1,5 @@
 # =====================================================================
-# PHASE 6e (v1.7.0): more facts from this port. Each step is independent, reads only, logs in to
+# PHASE 6e: more facts from this port. Each step is independent, reads only, logs in to
 # nothing and runs after everything above is saved.
 # =====================================================================
 [void](Save-Json 'checkpoint: discovery saved, extra checks not finished')
