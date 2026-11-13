@@ -212,31 +212,6 @@ $HostedLabel   = if ("$($HostedProfile.Name)") { "$($HostedProfile.Name)" } else
 $ExtraTargets  = @(@($HostedProfile.Targets) + @($ExtraTargets) | Where-Object { $_ } | Select-Object -Unique)
 
 $ScriptVersion = '1.0.0'
-$ErrorActionPreference = 'Stop'
-$ProgressPreference    = 'SilentlyContinue'
-$RunStart = Get-Date
-
-# Paste check: a copy cut short by the clipboard could run part-way and save nothing.
-# The last line of this file is a marker; if it is missing, stop before doing anything.
-$endMarker = '# END OF ' + 'COLLECTOR SCRIPT'
-$selfText = $null
-try {
-    if ($PSCommandPath) { $selfText = Get-Content -LiteralPath $PSCommandPath -Raw -ErrorAction Stop }
-    elseif ($psISE -and $psISE.CurrentFile) { $selfText = $psISE.CurrentFile.Editor.Text }
-} catch { }
-if ($selfText -and $selfText -notlike "*$endMarker*") {
-    Write-Host ''
-    Write-Host 'STOP: this copy of the script is incomplete (the end of the file is missing).' -ForegroundColor Red
-    Write-Host 'The paste was probably cut short. Nothing was run. Paste it again, or transfer the .ps1 file and open that.' -ForegroundColor Red
-    return
-}
-
-# ---------------------------------------------------------------------
-# Console + bookkeeping helpers
-# ---------------------------------------------------------------------
-$script:Errors  = @()
-$script:Flags   = @()
-$script:Timings = [ordered]@{}
 
 function Write-Step {
     param([string]$Text, [string]$Color = 'Cyan')
@@ -284,15 +259,6 @@ function Save-Json {
         Write-Host "JSON write failed: $($_.Exception.Message)" -ForegroundColor Red
         return $false
     }
-}
-
-function Test-SameSubnet {
-    # True when $Ip is inside the subnet of $LocalIp/$Mask (dotted IPv4 only).
-    param([string]$Ip, [string]$LocalIp, [string]$Mask)
-    $toInt = { param($s) $o = "$s".Split('.'); if ($o.Count -ne 4) { return $null }; ([int64]$o[0] -shl 24) + ([int64]$o[1] -shl 16) + ([int64]$o[2] -shl 8) + [int64]$o[3] }
-    $a = & $toInt $Ip; $b = & $toInt $LocalIp; $m = & $toInt $Mask
-    if ($null -eq $a -or $null -eq $b -or $null -eq $m) { return $false }
-    return (($a -band $m) -eq ($b -band $m))
 }
 
 function Get-Val {
@@ -527,6 +493,40 @@ function ConvertFrom-ColonText {
     }
     return $h
 }
+function Get-Prop {
+    # Reads $Obj.A.B... from hashtables or objects alike (live results and saved JSON); $null when absent.
+    param($Obj, [string[]]$Path)
+    foreach ($k in $Path) {
+        if ($null -eq $Obj) { return $null }
+        if ($Obj -is [System.Collections.IDictionary]) { if ($Obj.Contains($k)) { $Obj = $Obj[$k] } else { return $null } }
+        else { $pp = $Obj.PSObject.Properties[$k]; if ($pp) { $Obj = $pp.Value } else { return $null } }
+    }
+    return $Obj
+}
+
+function Get-RegString {
+    param([string]$Path, [string]$Name)
+    try { return (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name } catch { return $null }
+}
+
+# =====================================================================
+# PHASE 6: bandwidth (after the ping, TCP and trace series, so it does not distort them;
+# before active discovery, so nothing that might upset security software runs ahead of it)
+# Each direction fails over through $BandwidthProviders in order:
+#   Cloudflare (download + upload) -> M-Lab NDT7 (download + upload) -> Vultr (download only).
+# The helper functions below run inside Measure-Bandwidth and use its $client, $sw,
+# $startProbe and $finishProbe through PowerShell's dynamic scoping.
+# =====================================================================
+function Get-MedianValue { param($Values) $s = @($Values | Where-Object { $null -ne $_ } | Sort-Object); if ($s.Count) { return [math]::Round([double]$s[[int][math]::Floor($s.Count / 2)], 1) } return $null }
+
+function Test-SameSubnet {
+    # True when $Ip is inside the subnet of $LocalIp/$Mask (dotted IPv4 only).
+    param([string]$Ip, [string]$LocalIp, [string]$Mask)
+    $toInt = { param($s) $o = "$s".Split('.'); if ($o.Count -ne 4) { return $null }; ([int64]$o[0] -shl 24) + ([int64]$o[1] -shl 16) + ([int64]$o[2] -shl 8) + [int64]$o[3] }
+    $a = & $toInt $Ip; $b = & $toInt $LocalIp; $m = & $toInt $Mask
+    if ($null -eq $a -or $null -eq $b -or $null -eq $m) { return $false }
+    return (($a -band $m) -eq ($b -band $m))
+}
 
 # ---------------------------------------------------------------------
 # IP helpers
@@ -550,27 +550,6 @@ function Get-IpClass {
     return 'Public'
 }
 
-function Get-CpuLaunchYear {
-    # Approximate year a CPU generation shipped in volume, from the CPU name. $null when unknown.
-    # Used for machine age because a BIOS update resets the BIOS date that age was read from.
-    param([string]$Name)
-    $intelYear = @{ 2 = 2011; 3 = 2012; 4 = 2013; 5 = 2015; 6 = 2015; 7 = 2017; 8 = 2018; 9 = 2019; 10 = 2020; 11 = 2021; 12 = 2022; 13 = 2023; 14 = 2024 }
-    $amdYear = @{ 1 = 2017; 2 = 2018; 3 = 2019; 4 = 2020; 5 = 2021; 6 = 2022; 7 = 2023; 8 = 2024; 9 = 2024 }
-    if (-not $Name) { return $null }
-    if ($Name -match 'Core\(TM\) Ultra [3579] (\d)\d{2}') { if ($matches[1] -eq '1') { return 2024 } return 2025 }
-    if ($Name -match 'Core\(TM\) [3579] \d{3}') { return 2024 }
-    if ($Name -match '(\d{1,2})(st|nd|rd|th) Gen Intel') { $g = [int]$matches[1]; if ($intelYear.ContainsKey($g)) { return $intelYear[$g] } }
-    if ($Name -match 'Core\(TM\) i[3579]-(\d{4,5})') {
-        $num = $matches[1]
-        # 5 digits (10210U, 12400) and 4 digits starting with 1 (1035G1, 1235U, 1360P) carry a two-digit generation.
-        $g = if ($num.Length -eq 5 -or $num.StartsWith('1')) { [int]$num.Substring(0, 2) } else { [int]$num.Substring(0, 1) }
-        if ($intelYear.ContainsKey($g)) { return $intelYear[$g] }
-    }
-    if ($Name -match 'Ryzen AI') { return 2024 }
-    if ($Name -match 'Ryzen [3579] (PRO )?(\d)\d{3}') { $s = [int]$matches[2]; if ($amdYear.ContainsKey($s)) { return $amdYear[$s] } }
-    return $null
-}
-
 function Resolve-Ptr {
     param([string]$Ip)
     try {
@@ -586,6 +565,92 @@ function Test-TcpPort {
     try { $t = $c.ConnectAsync($Address, $Port); return ($t.Wait($TimeoutMs) -and $c.Connected) }
     catch { return $false }
     finally { $c.Close() }
+}
+
+function Test-TcpPortsBulk {
+    # TCP connect check of every IP x port pair, 400 at a time. Returns @{ ip = @(open ports) }.
+    param([string[]]$Ips, [int[]]$Ports, [int]$TimeoutMs = 800)
+    $open = @{}
+    $pairs = New-Object Collections.Generic.List[object]
+    foreach ($ip in $Ips) { foreach ($p in $Ports) { $pairs.Add(@($ip, $p)) } }
+    for ($i = 0; $i -lt $pairs.Count; $i += 400) {
+        $batch = @(); $tasks = @()
+        for ($j = $i; $j -lt [math]::Min($i + 400, $pairs.Count); $j++) {
+            $c = New-Object Net.Sockets.TcpClient
+            $t = $null
+            try { $t = $c.ConnectAsync([string]$pairs[$j][0], [int]$pairs[$j][1]) } catch { }
+            $batch += , @($pairs[$j][0], $pairs[$j][1], $c, $t)
+            if ($t) { $tasks += $t }
+        }
+        if ($tasks.Count) { try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$tasks, $TimeoutMs) } catch { } }
+        foreach ($b in $batch) {
+            if ($b[3] -and "$($b[3].Status)" -eq 'RanToCompletion' -and $b[2].Connected) {
+                if (-not $open.ContainsKey($b[0])) { $open[$b[0]] = @() }
+                $open[$b[0]] += [int]$b[1]
+            }
+            try { $b[2].Close() } catch { }
+        }
+    }
+    return $open
+}
+
+function Invoke-UdpProbe {
+    # Sends datagrams from one socket and returns every reply heard within $WaitMs as IP, Port, Data.
+    # $Sends is a list of @{ Address; Port; Bytes }. With -ListenPort the socket binds that port on
+    # every address, for protocols whose answers are broadcast (MikroTik, Netgear).
+    param($Sends, [string]$SourceIp, [int]$ListenPort = 0, [int]$WaitMs = 2500, [int]$MaxReplies = 3000)
+    $replies = New-Object Collections.Generic.List[object]
+    $udp = New-Object Net.Sockets.UdpClient
+    try {
+        $udp.Client.SetSocketOption([Net.Sockets.SocketOptionLevel]::Socket, [Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+        $udp.EnableBroadcast = $true
+        try { $udp.Client.ReceiveBufferSize = 1048576 } catch { }
+        # Without this a refused datagram (ICMP port unreachable) makes the next receive fail on Windows.
+        try { [void]$udp.Client.IOControl(-1744830452, [byte[]](0, 0, 0, 0), $null) } catch { }
+        $bindIp = if ($ListenPort -eq 0 -and $SourceIp -and (Test-IPv4 $SourceIp)) { [Net.IPAddress]::Parse($SourceIp) } else { [Net.IPAddress]::Any }
+        $udp.Client.Bind((New-Object Net.IPEndPoint($bindIp, $ListenPort)))
+        foreach ($s in @($Sends)) {
+            try {
+                $bytes = [byte[]]$s.Bytes
+                [void]$udp.Send($bytes, $bytes.Length, (New-Object Net.IPEndPoint([Net.IPAddress]::Parse([string]$s.Address), [int]$s.Port)))
+            } catch { }
+        }
+        $until = (Get-Date).AddMilliseconds($WaitMs); $rt = $null
+        while ((Get-Date) -lt $until -and $replies.Count -lt $MaxReplies) {
+            try {
+                if (-not $rt) { $rt = $udp.ReceiveAsync() }
+                if (-not $rt.Wait(200)) { continue }
+                $res = $rt.Result; $rt = $null
+                $ip = $res.RemoteEndPoint.Address.ToString()
+                if ($ip -eq $SourceIp) { continue }
+                $replies.Add([pscustomobject]@{ IP = $ip; Port = $res.RemoteEndPoint.Port; Data = $res.Buffer })
+            } catch { $rt = $null }
+        }
+    } finally { try { $udp.Close() } catch { } }
+    return $replies.ToArray()
+}
+
+function Get-BroadcastAddress {
+    param([string]$Ip, [string]$Mask)
+    try {
+        $i = [Net.IPAddress]::Parse($Ip).GetAddressBytes(); $m = [Net.IPAddress]::Parse($Mask).GetAddressBytes()
+        return ('{0}.{1}.{2}.{3}' -f ([int]$i[0] -bor (255 - [int]$m[0])), ([int]$i[1] -bor (255 - [int]$m[1])), ([int]$i[2] -bor (255 - [int]$m[2])), ([int]$i[3] -bor (255 - [int]$m[3])))
+    } catch { return $null }
+}
+
+# ---------------------------------------------------------------------
+# Other subnets: which ones this PC knows it can reach, which ones to sweep, and the sweep itself.
+# Only subnets listed in CONFIG or chosen at the prompt are swept; inferred ones are only reported.
+# ---------------------------------------------------------------------
+function ConvertTo-IpNumber { param([string]$Ip) $o = "$Ip".Split('.'); return ([int64]$o[0] -shl 24) + ([int64]$o[1] -shl 16) + ([int64]$o[2] -shl 8) + [int64]$o[3] }
+function ConvertFrom-IpNumber { param([int64]$N) return '{0}.{1}.{2}.{3}' -f (($N -shr 24) -band 255), (($N -shr 16) -band 255), (($N -shr 8) -band 255), ($N -band 255) }
+
+function ConvertTo-NetRange {
+    # Network number and broadcast number of $Ip/$Prefix (any prefix).
+    param([string]$Ip, [int]$Prefix)
+    $maskInt = ([int64]4294967295 -shl (32 - $Prefix)) -band [int64]4294967295
+    $net = (ConvertTo-IpNumber $Ip) -band $maskInt
+    return [pscustomobject]@{ NetInt = $net; End = $net + ([int64]1 -shl (32 - $Prefix)) - 1; Prefix = $Prefix }
 }
 
 function Get-HttpBanner {
@@ -647,31 +712,172 @@ function Get-TlsInfo {
     return [pscustomobject]$r
 }
 
-function Test-TcpPortsBulk {
-    # TCP connect check of every IP x port pair, 400 at a time. Returns @{ ip = @(open ports) }.
-    param([string[]]$Ips, [int[]]$Ports, [int]$TimeoutMs = 800)
-    $open = @{}
-    $pairs = New-Object Collections.Generic.List[object]
-    foreach ($ip in $Ips) { foreach ($p in $Ports) { $pairs.Add(@($ip, $p)) } }
-    for ($i = 0; $i -lt $pairs.Count; $i += 400) {
-        $batch = @(); $tasks = @()
-        for ($j = $i; $j -lt [math]::Min($i + 400, $pairs.Count); $j++) {
-            $c = New-Object Net.Sockets.TcpClient
-            $t = $null
-            try { $t = $c.ConnectAsync([string]$pairs[$j][0], [int]$pairs[$j][1]) } catch { }
-            $batch += , @($pairs[$j][0], $pairs[$j][1], $c, $t)
-            if ($t) { $tasks += $t }
+function Initialize-CertTrust {
+    # Web requests made in parallel check certificates on worker threads, where a PowerShell script block
+    # cannot run. This compiles a two-line callback that accepts device certificates (they are self-signed).
+    if ($null -ne $script:CertTrustReady) { return $script:CertTrustReady }
+    $script:CertTrustReady = $false
+    if (-not $script:FullLanguage) { return $false }
+    try {
+        if (-not ('SaCertTrust' -as [type])) {
+            Add-Type -ErrorAction Stop -TypeDefinition 'using System.Net.Security; using System.Security.Cryptography.X509Certificates; public static class SaCertTrust { public static bool Accept(object s, X509Certificate c, X509Chain ch, SslPolicyErrors e) { return true; } public static RemoteCertificateValidationCallback Callback = new RemoteCertificateValidationCallback(Accept); }'
         }
-        if ($tasks.Count) { try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$tasks, $TimeoutMs) } catch { } }
-        foreach ($b in $batch) {
-            if ($b[3] -and "$($b[3].Status)" -eq 'RanToCompletion' -and $b[2].Connected) {
-                if (-not $open.ContainsKey($b[0])) { $open[$b[0]] = @() }
-                $open[$b[0]] += [int]$b[1]
+        $script:CertTrustReady = $true
+    } catch { $script:CertTrustReady = $false }
+    return $script:CertTrustReady
+}
+
+function Get-HttpBannersBulk {
+    # One GET per URL, many at a time: status, Server header, page title, a little page text and the
+    # certificate names. Nothing is logged in to. Falls back to one at a time when parallel is not possible.
+    param([string[]]$Urls, [int]$TimeoutMs = 5000, [int]$BatchSize = 32)
+    $out = @()
+    if (-not $Urls -or $Urls.Count -eq 0) { return $out }
+    if (-not (Initialize-CertTrust)) {
+        foreach ($u in ($Urls | Select-Object -First 60)) { $b = Get-HttpBanner $u 2500; $b | Add-Member -NotePropertyName BodySample -NotePropertyValue $null -Force; $b | Add-Member -NotePropertyName AuthRealm -NotePropertyValue $null -Force; $out += $b }
+        return $out
+    }
+    $oldCb = [Net.ServicePointManager]::ServerCertificateValidationCallback
+    $oldProto = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        [Net.ServicePointManager]::ServerCertificateValidationCallback = [SaCertTrust]::Callback
+        # Old phones and printers only speak TLS 1.0/1.1; allow them for this pass if Windows still can.
+        try { [Net.ServicePointManager]::SecurityProtocol = $oldProto -bor [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+        for ($i = 0; $i -lt $Urls.Count; $i += $BatchSize) {
+            $batch = @()
+            foreach ($u in @($Urls[$i..([math]::Min($i + $BatchSize, $Urls.Count) - 1)])) {
+                $req = $null; $task = $null
+                try {
+                    $req = [Net.HttpWebRequest]::Create($u)
+                    $req.ReadWriteTimeout = 3000; $req.AllowAutoRedirect = $true; $req.MaximumAutomaticRedirections = 3; $req.KeepAlive = $false
+                    $req.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+                    $task = $req.GetResponseAsync()
+                } catch { }
+                $batch += , @($u, $req, $task)
             }
-            try { $b[2].Close() } catch { }
+            $tasks = @($batch | Where-Object { $_[2] } | ForEach-Object { $_[2] })
+            if ($tasks.Count) { try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$tasks, $TimeoutMs) } catch { } }
+            foreach ($b in $batch) {
+                $r = [ordered]@{ Url = $b[0]; Status = $null; Server = $null; Title = $null; BodySample = $null; AuthRealm = $null; CertSubject = $null; CertIssuer = $null; CertNotAfter = $null; Error = $null }
+                $resp = $null
+                if (-not $b[2]) { $r.Error = 'request could not be started' }
+                elseif ("$($b[2].Status)" -eq 'RanToCompletion') { $resp = $b[2].Result }
+                elseif ($b[2].IsFaulted) {
+                    $ex = $b[2].Exception.GetBaseException()
+                    if ($ex -is [Net.WebException] -and $ex.Response) { $resp = $ex.Response } else { $r.Error = $ex.Message }
+                } else { $r.Error = 'timed out'; try { $b[1].Abort() } catch { } }
+                try { if ($b[1] -and $b[1].ServicePoint -and $b[1].ServicePoint.Certificate) { $r.CertSubject = $b[1].ServicePoint.Certificate.Subject; $r.CertIssuer = $b[1].ServicePoint.Certificate.Issuer; $r.CertNotAfter = (New-Object Security.Cryptography.X509Certificates.X509Certificate2 $b[1].ServicePoint.Certificate).NotAfter.ToString('s') } } catch { }
+                if ($resp) {
+                    try {
+                        $r.Status = [int]$resp.StatusCode
+                        $r.Server = $resp.Headers['Server']
+                        $wa = $resp.Headers['WWW-Authenticate']
+                        if ($wa -and $wa -match 'realm="?([^",]{1,80})') { $r.AuthRealm = $matches[1] }
+                        $sr = New-Object IO.StreamReader($resp.GetResponseStream())
+                        $buf = New-Object char[] 32768
+                        $n = $sr.Read($buf, 0, $buf.Length)
+                        if ($n -gt 0) {
+                            $body = New-Object string($buf, 0, $n)
+                            if ($body -match '<title[^>]*>\s*([^<]{1,120})</title>') { $r.Title = (($matches[1] -replace '&nbsp;', ' ' -replace '[^\x20-\x7E]', '') -replace '\s+', ' ').Trim() }
+                            $text = ((($body -replace '(?s)<script.*?</script>|<style.*?</style>|<!--.*?-->', ' ') -replace '<[^>]+>', ' ') -replace '&nbsp;', ' ' -replace '[^\x20-\x7E]', ' ') -replace '\s+', ' '
+                            $r.BodySample = $text.Trim()
+                            if ($r.BodySample.Length -gt 200) { $r.BodySample = $r.BodySample.Substring(0, 200) }
+                        }
+                        $sr.Close()
+                    } catch { if (-not $r.Error) { $r.Error = $_.Exception.Message } }
+                    try { $resp.Close() } catch { }
+                }
+                $out += [pscustomobject]$r
+            }
+        }
+    } finally {
+        [Net.ServicePointManager]::ServerCertificateValidationCallback = $oldCb
+        try { [Net.ServicePointManager]::SecurityProtocol = $oldProto } catch { }
+    }
+    return $out
+}
+
+function Get-TcpBannersBulk {
+    # Connects to one port on many addresses and keeps what each service says first (SSH, FTP, Telnet).
+    param([string[]]$Ips, [int]$Port, [int]$TimeoutMs = 2000)
+    $out = @{}
+    if (-not $Ips -or $Ips.Count -eq 0) { return $out }
+    $items = @()
+    foreach ($ip in $Ips) {
+        $c = New-Object Net.Sockets.TcpClient; $t = $null
+        try { $t = $c.ConnectAsync([string]$ip, $Port) } catch { }
+        $items += , @([string]$ip, $c, $t, $null, $null)
+    }
+    $ct = @($items | Where-Object { $_[2] } | ForEach-Object { $_[2] })
+    if ($ct.Count) { try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$ct, 1500) } catch { } }
+    foreach ($it in $items) {
+        if ($it[2] -and "$($it[2].Status)" -eq 'RanToCompletion' -and $it[1].Connected) {
+            try { $buf = New-Object byte[] 256; $it[3] = $buf; $it[4] = $it[1].GetStream().ReadAsync($buf, 0, 256) } catch { }
         }
     }
-    return $open
+    $rt = @($items | Where-Object { $_[4] } | ForEach-Object { $_[4] })
+    if ($rt.Count) { try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$rt, $TimeoutMs) } catch { } }
+    foreach ($it in $items) {
+        try { if ($it[4] -and "$($it[4].Status)" -eq 'RanToCompletion' -and $it[4].Result -gt 0) { $s = ConvertTo-AsciiText $it[3] 0 ([int]$it[4].Result); if ($s) { $out[$it[0]] = $s } } } catch { }
+        try { $it[1].Close() } catch { }
+    }
+    return $out
+}
+
+function Invoke-HttpText {
+    # One HTTP(S) request with certificate checks off: Status, Server, Title, Body (first 64 KB), Error.
+    param([string]$Url, [string]$Method = 'GET', [string]$Body, [string]$ContentType = 'text/xml', [hashtable]$Headers = @{}, [int]$TimeoutMs = 5000)
+    $r = [ordered]@{ Url = $Url; Status = $null; Server = $null; Title = $null; Body = $null; Error = $null }
+    $oldCb = [Net.ServicePointManager]::ServerCertificateValidationCallback
+    [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    try {
+        $req = [Net.HttpWebRequest]::Create($Url)
+        $req.Method = $Method; $req.Timeout = $TimeoutMs; $req.ReadWriteTimeout = $TimeoutMs; $req.AllowAutoRedirect = $true; $req.MaximumAutomaticRedirections = 3
+        $req.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        foreach ($k in $Headers.Keys) { $req.Headers[$k] = $Headers[$k] }
+        if ($Body) {
+            $bytes = [Text.Encoding]::UTF8.GetBytes($Body)
+            $req.ContentType = $ContentType; $req.ContentLength = $bytes.Length
+            $st = $req.GetRequestStream(); $st.Write($bytes, 0, $bytes.Length); $st.Close()
+        }
+        $resp = $null
+        try { $resp = $req.GetResponse() } catch [Net.WebException] { $resp = $_.Exception.Response; if (-not $resp) { $r.Error = $_.Exception.Message } }
+        if ($resp) {
+            $r.Status = [int]$resp.StatusCode; $r.Server = $resp.Headers['Server']
+            try {
+                $sr = New-Object IO.StreamReader($resp.GetResponseStream())
+                $buf = New-Object char[] 65536
+                $n = $sr.Read($buf, 0, $buf.Length)
+                $r.Body = New-Object string($buf, 0, [math]::Max(0, $n))
+                if ($r.Body -match '<title[^>]*>\s*([^<]{1,120})</title>') { $r.Title = $matches[1].Trim() }
+                $sr.Close()
+            } catch { }
+            $resp.Close()
+        }
+    } catch { $r.Error = $_.Exception.Message }
+    finally { [Net.ServicePointManager]::ServerCertificateValidationCallback = $oldCb }
+    return [pscustomobject]$r
+}
+
+function Get-CpuLaunchYear {
+    # Approximate year a CPU generation shipped in volume, from the CPU name. $null when unknown.
+    # Used for machine age because a BIOS update resets the BIOS date that age was read from.
+    param([string]$Name)
+    $intelYear = @{ 2 = 2011; 3 = 2012; 4 = 2013; 5 = 2015; 6 = 2015; 7 = 2017; 8 = 2018; 9 = 2019; 10 = 2020; 11 = 2021; 12 = 2022; 13 = 2023; 14 = 2024 }
+    $amdYear = @{ 1 = 2017; 2 = 2018; 3 = 2019; 4 = 2020; 5 = 2021; 6 = 2022; 7 = 2023; 8 = 2024; 9 = 2024 }
+    if (-not $Name) { return $null }
+    if ($Name -match 'Core\(TM\) Ultra [3579] (\d)\d{2}') { if ($matches[1] -eq '1') { return 2024 } return 2025 }
+    if ($Name -match 'Core\(TM\) [3579] \d{3}') { return 2024 }
+    if ($Name -match '(\d{1,2})(st|nd|rd|th) Gen Intel') { $g = [int]$matches[1]; if ($intelYear.ContainsKey($g)) { return $intelYear[$g] } }
+    if ($Name -match 'Core\(TM\) i[3579]-(\d{4,5})') {
+        $num = $matches[1]
+        # 5 digits (10210U, 12400) and 4 digits starting with 1 (1035G1, 1235U, 1360P) carry a two-digit generation.
+        $g = if ($num.Length -eq 5 -or $num.StartsWith('1')) { [int]$num.Substring(0, 2) } else { [int]$num.Substring(0, 1) }
+        if ($intelYear.ContainsKey($g)) { return $intelYear[$g] }
+    }
+    if ($Name -match 'Ryzen AI') { return 2024 }
+    if ($Name -match 'Ryzen [3579] (PRO )?(\d)\d{3}') { $s = [int]$matches[2]; if ($amdYear.ContainsKey($s)) { return $amdYear[$s] } }
+    return $null
 }
 
 function Get-DeviceRole {
@@ -713,25 +919,6 @@ function Get-FirewallModelHint {
     }
     return $null
 }
-
-# ---------------------------------------------------------------------
-# MAC vendor lookup (embedded table for network gear, online fallback)
-# ---------------------------------------------------------------------
-$script:OuiTable = @{}
-$ouiSeed = @{
-    'Fortinet'   = '00090F 085B0E 704CA5 906CAC E81CBA 04D590 94FF3C'
-    'SonicWall'  = '0017C5 C0EAE4 18B169'
-    'Cisco Meraki' = '00180A 0C8DDB 881544 E0553D AC17C8 2C3F0B 683A1E E0CBBC'
-    'Ubiquiti'   = '00156D 002722 0418D6 24A43C 44D9E7 687251 788A20 802AA8 B4FBE4 DC9FDB F09FC2 FCECDA 74ACB9 18E829 E063DA 245A4C 784558 68D79A 70A741 D021F9 AC8BA9'
-    'WatchGuard' = '00907F'
-    'Sophos'     = '001A8C'
-    'Palo Alto Networks' = '001B17 00869C B40C25 08306B'
-    'Aruba (HPE)' = '000B86 001A1E 24DEC6 6CF37F 94B40F D8C7C8 204C03 9C1C12 84D47E 40E3D6 B45D50 F05C19'
-}
-foreach ($vendor in $ouiSeed.Keys) {
-    foreach ($o in ($ouiSeed[$vendor] -split ' ')) { $script:OuiTable[$o] = $vendor }
-}
-$script:OuiOnlineCount = 0
 
 function Get-MacVendor {
     param([string]$Mac)
@@ -935,263 +1122,6 @@ function New-DnsQuery {
     return $b.ToArray()
 }
 
-function Invoke-UdpProbe {
-    # Sends datagrams from one socket and returns every reply heard within $WaitMs as IP, Port, Data.
-    # $Sends is a list of @{ Address; Port; Bytes }. With -ListenPort the socket binds that port on
-    # every address, for protocols whose answers are broadcast (MikroTik, Netgear).
-    param($Sends, [string]$SourceIp, [int]$ListenPort = 0, [int]$WaitMs = 2500, [int]$MaxReplies = 3000)
-    $replies = New-Object Collections.Generic.List[object]
-    $udp = New-Object Net.Sockets.UdpClient
-    try {
-        $udp.Client.SetSocketOption([Net.Sockets.SocketOptionLevel]::Socket, [Net.Sockets.SocketOptionName]::ReuseAddress, $true)
-        $udp.EnableBroadcast = $true
-        try { $udp.Client.ReceiveBufferSize = 1048576 } catch { }
-        # Without this a refused datagram (ICMP port unreachable) makes the next receive fail on Windows.
-        try { [void]$udp.Client.IOControl(-1744830452, [byte[]](0, 0, 0, 0), $null) } catch { }
-        $bindIp = if ($ListenPort -eq 0 -and $SourceIp -and (Test-IPv4 $SourceIp)) { [Net.IPAddress]::Parse($SourceIp) } else { [Net.IPAddress]::Any }
-        $udp.Client.Bind((New-Object Net.IPEndPoint($bindIp, $ListenPort)))
-        foreach ($s in @($Sends)) {
-            try {
-                $bytes = [byte[]]$s.Bytes
-                [void]$udp.Send($bytes, $bytes.Length, (New-Object Net.IPEndPoint([Net.IPAddress]::Parse([string]$s.Address), [int]$s.Port)))
-            } catch { }
-        }
-        $until = (Get-Date).AddMilliseconds($WaitMs); $rt = $null
-        while ((Get-Date) -lt $until -and $replies.Count -lt $MaxReplies) {
-            try {
-                if (-not $rt) { $rt = $udp.ReceiveAsync() }
-                if (-not $rt.Wait(200)) { continue }
-                $res = $rt.Result; $rt = $null
-                $ip = $res.RemoteEndPoint.Address.ToString()
-                if ($ip -eq $SourceIp) { continue }
-                $replies.Add([pscustomobject]@{ IP = $ip; Port = $res.RemoteEndPoint.Port; Data = $res.Buffer })
-            } catch { $rt = $null }
-        }
-    } finally { try { $udp.Close() } catch { } }
-    return $replies.ToArray()
-}
-
-function Get-CaptureSummary {
-    # Reads the pktmon capture a second time and reports what the wire shows: who answers DHCP and with
-    # which options, spanning tree (the switch this port hangs off, the root switch), LLDP/CDP neighbors
-    # with their capabilities and voice VLAN, VLAN tags, other subnets heard in ARP, and how busy the
-    # broadcast domain is. Frames this PC sent are left out.
-    param([string]$Path, [int]$Seconds, [string[]]$LocalMacs)
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    $own = @{}
-    foreach ($m in @($LocalMacs)) { $k = ("$m" -replace '[^0-9A-Fa-f]', '').ToUpper(); if ($k) { $own[$k] = $true } }
-    $frames = 0; $bcast = 0; $truncated = $false
-    $etypes = @{}; $vlans = @{}; $arp = @{}; $talk = @{}; $udpPorts = @{}
-    $stp = @{}; $dhcpSrv = @{}; $dhcpCli = @{}; $ra = @{}; $lldp = @{}; $cdp = @{}; $ann = @{}; $arpDup = @{}
-    $lldpCaps = @('Other', 'Repeater', 'Bridge', 'WLAN access point', 'Router', 'Telephone', 'DOCSIS', 'Station')
-    $mau = @{ 10 = '10BASE-T full'; 15 = '100BASE-TX half'; 16 = '100BASE-TX full'; 29 = '1000BASE-T half'; 30 = '1000BASE-T full'; 54 = '10GBASE-T' }
-    $pos = 0
-    while ($pos + 12 -le $bytes.Length) {
-        $type = [BitConverter]::ToUInt32($bytes, $pos)
-        $len  = [int][BitConverter]::ToUInt32($bytes, $pos + 4)
-        if ($len -lt 12 -or $pos + $len -gt $bytes.Length) { break }
-        $capLen = 0
-        if ($type -eq 6) { $capLen = [int][BitConverter]::ToUInt32($bytes, $pos + 20) }
-        if ($type -eq 6 -and $capLen -ge 14 -and $pos + 28 + $capLen -le $bytes.Length) {
-            if ($frames -ge 40000) { $truncated = $true; break }
-            $f = New-Object byte[] $capLen
-            [Array]::Copy($bytes, $pos + 28, $f, 0, $capLen)
-            $srcMac = [BitConverter]::ToString($f, 6, 6)
-            if (-not $own.ContainsKey(($srcMac -replace '-', ''))) {
-                $frames++
-                $isB = ($f[0] -eq 255 -and $f[1] -eq 255 -and $f[2] -eq 255 -and $f[3] -eq 255 -and $f[4] -eq 255 -and $f[5] -eq 255)
-                $off = 14; $et = ([int]$f[12] * 256) + [int]$f[13]
-                if ($et -eq 0x8100 -and $capLen -ge 18) {
-                    $vid = "$((([int]$f[14] -band 0x0F) * 256) + [int]$f[15])"
-                    $vlans[$vid] = 1 + [int]$vlans[$vid]
-                    $et = ([int]$f[16] * 256) + [int]$f[17]; $off = 18
-                }
-                if ($isB) { $bcast++; $talk[$srcMac] = 1 + [int]$talk[$srcMac] }
-                $etKey = if ($et -le 1500) { 'LLC' } else { '0x{0:X4}' -f $et }
-                $etypes[$etKey] = 1 + [int]$etypes[$etKey]
-
-                if ($et -eq 0x0806 -and $capLen -ge $off + 28) {
-                    $spa = ConvertTo-IpText $f ($off + 14)
-                    # Untagged only: a tagged frame belongs to another VLAN, not to this port's network.
-                    if ($off -eq 14 -and $spa -and $spa -ne '0.0.0.0') {
-                        $sha = ConvertTo-MacText $f ($off + 8)
-                        if ($arp.ContainsKey($spa) -and $arp[$spa] -ne $sha) { $arpDup[$spa] = "$($arp[$spa]) and $sha" }
-                        $arp[$spa] = $sha
-                    }
-                }
-                elseif ($et -eq 0x0800 -and $capLen -ge $off + 28) {
-                    $ihl = ([int]$f[$off] -band 0x0F) * 4
-                    if ([int]$f[$off + 9] -eq 17 -and $capLen -ge $off + $ihl + 8) {
-                        $u = $off + $ihl
-                        $sp = ([int]$f[$u] * 256) + [int]$f[$u + 1]; $dp = ([int]$f[$u + 2] * 256) + [int]$f[$u + 3]; $pl = $u + 8
-                        $srcIp = ConvertTo-IpText $f ($off + 12)
-                        $udpPorts["$dp"] = 1 + [int]$udpPorts["$dp"]
-                        if (($sp -eq 67 -or $sp -eq 68) -and $capLen -ge $pl + 241) {
-                            $opt = @{}; $q = $pl + 240
-                            while ($q + 2 -le $capLen) {
-                                $ot = [int]$f[$q]
-                                if ($ot -eq 255) { break }
-                                if ($ot -eq 0) { $q++; continue }
-                                $ol = [int]$f[$q + 1]
-                                if ($q + 2 + $ol -gt $capLen) { break }
-                                $opt[$ot] = @(($q + 2), $ol); $q += 2 + $ol
-                            }
-                            $oStr = { param($k) if ($opt.ContainsKey($k)) { ConvertTo-AsciiText $f $opt[$k][0] $opt[$k][1] } }
-                            $oIps = { param($k) if ($opt.ContainsKey($k)) { $l = @(); for ($z = 0; $z + 4 -le $opt[$k][1]; $z += 4) { $l += ConvertTo-IpText $f ($opt[$k][0] + $z) }; $l -join ', ' } }
-                            $giaddr = ConvertTo-IpText $f ($pl + 24)
-                            if ($sp -eq 67) {
-                                $sid = if ($opt.ContainsKey(54)) { ConvertTo-IpText $f $opt[54][0] } else { $srcIp }
-                                if (-not $dhcpSrv.ContainsKey($sid)) { $dhcpSrv[$sid] = [ordered]@{ Server = $sid; SentFromIp = $srcIp; SentFromMac = $srcMac; RelayAgent = $null; Messages = 0; Mask = $null; Router = $null; Dns = $null; Domain = $null; LeaseSeconds = $null; TftpServer = $null; TftpAddresses = $null; BootFile = $null; Ntp = $null; VendorSpecificHex = $null } }
-                                $e = $dhcpSrv[$sid]; $e['Messages']++
-                                if ($giaddr -and $giaddr -ne '0.0.0.0') { $e['RelayAgent'] = $giaddr }
-                                foreach ($pair in @(@(1, 'Mask'), @(3, 'Router'), @(6, 'Dns'), @(42, 'Ntp'), @(150, 'TftpAddresses'))) { $v = & $oIps $pair[0]; if ($v) { $e[$pair[1]] = $v } }
-                                foreach ($pair in @(@(15, 'Domain'), @(66, 'TftpServer'), @(67, 'BootFile'))) { $v = & $oStr $pair[0]; if ($v) { $e[$pair[1]] = $v } }
-                                if ($opt.ContainsKey(51) -and $opt[51][1] -ge 4) { $o = $opt[51][0]; $e['LeaseSeconds'] = ([int64]$f[$o] * 16777216) + ([int64]$f[$o + 1] * 65536) + ([int64]$f[$o + 2] * 256) + [int64]$f[$o + 3] }
-                                if ($opt.ContainsKey(43)) { $e['VendorSpecificHex'] = ([BitConverter]::ToString($f, $opt[43][0], [math]::Min($opt[43][1], 64)) -replace '-', '') }
-                            } else {
-                                $ch = ConvertTo-MacText $f ($pl + 28)
-                                if (-not $dhcpCli.ContainsKey($ch)) { $dhcpCli[$ch] = [ordered]@{ Mac = $ch; Hostname = $null; VendorClass = $null; RequestedIp = $null; Messages = 0 } }
-                                $c = $dhcpCli[$ch]; $c['Messages']++
-                                $v = & $oStr 12; if ($v) { $c['Hostname'] = $v }
-                                $v = & $oStr 60; if ($v) { $c['VendorClass'] = $v }
-                                $v = & $oIps 50; if ($v) { $c['RequestedIp'] = $v }
-                            }
-                        }
-                        elseif (($dp -eq 10001 -or $sp -eq 10001 -or $dp -eq 5678 -or $dp -eq 63321) -and $capLen -gt $pl + 8) {
-                            $payload = New-Object byte[] ($capLen - $pl)
-                            [Array]::Copy($f, $pl, $payload, 0, $payload.Length)
-                            $d = if ($dp -eq 10001 -or $sp -eq 10001) { ConvertFrom-UbntDiscovery $payload } elseif ($dp -eq 63321) { ConvertFrom-Nsdp $payload } else { ConvertFrom-Mndp $payload }
-                            if ($d) { if (-not $d.IP) { $d.IP = $srcIp }; if (-not $d.Mac) { $d.Mac = $srcMac }; $ann["$($d.Protocol)|$($d.Mac)"] = $d }
-                        }
-                    }
-                }
-                elseif ($et -eq 0x86DD -and $capLen -ge $off + 41) {
-                    if ([int]$f[$off + 6] -eq 58 -and [int]$f[$off + 40] -eq 134) { $ra[$srcMac] = 1 + [int]$ra[$srcMac] }
-                }
-                elseif ($et -eq 0x88CC) {
-                    $n = [ordered]@{ Protocol = 'LLDP'; SenderMac = $srcMac; ChassisMac = $null; SystemName = $null; SystemDescription = $null; PortId = $null; PortDescription = $null; Capabilities = @(); MgmtIP = $null; PortVlan = $null; VlanNames = @(); LinkMode = $null; MedDeviceClass = $null; VoiceVlan = $null; VoiceVlanTagged = $null; MedManufacturer = $null; MedModel = $null; MedFirmware = $null; MedSoftware = $null; MedSerial = $null; Frames = 1 }
-                    $p = $off
-                    while ($p + 2 -le $capLen) {
-                        $hdr = ([int]$f[$p] * 256) + [int]$f[$p + 1]
-                        $tt = $hdr -shr 9; $tl = $hdr -band 0x1FF; $p += 2
-                        if ($tt -eq 0 -or $p + $tl -gt $capLen) { break }
-                        if ($tt -eq 1 -and $tl -ge 7 -and $f[$p] -eq 4) { $n['ChassisMac'] = ConvertTo-MacText $f ($p + 1) }
-                        elseif ($tt -eq 2 -and $tl -ge 2) { if ($tl -ge 7 -and $f[$p] -eq 3) { $n['PortId'] = 'MAC ' + (ConvertTo-MacText $f ($p + 1)) } else { $n['PortId'] = ConvertTo-AsciiText $f ($p + 1) ($tl - 1) } }
-                        elseif ($tt -eq 4) { $n['PortDescription'] = ConvertTo-AsciiText $f $p $tl }
-                        elseif ($tt -eq 5) { $n['SystemName'] = ConvertTo-AsciiText $f $p $tl }
-                        elseif ($tt -eq 6) { $n['SystemDescription'] = ConvertTo-AsciiText $f $p $tl }
-                        elseif ($tt -eq 7 -and $tl -ge 4) {
-                            $bits = ([int]$f[$p + 2] * 256) + [int]$f[$p + 3]
-                            if (-not $bits) { $bits = ([int]$f[$p] * 256) + [int]$f[$p + 1] }
-                            $caps = @(); for ($bi = 0; $bi -lt 8; $bi++) { if ($bits -band (1 -shl $bi)) { $caps += $lldpCaps[$bi] } }
-                            $n['Capabilities'] = $caps
-                        }
-                        elseif ($tt -eq 8 -and $tl -ge 6 -and $f[$p + 1] -eq 1) { $n['MgmtIP'] = ConvertTo-IpText $f ($p + 2) }
-                        elseif ($tt -eq 127 -and $tl -ge 4) {
-                            $oui = '{0:X2}{1:X2}{2:X2}' -f $f[$p], $f[$p + 1], $f[$p + 2]; $st = [int]$f[$p + 3]
-                            if ($oui -eq '0080C2' -and $st -eq 1 -and $tl -ge 6) { $n['PortVlan'] = ([int]$f[$p + 4] * 256) + [int]$f[$p + 5] }
-                            elseif ($oui -eq '0080C2' -and $st -eq 3 -and $tl -ge 7) { $n['VlanNames'] = @($n['VlanNames']) + ('{0} {1}' -f (([int]$f[$p + 4] * 256) + [int]$f[$p + 5]), (ConvertTo-AsciiText $f ($p + 7) ([math]::Min([int]$f[$p + 6], $tl - 7)))).Trim() }
-                            elseif ($oui -eq '00120F' -and $st -eq 1 -and $tl -ge 9) { $mt = ([int]$f[$p + 7] * 256) + [int]$f[$p + 8]; $n['LinkMode'] = if ($mau.ContainsKey($mt)) { $mau[$mt] } else { "MAU type $mt" } }
-                            elseif ($oui -eq '0012BB' -and $st -eq 1 -and $tl -ge 7) { $n['MedDeviceClass'] = switch ([int]$f[$p + 6]) { 1 { 'Endpoint class I' } 2 { 'Endpoint class II (media)' } 3 { 'Endpoint class III (phone)' } 4 { 'Network connectivity (switch)' } default { "class $([int]$f[$p + 6])" } } }
-                            elseif ($oui -eq '0012BB' -and $st -eq 2 -and $tl -ge 8 -and ([int]$f[$p + 4] -eq 1 -or -not $n['VoiceVlan'])) {
-                                $n['VoiceVlan'] = (([int]$f[$p + 5] -band 0x1F) * 128) + ([int]$f[$p + 6] -shr 1)
-                                $n['VoiceVlanTagged'] = [bool]([int]$f[$p + 5] -band 0x40)
-                            }
-                            elseif ($oui -eq '0012BB' -and $st -ge 5 -and $st -le 10) {
-                                $key = @{ 5 = 'MedHardware'; 6 = 'MedFirmware'; 7 = 'MedSoftware'; 8 = 'MedSerial'; 9 = 'MedManufacturer'; 10 = 'MedModel' }[$st]
-                                if ($n.Contains($key)) { $n[$key] = ConvertTo-AsciiText $f ($p + 4) ($tl - 4) }
-                            }
-                        }
-                        $p += $tl
-                    }
-                    $k = "$($n['ChassisMac'])|$($n['PortId'])|$srcMac"
-                    if ($lldp.ContainsKey($k)) { $lldp[$k]['Frames']++ } else { $lldp[$k] = $n }
-                }
-                elseif ($et -le 1500) {
-                    $dst = [BitConverter]::ToString($f, 0, 6)
-                    if ($dst -eq '01-00-0C-CC-CC-CC' -and $capLen -ge $off + 16 -and $f[$off + 6] -eq 0x20 -and $f[$off + 7] -eq 0x00) {
-                        $n = [ordered]@{ Protocol = 'CDP'; SenderMac = $srcMac; DeviceId = $null; PortId = $null; Platform = $null; Software = $null; Capabilities = @(); Address = $null; NativeVlan = $null; VoiceVlan = $null; Frames = 1 }
-                        $p = $off + 12
-                        while ($p + 4 -le $capLen) {
-                            $tt = ([int]$f[$p] * 256) + [int]$f[$p + 1]; $tl = ([int]$f[$p + 2] * 256) + [int]$f[$p + 3]
-                            if ($tl -lt 4 -or $p + $tl -gt $capLen) { break }
-                            $s = ConvertTo-AsciiText $f ($p + 4) ($tl - 4)
-                            if ($tt -eq 1) { $n['DeviceId'] = $s } elseif ($tt -eq 3) { $n['PortId'] = $s } elseif ($tt -eq 5) { $n['Software'] = $s } elseif ($tt -eq 6) { $n['Platform'] = $s }
-                            elseif ($tt -eq 4 -and $tl -ge 8) { $cb = [int]$f[$p + 7]; $caps = @(); foreach ($pair in @(@(1, 'Router'), @(2, 'Bridge'), @(8, 'Switch'), @(16, 'Host'), @(64, 'Repeater'), @(128, 'Telephone'))) { if ($cb -band $pair[0]) { $caps += $pair[1] } }; $n['Capabilities'] = $caps }
-                            elseif ($tt -eq 10 -and $tl -ge 6) { $n['NativeVlan'] = ([int]$f[$p + 4] * 256) + [int]$f[$p + 5] }
-                            elseif ($tt -eq 14 -and $tl -ge 7) { $n['VoiceVlan'] = ([int]$f[$p + 5] * 256) + [int]$f[$p + 6] }
-                            elseif ($tt -eq 2 -and $tl -ge 17 -and $f[$p + 8] -eq 1 -and $f[$p + 10] -eq 0xCC) { $n['Address'] = ConvertTo-IpText $f ($p + 13) }
-                            $p += $tl
-                        }
-                        $k = "$($n['DeviceId'])|$($n['PortId'])|$srcMac"
-                        if ($cdp.ContainsKey($k)) { $cdp[$k]['Frames']++ } else { $cdp[$k] = $n }
-                    }
-                    else {
-                        $b = -1; $proto = $null
-                        if ($dst -eq '01-80-C2-00-00-00' -and $capLen -ge $off + 3 -and $f[$off] -eq 0x42 -and $f[$off + 1] -eq 0x42) { $b = $off + 3; $proto = 'Spanning tree' }
-                        elseif ($dst -eq '01-00-0C-CC-CC-CD' -and $capLen -ge $off + 8) { $b = $off + 8; $proto = 'Cisco per-VLAN spanning tree' }
-                        if ($b -ge 0 -and $capLen -ge $b + 27 -and ([int]$f[$b + 3] -eq 0 -or [int]$f[$b + 3] -eq 2)) {
-                            $brMac = ConvertTo-MacText $f ($b + 19); $portId = ([int]$f[$b + 25] * 256) + [int]$f[$b + 26]
-                            $k = "$proto|$brMac|$portId"
-                            if ($stp.ContainsKey($k)) { $stp[$k]['Frames']++ }
-                            else {
-                                $stp[$k] = [ordered]@{
-                                    Protocol = $(if ([int]$f[$b + 2] -ge 2) { "$proto (rapid)" } else { $proto }); SenderMac = $srcMac
-                                    BridgeMac = $brMac; BridgePriority = ([int]$f[$b + 17] * 256) + [int]$f[$b + 18]; PortId = $portId
-                                    RootMac = ConvertTo-MacText $f ($b + 7); RootPriority = ([int]$f[$b + 5] * 256) + [int]$f[$b + 6]
-                                    RootPathCost = ([int64]$f[$b + 13] * 16777216) + ([int64]$f[$b + 14] * 65536) + ([int64]$f[$b + 15] * 256) + [int64]$f[$b + 16]
-                                    ThisSwitchIsRoot = ($brMac -eq (ConvertTo-MacText $f ($b + 7))); Frames = 1
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        $pos += $len
-    }
-    $subnets = @($arp.Keys | Group-Object { ($_ -split '\.')[0..2] -join '.' } | Sort-Object Count -Descending | ForEach-Object { [pscustomobject]@{ Subnet = "$($_.Name).0/24"; Hosts = $_.Count; Sample = (@($_.Group | Select-Object -First 4) -join ', ') } })
-    $secs = [math]::Max(1, $Seconds)
-    [ordered]@{
-        Seconds = $Seconds; Frames = $frames; Truncated = $truncated
-        BroadcastFrames = $bcast; BroadcastPerSecond = [math]::Round($bcast / $secs, 1)
-        Note = 'Counts are approximate: pktmon can record one frame at more than one point.'
-        EtherTypes = @($etypes.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { '{0}: {1}' -f $_.Key, $_.Value })
-        VlanTagsSeen = @($vlans.Keys | Sort-Object { [int]$_ })
-        EapolFrames = [int]$etypes['0x888E']
-        ArpConflicts = @($arpDup.GetEnumerator() | ForEach-Object { [pscustomobject]@{ IP = $_.Key; Macs = $_.Value } })
-        ArpSubnets = $subnets
-        ArpHosts = @($arp.GetEnumerator() | Sort-Object { try { [version]$_.Key } catch { [version]'0.0' } } | Select-Object -First 600 | ForEach-Object { [pscustomobject]@{ IP = $_.Key; Mac = $_.Value } })
-        TopBroadcasters = @($talk.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 8 | ForEach-Object { [pscustomobject]@{ Mac = $_.Key; Vendor = (Get-MacVendorLocal $_.Key); Frames = $_.Value } })
-        UdpBroadcastPorts = @($udpPorts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 10 | ForEach-Object { '{0}: {1}' -f $_.Key, $_.Value })
-        SpanningTree = @($stp.Values | ForEach-Object { $_['SenderVendor'] = Get-MacVendorLocal $_['SenderMac']; $_['RootVendor'] = Get-MacVendorLocal $_['RootMac']; [pscustomobject]$_ })
-        Lldp = @($lldp.Values | ForEach-Object { $_['ChassisVendor'] = Get-MacVendorLocal $(if ($_['ChassisMac']) { $_['ChassisMac'] } else { $_['SenderMac'] }); [pscustomobject]$_ })
-        Cdp = @($cdp.Values | ForEach-Object { [pscustomobject]$_ })
-        DhcpServers = @($dhcpSrv.Values | ForEach-Object { [pscustomobject]$_ })
-        DhcpClients = @($dhcpCli.Values | Select-Object -First 400 | ForEach-Object { [pscustomobject]$_ })
-        Ipv6RouterAdvertisers = @($ra.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Mac = $_.Key; Vendor = (Get-MacVendorLocal $_.Key); Frames = $_.Value } })
-        VendorAnnouncements = @($ann.Values)
-    }
-}
-function Get-Prop {
-    # Reads $Obj.A.B... from hashtables or objects alike (live results and saved JSON); $null when absent.
-    param($Obj, [string[]]$Path)
-    foreach ($k in $Path) {
-        if ($null -eq $Obj) { return $null }
-        if ($Obj -is [System.Collections.IDictionary]) { if ($Obj.Contains($k)) { $Obj = $Obj[$k] } else { return $null } }
-        else { $pp = $Obj.PSObject.Properties[$k]; if ($pp) { $Obj = $pp.Value } else { return $null } }
-    }
-    return $Obj
-}
-
-function Get-BroadcastAddress {
-    param([string]$Ip, [string]$Mask)
-    try {
-        $i = [Net.IPAddress]::Parse($Ip).GetAddressBytes(); $m = [Net.IPAddress]::Parse($Mask).GetAddressBytes()
-        return ('{0}.{1}.{2}.{3}' -f ([int]$i[0] -bor (255 - [int]$m[0])), ([int]$i[1] -bor (255 - [int]$m[1])), ([int]$i[2] -bor (255 - [int]$m[2])), ([int]$i[3] -bor (255 - [int]$m[3])))
-    } catch { return $null }
-}
-
 function Send-VendorDiscovery {
     # One question per vendor discovery protocol (Ubiquiti UDP 10001, MikroTik UDP 5678, Netgear UDP 63322),
     # sent to the broadcast address. Returns what answered on the sockets; broadcast answers that the
@@ -1214,118 +1144,6 @@ function Send-VendorDiscovery {
     $sends = @(); foreach ($t in $targets) { $sends += @{ Address = $t; Port = 63322; Bytes = $nsdp } }
     foreach ($x in @(Invoke-UdpProbe $sends $SourceIp 63321 $WaitMs)) { $d = ConvertFrom-Nsdp $x.Data; if ($d) { if (-not $d.IP) { $d.IP = $x.IP }; $found += $d } }
     return $found
-}
-
-function Initialize-CertTrust {
-    # Web requests made in parallel check certificates on worker threads, where a PowerShell script block
-    # cannot run. This compiles a two-line callback that accepts device certificates (they are self-signed).
-    if ($null -ne $script:CertTrustReady) { return $script:CertTrustReady }
-    $script:CertTrustReady = $false
-    if (-not $script:FullLanguage) { return $false }
-    try {
-        if (-not ('SaCertTrust' -as [type])) {
-            Add-Type -ErrorAction Stop -TypeDefinition 'using System.Net.Security; using System.Security.Cryptography.X509Certificates; public static class SaCertTrust { public static bool Accept(object s, X509Certificate c, X509Chain ch, SslPolicyErrors e) { return true; } public static RemoteCertificateValidationCallback Callback = new RemoteCertificateValidationCallback(Accept); }'
-        }
-        $script:CertTrustReady = $true
-    } catch { $script:CertTrustReady = $false }
-    return $script:CertTrustReady
-}
-
-function Get-HttpBannersBulk {
-    # One GET per URL, many at a time: status, Server header, page title, a little page text and the
-    # certificate names. Nothing is logged in to. Falls back to one at a time when parallel is not possible.
-    param([string[]]$Urls, [int]$TimeoutMs = 5000, [int]$BatchSize = 32)
-    $out = @()
-    if (-not $Urls -or $Urls.Count -eq 0) { return $out }
-    if (-not (Initialize-CertTrust)) {
-        foreach ($u in ($Urls | Select-Object -First 60)) { $b = Get-HttpBanner $u 2500; $b | Add-Member -NotePropertyName BodySample -NotePropertyValue $null -Force; $b | Add-Member -NotePropertyName AuthRealm -NotePropertyValue $null -Force; $out += $b }
-        return $out
-    }
-    $oldCb = [Net.ServicePointManager]::ServerCertificateValidationCallback
-    $oldProto = [Net.ServicePointManager]::SecurityProtocol
-    try {
-        [Net.ServicePointManager]::ServerCertificateValidationCallback = [SaCertTrust]::Callback
-        # Old phones and printers only speak TLS 1.0/1.1; allow them for this pass if Windows still can.
-        try { [Net.ServicePointManager]::SecurityProtocol = $oldProto -bor [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12 } catch { }
-        for ($i = 0; $i -lt $Urls.Count; $i += $BatchSize) {
-            $batch = @()
-            foreach ($u in @($Urls[$i..([math]::Min($i + $BatchSize, $Urls.Count) - 1)])) {
-                $req = $null; $task = $null
-                try {
-                    $req = [Net.HttpWebRequest]::Create($u)
-                    $req.ReadWriteTimeout = 3000; $req.AllowAutoRedirect = $true; $req.MaximumAutomaticRedirections = 3; $req.KeepAlive = $false
-                    $req.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-                    $task = $req.GetResponseAsync()
-                } catch { }
-                $batch += , @($u, $req, $task)
-            }
-            $tasks = @($batch | Where-Object { $_[2] } | ForEach-Object { $_[2] })
-            if ($tasks.Count) { try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$tasks, $TimeoutMs) } catch { } }
-            foreach ($b in $batch) {
-                $r = [ordered]@{ Url = $b[0]; Status = $null; Server = $null; Title = $null; BodySample = $null; AuthRealm = $null; CertSubject = $null; CertIssuer = $null; CertNotAfter = $null; Error = $null }
-                $resp = $null
-                if (-not $b[2]) { $r.Error = 'request could not be started' }
-                elseif ("$($b[2].Status)" -eq 'RanToCompletion') { $resp = $b[2].Result }
-                elseif ($b[2].IsFaulted) {
-                    $ex = $b[2].Exception.GetBaseException()
-                    if ($ex -is [Net.WebException] -and $ex.Response) { $resp = $ex.Response } else { $r.Error = $ex.Message }
-                } else { $r.Error = 'timed out'; try { $b[1].Abort() } catch { } }
-                try { if ($b[1] -and $b[1].ServicePoint -and $b[1].ServicePoint.Certificate) { $r.CertSubject = $b[1].ServicePoint.Certificate.Subject; $r.CertIssuer = $b[1].ServicePoint.Certificate.Issuer; $r.CertNotAfter = (New-Object Security.Cryptography.X509Certificates.X509Certificate2 $b[1].ServicePoint.Certificate).NotAfter.ToString('s') } } catch { }
-                if ($resp) {
-                    try {
-                        $r.Status = [int]$resp.StatusCode
-                        $r.Server = $resp.Headers['Server']
-                        $wa = $resp.Headers['WWW-Authenticate']
-                        if ($wa -and $wa -match 'realm="?([^",]{1,80})') { $r.AuthRealm = $matches[1] }
-                        $sr = New-Object IO.StreamReader($resp.GetResponseStream())
-                        $buf = New-Object char[] 32768
-                        $n = $sr.Read($buf, 0, $buf.Length)
-                        if ($n -gt 0) {
-                            $body = New-Object string($buf, 0, $n)
-                            if ($body -match '<title[^>]*>\s*([^<]{1,120})</title>') { $r.Title = (($matches[1] -replace '&nbsp;', ' ' -replace '[^\x20-\x7E]', '') -replace '\s+', ' ').Trim() }
-                            $text = ((($body -replace '(?s)<script.*?</script>|<style.*?</style>|<!--.*?-->', ' ') -replace '<[^>]+>', ' ') -replace '&nbsp;', ' ' -replace '[^\x20-\x7E]', ' ') -replace '\s+', ' '
-                            $r.BodySample = $text.Trim()
-                            if ($r.BodySample.Length -gt 200) { $r.BodySample = $r.BodySample.Substring(0, 200) }
-                        }
-                        $sr.Close()
-                    } catch { if (-not $r.Error) { $r.Error = $_.Exception.Message } }
-                    try { $resp.Close() } catch { }
-                }
-                $out += [pscustomobject]$r
-            }
-        }
-    } finally {
-        [Net.ServicePointManager]::ServerCertificateValidationCallback = $oldCb
-        try { [Net.ServicePointManager]::SecurityProtocol = $oldProto } catch { }
-    }
-    return $out
-}
-
-function Get-TcpBannersBulk {
-    # Connects to one port on many addresses and keeps what each service says first (SSH, FTP, Telnet).
-    param([string[]]$Ips, [int]$Port, [int]$TimeoutMs = 2000)
-    $out = @{}
-    if (-not $Ips -or $Ips.Count -eq 0) { return $out }
-    $items = @()
-    foreach ($ip in $Ips) {
-        $c = New-Object Net.Sockets.TcpClient; $t = $null
-        try { $t = $c.ConnectAsync([string]$ip, $Port) } catch { }
-        $items += , @([string]$ip, $c, $t, $null, $null)
-    }
-    $ct = @($items | Where-Object { $_[2] } | ForEach-Object { $_[2] })
-    if ($ct.Count) { try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$ct, 1500) } catch { } }
-    foreach ($it in $items) {
-        if ($it[2] -and "$($it[2].Status)" -eq 'RanToCompletion' -and $it[1].Connected) {
-            try { $buf = New-Object byte[] 256; $it[3] = $buf; $it[4] = $it[1].GetStream().ReadAsync($buf, 0, 256) } catch { }
-        }
-    }
-    $rt = @($items | Where-Object { $_[4] } | ForEach-Object { $_[4] })
-    if ($rt.Count) { try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$rt, $TimeoutMs) } catch { } }
-    foreach ($it in $items) {
-        try { if ($it[4] -and "$($it[4].Status)" -eq 'RanToCompletion' -and $it[4].Result -gt 0) { $s = ConvertTo-AsciiText $it[3] 0 ([int]$it[4].Result); if ($s) { $out[$it[0]] = $s } } } catch { }
-        try { $it[1].Close() } catch { }
-    }
-    return $out
 }
 
 function ConvertFrom-NbnsStatus {
@@ -1560,6 +1378,412 @@ function Get-DeviceIdentity {
     if (-not $vendor -and $mv -and $mv -notmatch 'Unknown|Randomized|IEEE Registration') { $vendor = $mv }
     return [ordered]@{ Kind = $kind; Vendor = $vendor; Model = $model; Firmware = $fw; PassThrough = $pass; Confidence = $conf; Evidence = @($evid) }
 }
+
+function Get-WindowsBuildName {
+    param([int]$Build)
+    if ($Build -ge 26100) { return 'Windows 11 24H2 or later / Server 2025' }
+    if ($Build -ge 22000) { return 'Windows 11' }
+    if ($Build -eq 20348) { return 'Windows Server 2022' }
+    if ($Build -ge 19041 -and $Build -le 19045) { return 'Windows 10 (2004 to 22H2)' }
+    if ($Build -eq 17763) { return 'Windows 10 1809 / Server 2019' }
+    if ($Build -ge 10240 -and $Build -lt 19041) { if ($Build -eq 14393) { return 'Windows 10 1607 / Server 2016' } return 'Windows 10 (old release)' }
+    if ($Build -eq 9600) { return 'Windows 8.1 / Server 2012 R2' }
+    if ($Build -eq 9200) { return 'Windows 8 / Server 2012' }
+    if ($Build -ge 7600 -and $Build -le 7601) { return 'Windows 7 / Server 2008 R2' }
+    if ($Build -gt 0) { return "build $Build" }
+    return $null
+}
+
+function Get-SmbNtlmInfo {
+    # File-sharing handshake up to the server's challenge. No logon is attempted and no credentials are
+    # sent; the challenge itself names the computer and its domain and carries the Windows build number.
+    param([string]$Ip, [int]$TimeoutMs = 1500)
+    $r = [ordered]@{ ComputerName = $null; DnsName = $null; Domain = $null; DnsDomain = $null; OsVersion = $null; Build = $null; Os = $null; Error = $null }
+    $c = New-Object Net.Sockets.TcpClient
+    try {
+        if (-not ($c.ConnectAsync($Ip, 445).Wait($TimeoutMs) -and $c.Connected)) { throw 'connect failed' }
+        $ns = $c.GetStream(); $ns.ReadTimeout = $TimeoutMs; $ns.WriteTimeout = $TimeoutMs
+        $hdr = { param([int]$cmd, [int]$msgId) $h = New-Object byte[] 64; $h[0] = 0xFE; $h[1] = 0x53; $h[2] = 0x4D; $h[3] = 0x42; $h[4] = 64; $h[12] = [byte]$cmd; $h[14] = 1; $h[24] = [byte]$msgId; return , $h }
+        $send = {
+            param([byte[]]$body)
+            $len = $body.Length
+            $pkt = [byte[]](@(0, [byte](($len -shr 16) -band 255), [byte](($len -shr 8) -band 255), [byte]($len -band 255)) + @($body))
+            $ns.Write($pkt, 0, $pkt.Length)
+            $buf = New-Object byte[] 4096
+            $n = $ns.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { return $null }
+            $got = New-Object byte[] $n; [Array]::Copy($buf, 0, $got, 0, $n)
+            return , $got
+        }
+        $neg = New-Object byte[] 44; $neg[0] = 36; $neg[2] = 4; $neg[4] = 1
+        $g = [Guid]::NewGuid().ToByteArray(); [Array]::Copy($g, 0, $neg, 12, 16)
+        $d = @(0x02, 0x02, 0x10, 0x02, 0x00, 0x03, 0x02, 0x03); for ($i = 0; $i -lt 8; $i++) { $neg[36 + $i] = [byte]$d[$i] }
+        $resp = & $send (Join-Bytes (& $hdr 0 0) $neg)
+        if (-not $resp -or $resp.Length -lt 70 -or $resp[4] -ne 0xFE) { throw 'no SMB2 answer' }
+        $ntlm = New-Object byte[] 40
+        $sig = [Text.Encoding]::ASCII.GetBytes('NTLMSSP'); [Array]::Copy($sig, 0, $ntlm, 0, 7); $ntlm[8] = 1
+        $ntlm[12] = 0x97; $ntlm[13] = 0x82; $ntlm[14] = 0x08; $ntlm[15] = 0xE2
+        $ntlm[32] = 10; $ntlm[34] = 0x61; $ntlm[35] = 0x4A; $ntlm[39] = 15
+        $ss = New-Object byte[] 24; $ss[0] = 25; $ss[3] = 1; $ss[12] = 88; $ss[14] = [byte]$ntlm.Length
+        $resp = & $send (Join-Bytes (& $hdr 1 1) $ss $ntlm)
+        if (-not $resp) { throw 'no answer to session setup' }
+        $idx = -1
+        for ($i = 0; $i -le $resp.Length - 56; $i++) { if ($resp[$i] -eq 0x4E -and $resp[$i + 1] -eq 0x54 -and $resp[$i + 2] -eq 0x4C -and $resp[$i + 3] -eq 0x4D -and $resp[$i + 4] -eq 0x53 -and $resp[$i + 5] -eq 0x53 -and $resp[$i + 6] -eq 0x50 -and $resp[$i + 7] -eq 0 -and $resp[$i + 8] -eq 2) { $idx = $i; break } }
+        if ($idx -lt 0) { throw 'no NTLM challenge in the answer' }
+        $flags = [BitConverter]::ToUInt32($resp, $idx + 20)
+        if ($flags -band 0x02000000) {
+            $build = [int][BitConverter]::ToUInt16($resp, $idx + 50)
+            $r['OsVersion'] = '{0}.{1}.{2}' -f [int]$resp[$idx + 48], [int]$resp[$idx + 49], $build
+            $r['Build'] = $build; $r['Os'] = Get-WindowsBuildName $build
+        }
+        $tiLen = [int][BitConverter]::ToUInt16($resp, $idx + 40); $p = $idx + [int][BitConverter]::ToUInt32($resp, $idx + 44)
+        $end = [math]::Min($resp.Length, $p + $tiLen)
+        while ($p + 4 -le $end) {
+            $id = [int][BitConverter]::ToUInt16($resp, $p); $l = [int][BitConverter]::ToUInt16($resp, $p + 2)
+            if ($id -eq 0 -or $p + 4 + $l -gt $end) { break }
+            $val = [Text.Encoding]::Unicode.GetString($resp, $p + 4, $l)
+            switch ($id) { 1 { $r['ComputerName'] = $val } 2 { $r['Domain'] = $val } 3 { $r['DnsName'] = $val } 4 { $r['DnsDomain'] = $val } }
+            $p += 4 + $l
+        }
+    } catch { $r['Error'] = $_.Exception.GetBaseException().Message }
+    finally { try { $c.Close() } catch { } }
+    return [pscustomobject]$r
+}
+
+function New-IppRequest {
+    # IPP Get-Printer-Attributes: the standard "describe yourself" question a print client asks.
+    param([string]$Uri, [string[]]$Attributes)
+    $b = New-Object Collections.Generic.List[byte]
+    $b.AddRange([byte[]](1, 1, 0, 0x0B, 0, 0, 0, 1, 1))
+    $attr = {
+        param([int]$tag, [string]$name, [string]$value)
+        $nb = [Text.Encoding]::ASCII.GetBytes("$name"); $vb = [Text.Encoding]::ASCII.GetBytes("$value")
+        $b.Add([byte]$tag); $b.Add([byte]($nb.Length -shr 8)); $b.Add([byte]($nb.Length -band 255)); if ($nb.Length) { $b.AddRange([byte[]]$nb) }
+        $b.Add([byte]($vb.Length -shr 8)); $b.Add([byte]($vb.Length -band 255)); if ($vb.Length) { $b.AddRange([byte[]]$vb) }
+    }
+    & $attr 0x47 'attributes-charset' 'utf-8'
+    & $attr 0x48 'attributes-natural-language' 'en'
+    & $attr 0x45 'printer-uri' $Uri
+    $first = $true
+    foreach ($a in $Attributes) { & $attr 0x44 $(if ($first) { 'requested-attributes' } else { '' }) $a; $first = $false }
+    $b.Add(3)
+    return , $b.ToArray()
+}
+function ConvertFrom-IppResponse {
+    # Attribute name to value (or values) from an IPP reply; '_status' is the IPP status code.
+    param([byte[]]$B)
+    $out = [ordered]@{}
+    if (-not $B -or $B.Length -lt 9) { return $out }
+    $out['_status'] = ([int]$B[2] * 256) + [int]$B[3]
+    $p = 8; $last = $null
+    while ($p -lt $B.Length) {
+        $tag = [int]$B[$p]; $p++
+        if ($tag -eq 3) { break }
+        if ($tag -lt 0x10) { continue }
+        if ($p + 2 -gt $B.Length) { break }
+        $nl = ([int]$B[$p] * 256) + [int]$B[$p + 1]; $p += 2
+        if ($p + $nl + 2 -gt $B.Length) { break }
+        $name = if ($nl) { [Text.Encoding]::ASCII.GetString($B, $p, $nl) } else { $last }
+        $p += $nl
+        $vl = ([int]$B[$p] * 256) + [int]$B[$p + 1]; $p += 2
+        if ($p + $vl -gt $B.Length) { break }
+        $val = $null
+        if (($tag -eq 0x21 -or $tag -eq 0x23) -and $vl -eq 4) { $val = ([int]$B[$p] * 16777216) + ([int]$B[$p + 1] * 65536) + ([int]$B[$p + 2] * 256) + [int]$B[$p + 3] }
+        elseif ($tag -eq 0x22 -and $vl -ge 1) { $val = [bool]$B[$p] }
+        elseif ($tag -ge 0x30) { $val = ConvertTo-AsciiText $B $p $vl }
+        $p += $vl; $last = $name
+        if ($name -and $null -ne $val -and "$val" -ne '') { if ($out.Contains($name)) { $out[$name] = @($out[$name]) + $val } else { $out[$name] = $val } }
+    }
+    return $out
+}
+
+function Get-CaptureSummary {
+    # Reads the pktmon capture a second time and reports what the wire shows: who answers DHCP and with
+    # which options, spanning tree (the switch this port hangs off, the root switch), LLDP/CDP neighbors
+    # with their capabilities and voice VLAN, VLAN tags, other subnets heard in ARP, and how busy the
+    # broadcast domain is. Frames this PC sent are left out.
+    param([string]$Path, [int]$Seconds, [string[]]$LocalMacs)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $own = @{}
+    foreach ($m in @($LocalMacs)) { $k = ("$m" -replace '[^0-9A-Fa-f]', '').ToUpper(); if ($k) { $own[$k] = $true } }
+    $frames = 0; $bcast = 0; $truncated = $false
+    $etypes = @{}; $vlans = @{}; $arp = @{}; $talk = @{}; $udpPorts = @{}
+    $stp = @{}; $dhcpSrv = @{}; $dhcpCli = @{}; $ra = @{}; $lldp = @{}; $cdp = @{}; $ann = @{}; $arpDup = @{}
+    $lldpCaps = @('Other', 'Repeater', 'Bridge', 'WLAN access point', 'Router', 'Telephone', 'DOCSIS', 'Station')
+    $mau = @{ 10 = '10BASE-T full'; 15 = '100BASE-TX half'; 16 = '100BASE-TX full'; 29 = '1000BASE-T half'; 30 = '1000BASE-T full'; 54 = '10GBASE-T' }
+    $pos = 0
+    while ($pos + 12 -le $bytes.Length) {
+        $type = [BitConverter]::ToUInt32($bytes, $pos)
+        $len  = [int][BitConverter]::ToUInt32($bytes, $pos + 4)
+        if ($len -lt 12 -or $pos + $len -gt $bytes.Length) { break }
+        $capLen = 0
+        if ($type -eq 6) { $capLen = [int][BitConverter]::ToUInt32($bytes, $pos + 20) }
+        if ($type -eq 6 -and $capLen -ge 14 -and $pos + 28 + $capLen -le $bytes.Length) {
+            if ($frames -ge 40000) { $truncated = $true; break }
+            $f = New-Object byte[] $capLen
+            [Array]::Copy($bytes, $pos + 28, $f, 0, $capLen)
+            $srcMac = [BitConverter]::ToString($f, 6, 6)
+            if (-not $own.ContainsKey(($srcMac -replace '-', ''))) {
+                $frames++
+                $isB = ($f[0] -eq 255 -and $f[1] -eq 255 -and $f[2] -eq 255 -and $f[3] -eq 255 -and $f[4] -eq 255 -and $f[5] -eq 255)
+                $off = 14; $et = ([int]$f[12] * 256) + [int]$f[13]
+                if ($et -eq 0x8100 -and $capLen -ge 18) {
+                    $vid = "$((([int]$f[14] -band 0x0F) * 256) + [int]$f[15])"
+                    $vlans[$vid] = 1 + [int]$vlans[$vid]
+                    $et = ([int]$f[16] * 256) + [int]$f[17]; $off = 18
+                }
+                if ($isB) { $bcast++; $talk[$srcMac] = 1 + [int]$talk[$srcMac] }
+                $etKey = if ($et -le 1500) { 'LLC' } else { '0x{0:X4}' -f $et }
+                $etypes[$etKey] = 1 + [int]$etypes[$etKey]
+
+                if ($et -eq 0x0806 -and $capLen -ge $off + 28) {
+                    $spa = ConvertTo-IpText $f ($off + 14)
+                    # Untagged only: a tagged frame belongs to another VLAN, not to this port's network.
+                    if ($off -eq 14 -and $spa -and $spa -ne '0.0.0.0') {
+                        $sha = ConvertTo-MacText $f ($off + 8)
+                        if ($arp.ContainsKey($spa) -and $arp[$spa] -ne $sha) { $arpDup[$spa] = "$($arp[$spa]) and $sha" }
+                        $arp[$spa] = $sha
+                    }
+                }
+                elseif ($et -eq 0x0800 -and $capLen -ge $off + 28) {
+                    $ihl = ([int]$f[$off] -band 0x0F) * 4
+                    if ([int]$f[$off + 9] -eq 17 -and $capLen -ge $off + $ihl + 8) {
+                        $u = $off + $ihl
+                        $sp = ([int]$f[$u] * 256) + [int]$f[$u + 1]; $dp = ([int]$f[$u + 2] * 256) + [int]$f[$u + 3]; $pl = $u + 8
+                        $srcIp = ConvertTo-IpText $f ($off + 12)
+                        $udpPorts["$dp"] = 1 + [int]$udpPorts["$dp"]
+                        if (($sp -eq 67 -or $sp -eq 68) -and $capLen -ge $pl + 241) {
+                            $opt = @{}; $q = $pl + 240
+                            while ($q + 2 -le $capLen) {
+                                $ot = [int]$f[$q]
+                                if ($ot -eq 255) { break }
+                                if ($ot -eq 0) { $q++; continue }
+                                $ol = [int]$f[$q + 1]
+                                if ($q + 2 + $ol -gt $capLen) { break }
+                                $opt[$ot] = @(($q + 2), $ol); $q += 2 + $ol
+                            }
+                            $oStr = { param($k) if ($opt.ContainsKey($k)) { ConvertTo-AsciiText $f $opt[$k][0] $opt[$k][1] } }
+                            $oIps = { param($k) if ($opt.ContainsKey($k)) { $l = @(); for ($z = 0; $z + 4 -le $opt[$k][1]; $z += 4) { $l += ConvertTo-IpText $f ($opt[$k][0] + $z) }; $l -join ', ' } }
+                            $giaddr = ConvertTo-IpText $f ($pl + 24)
+                            if ($sp -eq 67) {
+                                $sid = if ($opt.ContainsKey(54)) { ConvertTo-IpText $f $opt[54][0] } else { $srcIp }
+                                if (-not $dhcpSrv.ContainsKey($sid)) { $dhcpSrv[$sid] = [ordered]@{ Server = $sid; SentFromIp = $srcIp; SentFromMac = $srcMac; RelayAgent = $null; Messages = 0; Mask = $null; Router = $null; Dns = $null; Domain = $null; LeaseSeconds = $null; TftpServer = $null; TftpAddresses = $null; BootFile = $null; Ntp = $null; VendorSpecificHex = $null } }
+                                $e = $dhcpSrv[$sid]; $e['Messages']++
+                                if ($giaddr -and $giaddr -ne '0.0.0.0') { $e['RelayAgent'] = $giaddr }
+                                foreach ($pair in @(@(1, 'Mask'), @(3, 'Router'), @(6, 'Dns'), @(42, 'Ntp'), @(150, 'TftpAddresses'))) { $v = & $oIps $pair[0]; if ($v) { $e[$pair[1]] = $v } }
+                                foreach ($pair in @(@(15, 'Domain'), @(66, 'TftpServer'), @(67, 'BootFile'))) { $v = & $oStr $pair[0]; if ($v) { $e[$pair[1]] = $v } }
+                                if ($opt.ContainsKey(51) -and $opt[51][1] -ge 4) { $o = $opt[51][0]; $e['LeaseSeconds'] = ([int64]$f[$o] * 16777216) + ([int64]$f[$o + 1] * 65536) + ([int64]$f[$o + 2] * 256) + [int64]$f[$o + 3] }
+                                if ($opt.ContainsKey(43)) { $e['VendorSpecificHex'] = ([BitConverter]::ToString($f, $opt[43][0], [math]::Min($opt[43][1], 64)) -replace '-', '') }
+                            } else {
+                                $ch = ConvertTo-MacText $f ($pl + 28)
+                                if (-not $dhcpCli.ContainsKey($ch)) { $dhcpCli[$ch] = [ordered]@{ Mac = $ch; Hostname = $null; VendorClass = $null; RequestedIp = $null; Messages = 0 } }
+                                $c = $dhcpCli[$ch]; $c['Messages']++
+                                $v = & $oStr 12; if ($v) { $c['Hostname'] = $v }
+                                $v = & $oStr 60; if ($v) { $c['VendorClass'] = $v }
+                                $v = & $oIps 50; if ($v) { $c['RequestedIp'] = $v }
+                            }
+                        }
+                        elseif (($dp -eq 10001 -or $sp -eq 10001 -or $dp -eq 5678 -or $dp -eq 63321) -and $capLen -gt $pl + 8) {
+                            $payload = New-Object byte[] ($capLen - $pl)
+                            [Array]::Copy($f, $pl, $payload, 0, $payload.Length)
+                            $d = if ($dp -eq 10001 -or $sp -eq 10001) { ConvertFrom-UbntDiscovery $payload } elseif ($dp -eq 63321) { ConvertFrom-Nsdp $payload } else { ConvertFrom-Mndp $payload }
+                            if ($d) { if (-not $d.IP) { $d.IP = $srcIp }; if (-not $d.Mac) { $d.Mac = $srcMac }; $ann["$($d.Protocol)|$($d.Mac)"] = $d }
+                        }
+                    }
+                }
+                elseif ($et -eq 0x86DD -and $capLen -ge $off + 41) {
+                    if ([int]$f[$off + 6] -eq 58 -and [int]$f[$off + 40] -eq 134) { $ra[$srcMac] = 1 + [int]$ra[$srcMac] }
+                }
+                elseif ($et -eq 0x88CC) {
+                    $n = [ordered]@{ Protocol = 'LLDP'; SenderMac = $srcMac; ChassisMac = $null; SystemName = $null; SystemDescription = $null; PortId = $null; PortDescription = $null; Capabilities = @(); MgmtIP = $null; PortVlan = $null; VlanNames = @(); LinkMode = $null; MedDeviceClass = $null; VoiceVlan = $null; VoiceVlanTagged = $null; MedManufacturer = $null; MedModel = $null; MedFirmware = $null; MedSoftware = $null; MedSerial = $null; Frames = 1 }
+                    $p = $off
+                    while ($p + 2 -le $capLen) {
+                        $hdr = ([int]$f[$p] * 256) + [int]$f[$p + 1]
+                        $tt = $hdr -shr 9; $tl = $hdr -band 0x1FF; $p += 2
+                        if ($tt -eq 0 -or $p + $tl -gt $capLen) { break }
+                        if ($tt -eq 1 -and $tl -ge 7 -and $f[$p] -eq 4) { $n['ChassisMac'] = ConvertTo-MacText $f ($p + 1) }
+                        elseif ($tt -eq 2 -and $tl -ge 2) { if ($tl -ge 7 -and $f[$p] -eq 3) { $n['PortId'] = 'MAC ' + (ConvertTo-MacText $f ($p + 1)) } else { $n['PortId'] = ConvertTo-AsciiText $f ($p + 1) ($tl - 1) } }
+                        elseif ($tt -eq 4) { $n['PortDescription'] = ConvertTo-AsciiText $f $p $tl }
+                        elseif ($tt -eq 5) { $n['SystemName'] = ConvertTo-AsciiText $f $p $tl }
+                        elseif ($tt -eq 6) { $n['SystemDescription'] = ConvertTo-AsciiText $f $p $tl }
+                        elseif ($tt -eq 7 -and $tl -ge 4) {
+                            $bits = ([int]$f[$p + 2] * 256) + [int]$f[$p + 3]
+                            if (-not $bits) { $bits = ([int]$f[$p] * 256) + [int]$f[$p + 1] }
+                            $caps = @(); for ($bi = 0; $bi -lt 8; $bi++) { if ($bits -band (1 -shl $bi)) { $caps += $lldpCaps[$bi] } }
+                            $n['Capabilities'] = $caps
+                        }
+                        elseif ($tt -eq 8 -and $tl -ge 6 -and $f[$p + 1] -eq 1) { $n['MgmtIP'] = ConvertTo-IpText $f ($p + 2) }
+                        elseif ($tt -eq 127 -and $tl -ge 4) {
+                            $oui = '{0:X2}{1:X2}{2:X2}' -f $f[$p], $f[$p + 1], $f[$p + 2]; $st = [int]$f[$p + 3]
+                            if ($oui -eq '0080C2' -and $st -eq 1 -and $tl -ge 6) { $n['PortVlan'] = ([int]$f[$p + 4] * 256) + [int]$f[$p + 5] }
+                            elseif ($oui -eq '0080C2' -and $st -eq 3 -and $tl -ge 7) { $n['VlanNames'] = @($n['VlanNames']) + ('{0} {1}' -f (([int]$f[$p + 4] * 256) + [int]$f[$p + 5]), (ConvertTo-AsciiText $f ($p + 7) ([math]::Min([int]$f[$p + 6], $tl - 7)))).Trim() }
+                            elseif ($oui -eq '00120F' -and $st -eq 1 -and $tl -ge 9) { $mt = ([int]$f[$p + 7] * 256) + [int]$f[$p + 8]; $n['LinkMode'] = if ($mau.ContainsKey($mt)) { $mau[$mt] } else { "MAU type $mt" } }
+                            elseif ($oui -eq '0012BB' -and $st -eq 1 -and $tl -ge 7) { $n['MedDeviceClass'] = switch ([int]$f[$p + 6]) { 1 { 'Endpoint class I' } 2 { 'Endpoint class II (media)' } 3 { 'Endpoint class III (phone)' } 4 { 'Network connectivity (switch)' } default { "class $([int]$f[$p + 6])" } } }
+                            elseif ($oui -eq '0012BB' -and $st -eq 2 -and $tl -ge 8 -and ([int]$f[$p + 4] -eq 1 -or -not $n['VoiceVlan'])) {
+                                $n['VoiceVlan'] = (([int]$f[$p + 5] -band 0x1F) * 128) + ([int]$f[$p + 6] -shr 1)
+                                $n['VoiceVlanTagged'] = [bool]([int]$f[$p + 5] -band 0x40)
+                            }
+                            elseif ($oui -eq '0012BB' -and $st -ge 5 -and $st -le 10) {
+                                $key = @{ 5 = 'MedHardware'; 6 = 'MedFirmware'; 7 = 'MedSoftware'; 8 = 'MedSerial'; 9 = 'MedManufacturer'; 10 = 'MedModel' }[$st]
+                                if ($n.Contains($key)) { $n[$key] = ConvertTo-AsciiText $f ($p + 4) ($tl - 4) }
+                            }
+                        }
+                        $p += $tl
+                    }
+                    $k = "$($n['ChassisMac'])|$($n['PortId'])|$srcMac"
+                    if ($lldp.ContainsKey($k)) { $lldp[$k]['Frames']++ } else { $lldp[$k] = $n }
+                }
+                elseif ($et -le 1500) {
+                    $dst = [BitConverter]::ToString($f, 0, 6)
+                    if ($dst -eq '01-00-0C-CC-CC-CC' -and $capLen -ge $off + 16 -and $f[$off + 6] -eq 0x20 -and $f[$off + 7] -eq 0x00) {
+                        $n = [ordered]@{ Protocol = 'CDP'; SenderMac = $srcMac; DeviceId = $null; PortId = $null; Platform = $null; Software = $null; Capabilities = @(); Address = $null; NativeVlan = $null; VoiceVlan = $null; Frames = 1 }
+                        $p = $off + 12
+                        while ($p + 4 -le $capLen) {
+                            $tt = ([int]$f[$p] * 256) + [int]$f[$p + 1]; $tl = ([int]$f[$p + 2] * 256) + [int]$f[$p + 3]
+                            if ($tl -lt 4 -or $p + $tl -gt $capLen) { break }
+                            $s = ConvertTo-AsciiText $f ($p + 4) ($tl - 4)
+                            if ($tt -eq 1) { $n['DeviceId'] = $s } elseif ($tt -eq 3) { $n['PortId'] = $s } elseif ($tt -eq 5) { $n['Software'] = $s } elseif ($tt -eq 6) { $n['Platform'] = $s }
+                            elseif ($tt -eq 4 -and $tl -ge 8) { $cb = [int]$f[$p + 7]; $caps = @(); foreach ($pair in @(@(1, 'Router'), @(2, 'Bridge'), @(8, 'Switch'), @(16, 'Host'), @(64, 'Repeater'), @(128, 'Telephone'))) { if ($cb -band $pair[0]) { $caps += $pair[1] } }; $n['Capabilities'] = $caps }
+                            elseif ($tt -eq 10 -and $tl -ge 6) { $n['NativeVlan'] = ([int]$f[$p + 4] * 256) + [int]$f[$p + 5] }
+                            elseif ($tt -eq 14 -and $tl -ge 7) { $n['VoiceVlan'] = ([int]$f[$p + 5] * 256) + [int]$f[$p + 6] }
+                            elseif ($tt -eq 2 -and $tl -ge 17 -and $f[$p + 8] -eq 1 -and $f[$p + 10] -eq 0xCC) { $n['Address'] = ConvertTo-IpText $f ($p + 13) }
+                            $p += $tl
+                        }
+                        $k = "$($n['DeviceId'])|$($n['PortId'])|$srcMac"
+                        if ($cdp.ContainsKey($k)) { $cdp[$k]['Frames']++ } else { $cdp[$k] = $n }
+                    }
+                    else {
+                        $b = -1; $proto = $null
+                        if ($dst -eq '01-80-C2-00-00-00' -and $capLen -ge $off + 3 -and $f[$off] -eq 0x42 -and $f[$off + 1] -eq 0x42) { $b = $off + 3; $proto = 'Spanning tree' }
+                        elseif ($dst -eq '01-00-0C-CC-CC-CD' -and $capLen -ge $off + 8) { $b = $off + 8; $proto = 'Cisco per-VLAN spanning tree' }
+                        if ($b -ge 0 -and $capLen -ge $b + 27 -and ([int]$f[$b + 3] -eq 0 -or [int]$f[$b + 3] -eq 2)) {
+                            $brMac = ConvertTo-MacText $f ($b + 19); $portId = ([int]$f[$b + 25] * 256) + [int]$f[$b + 26]
+                            $k = "$proto|$brMac|$portId"
+                            if ($stp.ContainsKey($k)) { $stp[$k]['Frames']++ }
+                            else {
+                                $stp[$k] = [ordered]@{
+                                    Protocol = $(if ([int]$f[$b + 2] -ge 2) { "$proto (rapid)" } else { $proto }); SenderMac = $srcMac
+                                    BridgeMac = $brMac; BridgePriority = ([int]$f[$b + 17] * 256) + [int]$f[$b + 18]; PortId = $portId
+                                    RootMac = ConvertTo-MacText $f ($b + 7); RootPriority = ([int]$f[$b + 5] * 256) + [int]$f[$b + 6]
+                                    RootPathCost = ([int64]$f[$b + 13] * 16777216) + ([int64]$f[$b + 14] * 65536) + ([int64]$f[$b + 15] * 256) + [int64]$f[$b + 16]
+                                    ThisSwitchIsRoot = ($brMac -eq (ConvertTo-MacText $f ($b + 7))); Frames = 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        $pos += $len
+    }
+    $subnets = @($arp.Keys | Group-Object { ($_ -split '\.')[0..2] -join '.' } | Sort-Object Count -Descending | ForEach-Object { [pscustomobject]@{ Subnet = "$($_.Name).0/24"; Hosts = $_.Count; Sample = (@($_.Group | Select-Object -First 4) -join ', ') } })
+    $secs = [math]::Max(1, $Seconds)
+    [ordered]@{
+        Seconds = $Seconds; Frames = $frames; Truncated = $truncated
+        BroadcastFrames = $bcast; BroadcastPerSecond = [math]::Round($bcast / $secs, 1)
+        Note = 'Counts are approximate: pktmon can record one frame at more than one point.'
+        EtherTypes = @($etypes.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { '{0}: {1}' -f $_.Key, $_.Value })
+        VlanTagsSeen = @($vlans.Keys | Sort-Object { [int]$_ })
+        EapolFrames = [int]$etypes['0x888E']
+        ArpConflicts = @($arpDup.GetEnumerator() | ForEach-Object { [pscustomobject]@{ IP = $_.Key; Macs = $_.Value } })
+        ArpSubnets = $subnets
+        ArpHosts = @($arp.GetEnumerator() | Sort-Object { try { [version]$_.Key } catch { [version]'0.0' } } | Select-Object -First 600 | ForEach-Object { [pscustomobject]@{ IP = $_.Key; Mac = $_.Value } })
+        TopBroadcasters = @($talk.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 8 | ForEach-Object { [pscustomobject]@{ Mac = $_.Key; Vendor = (Get-MacVendorLocal $_.Key); Frames = $_.Value } })
+        UdpBroadcastPorts = @($udpPorts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 10 | ForEach-Object { '{0}: {1}' -f $_.Key, $_.Value })
+        SpanningTree = @($stp.Values | ForEach-Object { $_['SenderVendor'] = Get-MacVendorLocal $_['SenderMac']; $_['RootVendor'] = Get-MacVendorLocal $_['RootMac']; [pscustomobject]$_ })
+        Lldp = @($lldp.Values | ForEach-Object { $_['ChassisVendor'] = Get-MacVendorLocal $(if ($_['ChassisMac']) { $_['ChassisMac'] } else { $_['SenderMac'] }); [pscustomobject]$_ })
+        Cdp = @($cdp.Values | ForEach-Object { [pscustomobject]$_ })
+        DhcpServers = @($dhcpSrv.Values | ForEach-Object { [pscustomobject]$_ })
+        DhcpClients = @($dhcpCli.Values | Select-Object -First 400 | ForEach-Object { [pscustomobject]$_ })
+        Ipv6RouterAdvertisers = @($ra.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Mac = $_.Key; Vendor = (Get-MacVendorLocal $_.Key); Frames = $_.Value } })
+        VendorAnnouncements = @($ann.Values)
+    }
+}
+
+# =====================================================================
+# PHASE 5: collect background jobs
+# =====================================================================
+function ConvertFrom-NeighborCapture {
+    # Parses LLDP and CDP frames out of a pktmon pcapng file.
+    param([string]$Path)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $frames = @()
+    $pos = 0
+    while ($pos + 12 -le $bytes.Length) {
+        $type = [BitConverter]::ToUInt32($bytes, $pos)
+        $len  = [BitConverter]::ToUInt32($bytes, $pos + 4)
+        if ($len -lt 12 -or $pos + $len -gt $bytes.Length) { break }
+        if ($type -eq 6) {
+            $capLen = [BitConverter]::ToUInt32($bytes, $pos + 20)
+            $data = New-Object byte[] $capLen
+            [Array]::Copy($bytes, $pos + 28, $data, 0, $capLen)
+            $frames += ,$data
+        }
+        $pos += $len
+    }
+    $txt = { param($b, $off) [Text.Encoding]::ASCII.GetString($b, $off, $b.Length - $off) -replace '[^\x20-\x7E]', '' }
+    $mac = { param($b, $off) (($b[$off..($off + 5)] | ForEach-Object { '{0:X2}' -f $_ }) -join '-') }
+    # IEEE 802.3 operational MAU types seen most often (RFC 4836).
+    $mau = @{ 10 = '10BASE-T full'; 15 = '100BASE-TX half'; 16 = '100BASE-TX full'; 29 = '1000BASE-T half'; 30 = '1000BASE-T full'; 54 = '10GBASE-T' }
+    $found = @()
+    foreach ($f in $frames) {
+        if ($f.Length -lt 16) { continue }
+        $etype = ($f[12] * 256) + $f[13]
+        if ($etype -eq 0x88CC) {
+            $info = [ordered]@{ Protocol = 'LLDP'; SystemName = $null; Model = $null; Port = $null; PortId = $null; PortDescription = $null; LinkMode = $null; Vlan = $null; MgmtIP = $null; ChassisMac = $null; ChassisVendor = $null; SystemDescription = $null }
+            $p = 14
+            while ($p + 2 -le $f.Length) {
+                $hdr = ($f[$p] * 256) + $f[$p + 1]
+                $tt = $hdr -shr 9; $tl = $hdr -band 0x1FF
+                $p += 2
+                if ($tt -eq 0 -or $p + $tl -gt $f.Length) { break }
+                $val = New-Object byte[] $tl
+                [Array]::Copy($f, $p, $val, 0, $tl)
+                switch ($tt) {
+                    1 { if ($tl -ge 7 -and $val[0] -eq 4) { $info['ChassisMac'] = & $mac $val 1 } }
+                    # Port ID subtype 3 is a MAC address; the others are text (interface alias/name, local).
+                    2 { if ($tl -ge 7 -and $val[0] -eq 3) { $info['PortId'] = 'MAC ' + (& $mac $val 1) } else { $info['PortId'] = & $txt $val 1 } }
+                    4 { $info['PortDescription'] = & $txt $val 0 }
+                    5 { $info['SystemName'] = & $txt $val 0 }
+                    6 { $info['SystemDescription'] = & $txt $val 0 }
+                    8 { if ($tl -ge 6 -and $val[1] -eq 1) { $info['MgmtIP'] = '{0}.{1}.{2}.{3}' -f $val[2], $val[3], $val[4], $val[5] } }
+                    127 {
+                        if ($tl -ge 6 -and $val[0] -eq 0x00 -and $val[1] -eq 0x80 -and $val[2] -eq 0xC2 -and $val[3] -eq 1) { $info['Vlan'] = ($val[4] * 256) + $val[5] }
+                        elseif ($tl -ge 9 -and $val[0] -eq 0x00 -and $val[1] -eq 0x12 -and $val[2] -eq 0x0F -and $val[3] -eq 1) {
+                            $m = ($val[7] * 256) + $val[8]
+                            $info['LinkMode'] = if ($mau.ContainsKey($m)) { $mau[$m] } else { "MAU type $m" }
+                        }
+                    }
+                }
+                $p += $tl
+            }
+            # Human-friendly port: a short description (often just the port number) beats a MAC-style port ID.
+            $info['Port'] = if ($info['PortDescription'] -and $info['PortDescription'].Length -le 24) { $info['PortDescription'] } else { $info['PortId'] }
+            if ($info['SystemDescription']) { $info['Model'] = ($info['SystemDescription'] -split ',')[0].Trim() }
+            if ($info['ChassisMac']) { $info['ChassisVendor'] = Get-MacVendor $info['ChassisMac'] }
+            $found += [pscustomobject]$info
+        } elseif ($f[0] -eq 0x01 -and $f[1] -eq 0x00 -and $f[2] -eq 0x0C -and $f[3] -eq 0xCC) {
+            # CDP over 802.3 + LLC/SNAP: header 14 + 8, then version/ttl/checksum (4)
+            $info = [ordered]@{ Protocol = 'CDP'; SystemName = $null; Model = $null; Port = $null; PortId = $null; PortDescription = $null; LinkMode = $null; Vlan = $null; MgmtIP = $null; ChassisMac = $null; ChassisVendor = $null; SystemDescription = $null }
+            $p = 26
+            while ($p + 4 -le $f.Length) {
+                $tt = ($f[$p] * 256) + $f[$p + 1]; $tl = ($f[$p + 2] * 256) + $f[$p + 3]
+                if ($tl -lt 4 -or $p + $tl -gt $f.Length) { break }
+                $s = [Text.Encoding]::ASCII.GetString($f, $p + 4, $tl - 4) -replace '[^\x20-\x7E]', ''
+                switch ($tt) { 1 { $info['SystemName'] = $s } 3 { $info['PortId'] = $s } 5 { $info['SystemDescription'] = $s } 6 { $info['Model'] = $s } 10 { if ($tl -ge 6) { $info['Vlan'] = ($f[$p + 4] * 256) + $f[$p + 5] } } }
+                $p += $tl
+            }
+            $info['Port'] = $info['PortId']
+            $found += [pscustomobject]$info
+        }
+    }
+    [ordered]@{
+        FramesCaptured = $frames.Count
+        Neighbors = @($found | Sort-Object Protocol, SystemName, Port -Unique)
+        Note = if ($found.Count -eq 0) { 'No LLDP/CDP seen: switch is unmanaged, LLDP disabled, or interval > capture window' } else { $null }
+    }
+}
+
 # ---------------------------------------------------------------------
 # v1.7.0 helpers: SNMP (read only), Windows build from the file-sharing handshake, IPP, RTSP, STUN,
 # NTP and the fast ping used for the voice sample.
@@ -1711,209 +1935,131 @@ function Invoke-SnmpWalk {
     return $rows.ToArray()
 }
 
-function Get-WindowsBuildName {
-    param([int]$Build)
-    if ($Build -ge 26100) { return 'Windows 11 24H2 or later / Server 2025' }
-    if ($Build -ge 22000) { return 'Windows 11' }
-    if ($Build -eq 20348) { return 'Windows Server 2022' }
-    if ($Build -ge 19041 -and $Build -le 19045) { return 'Windows 10 (2004 to 22H2)' }
-    if ($Build -eq 17763) { return 'Windows 10 1809 / Server 2019' }
-    if ($Build -ge 10240 -and $Build -lt 19041) { if ($Build -eq 14393) { return 'Windows 10 1607 / Server 2016' } return 'Windows 10 (old release)' }
-    if ($Build -eq 9600) { return 'Windows 8.1 / Server 2012 R2' }
-    if ($Build -eq 9200) { return 'Windows 8 / Server 2012' }
-    if ($Build -ge 7600 -and $Build -le 7601) { return 'Windows 7 / Server 2008 R2' }
-    if ($Build -gt 0) { return "build $Build" }
+# ---------------------------------------------------------------------
+# Router and UPS tables over SNMP (read only, same community as the rest of the SNMP step).
+# The parsers take the rows Invoke-SnmpWalk returns (Index = the OID part after the column).
+# ---------------------------------------------------------------------
+function ConvertFrom-SnmpMac {
+    # A MAC from an SNMP octet string; $null unless it is six bytes that are not all zero.
+    param($Value)
+    $v = "$Value".Trim().ToUpper() -replace ':', '-'
+    if ($v -notmatch '^([0-9A-F]{2}-){5}[0-9A-F]{2}$' -or $v -eq '00-00-00-00-00-00' -or $v -eq 'FF-FF-FF-FF-FF-FF') { return $null }
+    return $v
+}
+
+function ConvertFrom-ArpRows {
+    # ipNetToMediaPhysAddress (1.3.6.1.2.1.4.22.1.2, index ifIndex.a.b.c.d) or ipNetToPhysicalPhysAddress
+    # (1.3.6.1.2.1.4.35.1.4, index ifIndex.1.4.a.b.c.d for IPv4) -> IP, Mac, IfIndex.
+    param($Rows)
+    $out = @()
+    foreach ($r in @($Rows)) {
+        if (-not $r) { continue }
+        $p = @("$($r.Index)" -split '\.')
+        $ip = $null
+        if ($p.Count -eq 5) { $ip = ($p[1..4]) -join '.' }
+        elseif ($p.Count -eq 7 -and $p[1] -eq '1' -and $p[2] -eq '4') { $ip = ($p[3..6]) -join '.' }
+        $mac = ConvertFrom-SnmpMac $r.Value
+        if ($ip -and $mac) { $out += [pscustomobject]@{ IP = $ip; Mac = $mac; IfIndex = [int]$p[0] } }
+    }
+    return $out
+}
+
+function ConvertFrom-AddrRows {
+    # ipAdEntIfIndex (1.3.6.1.2.1.4.20.1.2) and ipAdEntNetMask (1.3.6.1.2.1.4.20.1.3), both indexed by the
+    # address -> IP, Mask, Prefix, IfIndex, Class. Loopback addresses are left out.
+    param($IfRows, $MaskRows)
+    $masks = @{}; foreach ($m in @($MaskRows)) { if ($m) { $masks["$($m.Index)"] = "$($m.Value)" } }
+    $out = @()
+    foreach ($r in @($IfRows)) {
+        if (-not $r -or -not (Test-IPv4 "$($r.Index)") -or "$($r.Index)" -like '127.*') { continue }
+        $mk = $masks["$($r.Index)"]; $pre = $null
+        if (Test-IPv4 $mk) { $pre = 0; $mi = ConvertTo-IpNumber $mk; for ($bit = 31; $bit -ge 0; $bit--) { if (($mi -shr $bit) -band 1) { $pre++ } else { break } } }
+        $out += [pscustomobject]@{ IP = "$($r.Index)"; Mask = $mk; Prefix = $pre; IfIndex = [int]$r.Value; Class = (Get-IpClass "$($r.Index)") }
+    }
+    return $out
+}
+
+function ConvertFrom-RouteRows {
+    # ipCidrRouteNextHop (1.3.6.1.2.1.4.24.4.1.4, index dest.mask.tos.nexthop) -> Destination, Prefix, NextHop.
+    # Or, with -Legacy, ipRouteNextHop (1.3.6.1.2.1.4.21.1.7, index dest) plus ipRouteMask rows.
+    param($Rows, $MaskRows = @(), [switch]$Legacy)
+    $toPrefix = { param($mk) if (-not (Test-IPv4 $mk)) { return $null }; $n = 0; $mi = ConvertTo-IpNumber $mk; for ($bit = 31; $bit -ge 0; $bit--) { if (($mi -shr $bit) -band 1) { $n++ } else { break } }; $n }
+    $out = @()
+    if ($Legacy) {
+        $masks = @{}; foreach ($m in @($MaskRows)) { if ($m) { $masks["$($m.Index)"] = "$($m.Value)" } }
+        foreach ($r in @($Rows)) { if ($r -and (Test-IPv4 "$($r.Index)")) { $out += [pscustomobject]@{ Destination = "$($r.Index)"; Prefix = (& $toPrefix $masks["$($r.Index)"]); NextHop = "$($r.Value)" } } }
+    } else {
+        foreach ($r in @($Rows)) {
+            $p = @("$($r.Index)" -split '\.')
+            if ($p.Count -ne 13) { continue }
+            $out += [pscustomobject]@{ Destination = ($p[0..3] -join '.'); Prefix = (& $toPrefix ($p[4..7] -join '.')); NextHop = "$($r.Value)" }
+        }
+    }
+    return @($out | Sort-Object { ConvertTo-IpNumber $_.Destination }, Prefix)
+}
+
+function Get-UpsOidMap {
+    # The UPS values read over SNMP: RFC 1628 UPS-MIB, or with -Apc the APC PowerNet-MIB for network
+    # cards that do not answer UPS-MIB.
+    param([switch]$Apc)
+    if ($Apc) {
+        return [ordered]@{
+            Model = '1.3.6.1.4.1.318.1.1.1.1.1.1.0'; BatteryStatus = '1.3.6.1.4.1.318.1.1.1.2.1.1.0'; ChargePct = '1.3.6.1.4.1.318.1.1.1.2.2.1.0'
+            RuntimeTicks = '1.3.6.1.4.1.318.1.1.1.2.2.3.0'; ReplaceBattery = '1.3.6.1.4.1.318.1.1.1.2.2.4.0'; OutputStatus = '1.3.6.1.4.1.318.1.1.1.4.1.1.0'; LoadPct = '1.3.6.1.4.1.318.1.1.1.4.2.3.0'
+        }
+    }
+    return [ordered]@{
+        Manufacturer = '1.3.6.1.2.1.33.1.1.1.0'; Model = '1.3.6.1.2.1.33.1.1.2.0'; BatteryStatus = '1.3.6.1.2.1.33.1.2.1.0'
+        MinutesRemaining = '1.3.6.1.2.1.33.1.2.3.0'; ChargePct = '1.3.6.1.2.1.33.1.2.4.0'; OutputSource = '1.3.6.1.2.1.33.1.4.1.0'; LoadPct = '1.3.6.1.2.1.33.1.4.4.1.5.1'
+    }
+}
+
+function ConvertTo-UpsStatus {
+    # Values read with $UpsOids (-Standard) or $ApcUpsOids (-Apc) -> one plain UPS record, or $null.
+    param($Standard, $Apc)
+    $UpsOids = Get-UpsOidMap; $ApcUpsOids = Get-UpsOidMap -Apc
+    $num = { param($v) if ($null -eq $v -or "$v" -eq '') { return $null }; try { return [double]$v } catch { return $null } }
+    if ($Standard -and ($Standard[$UpsOids.Model] -or $Standard[$UpsOids.BatteryStatus])) {
+        $bs = & $num $Standard[$UpsOids.BatteryStatus]; $src = & $num $Standard[$UpsOids.OutputSource]
+        return [pscustomobject]@{
+            Source = 'UPS-MIB'; Manufacturer = "$($Standard[$UpsOids.Manufacturer])".Trim(); Model = "$($Standard[$UpsOids.Model])".Trim()
+            Battery = $(switch ($bs) { 2 { 'normal' } 3 { 'low' } 4 { 'depleted' } default { 'unknown' } })
+            OnBattery = ($src -eq 5); ChargePct = (& $num $Standard[$UpsOids.ChargePct]); MinutesRemaining = (& $num $Standard[$UpsOids.MinutesRemaining])
+            LoadPct = (& $num $Standard[$UpsOids.LoadPct]); ReplaceBattery = $null
+        }
+    }
+    if ($Apc -and ($Apc[$ApcUpsOids.Model] -or $Apc[$ApcUpsOids.BatteryStatus])) {
+        $bs = & $num $Apc[$ApcUpsOids.BatteryStatus]; $os = & $num $Apc[$ApcUpsOids.OutputStatus]; $rt = & $num $Apc[$ApcUpsOids.RuntimeTicks]
+        return [pscustomobject]@{
+            Source = 'APC'; Manufacturer = 'APC'; Model = "$($Apc[$ApcUpsOids.Model])".Trim()
+            Battery = $(switch ($bs) { 2 { 'normal' } 3 { 'low' } 4 { 'in fault' } default { 'unknown' } })
+            OnBattery = ($os -eq 3); ChargePct = (& $num $Apc[$ApcUpsOids.ChargePct]); MinutesRemaining = $(if ($null -ne $rt) { [math]::Round($rt / 6000, 0) } else { $null })
+            LoadPct = (& $num $Apc[$ApcUpsOids.LoadPct]); ReplaceBattery = ((& $num $Apc[$ApcUpsOids.ReplaceBattery]) -eq 2)
+        }
+    }
     return $null
 }
 
-function Get-SmbNtlmInfo {
-    # File-sharing handshake up to the server's challenge. No logon is attempted and no credentials are
-    # sent; the challenge itself names the computer and its domain and carries the Windows build number.
-    param([string]$Ip, [int]$TimeoutMs = 1500)
-    $r = [ordered]@{ ComputerName = $null; DnsName = $null; Domain = $null; DnsDomain = $null; OsVersion = $null; Build = $null; Os = $null; Error = $null }
-    $c = New-Object Net.Sockets.TcpClient
-    try {
-        if (-not ($c.ConnectAsync($Ip, 445).Wait($TimeoutMs) -and $c.Connected)) { throw 'connect failed' }
-        $ns = $c.GetStream(); $ns.ReadTimeout = $TimeoutMs; $ns.WriteTimeout = $TimeoutMs
-        $hdr = { param([int]$cmd, [int]$msgId) $h = New-Object byte[] 64; $h[0] = 0xFE; $h[1] = 0x53; $h[2] = 0x4D; $h[3] = 0x42; $h[4] = 64; $h[12] = [byte]$cmd; $h[14] = 1; $h[24] = [byte]$msgId; return , $h }
-        $send = {
-            param([byte[]]$body)
-            $len = $body.Length
-            $pkt = [byte[]](@(0, [byte](($len -shr 16) -band 255), [byte](($len -shr 8) -band 255), [byte]($len -band 255)) + @($body))
-            $ns.Write($pkt, 0, $pkt.Length)
-            $buf = New-Object byte[] 4096
-            $n = $ns.Read($buf, 0, $buf.Length)
-            if ($n -le 0) { return $null }
-            $got = New-Object byte[] $n; [Array]::Copy($buf, 0, $got, 0, $n)
-            return , $got
-        }
-        $neg = New-Object byte[] 44; $neg[0] = 36; $neg[2] = 4; $neg[4] = 1
-        $g = [Guid]::NewGuid().ToByteArray(); [Array]::Copy($g, 0, $neg, 12, 16)
-        $d = @(0x02, 0x02, 0x10, 0x02, 0x00, 0x03, 0x02, 0x03); for ($i = 0; $i -lt 8; $i++) { $neg[36 + $i] = [byte]$d[$i] }
-        $resp = & $send (Join-Bytes (& $hdr 0 0) $neg)
-        if (-not $resp -or $resp.Length -lt 70 -or $resp[4] -ne 0xFE) { throw 'no SMB2 answer' }
-        $ntlm = New-Object byte[] 40
-        $sig = [Text.Encoding]::ASCII.GetBytes('NTLMSSP'); [Array]::Copy($sig, 0, $ntlm, 0, 7); $ntlm[8] = 1
-        $ntlm[12] = 0x97; $ntlm[13] = 0x82; $ntlm[14] = 0x08; $ntlm[15] = 0xE2
-        $ntlm[32] = 10; $ntlm[34] = 0x61; $ntlm[35] = 0x4A; $ntlm[39] = 15
-        $ss = New-Object byte[] 24; $ss[0] = 25; $ss[3] = 1; $ss[12] = 88; $ss[14] = [byte]$ntlm.Length
-        $resp = & $send (Join-Bytes (& $hdr 1 1) $ss $ntlm)
-        if (-not $resp) { throw 'no answer to session setup' }
-        $idx = -1
-        for ($i = 0; $i -le $resp.Length - 56; $i++) { if ($resp[$i] -eq 0x4E -and $resp[$i + 1] -eq 0x54 -and $resp[$i + 2] -eq 0x4C -and $resp[$i + 3] -eq 0x4D -and $resp[$i + 4] -eq 0x53 -and $resp[$i + 5] -eq 0x53 -and $resp[$i + 6] -eq 0x50 -and $resp[$i + 7] -eq 0 -and $resp[$i + 8] -eq 2) { $idx = $i; break } }
-        if ($idx -lt 0) { throw 'no NTLM challenge in the answer' }
-        $flags = [BitConverter]::ToUInt32($resp, $idx + 20)
-        if ($flags -band 0x02000000) {
-            $build = [int][BitConverter]::ToUInt16($resp, $idx + 50)
-            $r['OsVersion'] = '{0}.{1}.{2}' -f [int]$resp[$idx + 48], [int]$resp[$idx + 49], $build
-            $r['Build'] = $build; $r['Os'] = Get-WindowsBuildName $build
-        }
-        $tiLen = [int][BitConverter]::ToUInt16($resp, $idx + 40); $p = $idx + [int][BitConverter]::ToUInt32($resp, $idx + 44)
-        $end = [math]::Min($resp.Length, $p + $tiLen)
-        while ($p + 4 -le $end) {
-            $id = [int][BitConverter]::ToUInt16($resp, $p); $l = [int][BitConverter]::ToUInt16($resp, $p + 2)
-            if ($id -eq 0 -or $p + 4 + $l -gt $end) { break }
-            $val = [Text.Encoding]::Unicode.GetString($resp, $p + 4, $l)
-            switch ($id) { 1 { $r['ComputerName'] = $val } 2 { $r['Domain'] = $val } 3 { $r['DnsName'] = $val } 4 { $r['DnsDomain'] = $val } }
-            $p += 4 + $l
-        }
-    } catch { $r['Error'] = $_.Exception.GetBaseException().Message }
-    finally { try { $c.Close() } catch { } }
-    return [pscustomobject]$r
-}
-
-function New-IppRequest {
-    # IPP Get-Printer-Attributes: the standard "describe yourself" question a print client asks.
-    param([string]$Uri, [string[]]$Attributes)
-    $b = New-Object Collections.Generic.List[byte]
-    $b.AddRange([byte[]](1, 1, 0, 0x0B, 0, 0, 0, 1, 1))
-    $attr = {
-        param([int]$tag, [string]$name, [string]$value)
-        $nb = [Text.Encoding]::ASCII.GetBytes("$name"); $vb = [Text.Encoding]::ASCII.GetBytes("$value")
-        $b.Add([byte]$tag); $b.Add([byte]($nb.Length -shr 8)); $b.Add([byte]($nb.Length -band 255)); if ($nb.Length) { $b.AddRange([byte[]]$nb) }
-        $b.Add([byte]($vb.Length -shr 8)); $b.Add([byte]($vb.Length -band 255)); if ($vb.Length) { $b.AddRange([byte[]]$vb) }
+function Get-RouterTables {
+    # A router's own addresses, ARP table and routes, read only. Returns $null when it is not a router.
+    param([string]$Ip, [string]$Community, [bool]$Force = $false)
+    $fw = Get-SnmpValues $Ip $Community @('1.3.6.1.2.1.4.1.0') 1500
+    $isRouter = ($fw -and "$($fw['1.3.6.1.2.1.4.1.0'])" -eq '1')
+    if (-not $isRouter -and -not $Force) { return $null }
+    $addr = @(ConvertFrom-AddrRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.20.1.2' 100 1500) (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.20.1.3' 100 1500))
+    $arp = @(ConvertFrom-ArpRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.22.1.2' 2000 1500))
+    if (-not $arp.Count) { $arp = @(ConvertFrom-ArpRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.35.1.4' 2000 1500)) }
+    $routes = @(ConvertFrom-RouteRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.24.4.1.4' 300 1500))
+    if (-not $routes.Count) { $routes = @(ConvertFrom-RouteRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.21.1.7' 300 1500) (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.21.1.11' 300 1500) -Legacy) }
+    if (-not $isRouter -and -not $addr.Count -and -not $arp.Count -and -not $routes.Count) { return $null }
+    return [ordered]@{
+        Forwarding = $isRouter
+        Addresses = $addr
+        WanAddresses = @($addr | Where-Object { $_.Class -eq 'Public' } | ForEach-Object { $_.IP })
+        Arp = $arp
+        Routes = $routes
+        DefaultRoute = @($routes | Where-Object { $_.Destination -eq '0.0.0.0' -and $_.Prefix -eq 0 } | ForEach-Object { $_.NextHop } | Select-Object -First 1)
     }
-    & $attr 0x47 'attributes-charset' 'utf-8'
-    & $attr 0x48 'attributes-natural-language' 'en'
-    & $attr 0x45 'printer-uri' $Uri
-    $first = $true
-    foreach ($a in $Attributes) { & $attr 0x44 $(if ($first) { 'requested-attributes' } else { '' }) $a; $first = $false }
-    $b.Add(3)
-    return , $b.ToArray()
-}
-function ConvertFrom-IppResponse {
-    # Attribute name to value (or values) from an IPP reply; '_status' is the IPP status code.
-    param([byte[]]$B)
-    $out = [ordered]@{}
-    if (-not $B -or $B.Length -lt 9) { return $out }
-    $out['_status'] = ([int]$B[2] * 256) + [int]$B[3]
-    $p = 8; $last = $null
-    while ($p -lt $B.Length) {
-        $tag = [int]$B[$p]; $p++
-        if ($tag -eq 3) { break }
-        if ($tag -lt 0x10) { continue }
-        if ($p + 2 -gt $B.Length) { break }
-        $nl = ([int]$B[$p] * 256) + [int]$B[$p + 1]; $p += 2
-        if ($p + $nl + 2 -gt $B.Length) { break }
-        $name = if ($nl) { [Text.Encoding]::ASCII.GetString($B, $p, $nl) } else { $last }
-        $p += $nl
-        $vl = ([int]$B[$p] * 256) + [int]$B[$p + 1]; $p += 2
-        if ($p + $vl -gt $B.Length) { break }
-        $val = $null
-        if (($tag -eq 0x21 -or $tag -eq 0x23) -and $vl -eq 4) { $val = ([int]$B[$p] * 16777216) + ([int]$B[$p + 1] * 65536) + ([int]$B[$p + 2] * 256) + [int]$B[$p + 3] }
-        elseif ($tag -eq 0x22 -and $vl -ge 1) { $val = [bool]$B[$p] }
-        elseif ($tag -ge 0x30) { $val = ConvertTo-AsciiText $B $p $vl }
-        $p += $vl; $last = $name
-        if ($name -and $null -ne $val -and "$val" -ne '') { if ($out.Contains($name)) { $out[$name] = @($out[$name]) + $val } else { $out[$name] = $val } }
-    }
-    return $out
-}
-
-function Get-StunMappings {
-    # Asks STUN servers, from one socket, which public address and port they see. The same port from
-    # two servers means the NAT keeps one mapping per socket (good for calls); different ports means it does not.
-    param($Servers, [int]$TimeoutMs = 1500)
-    $out = @()
-    $u = New-Object Net.Sockets.UdpClient
-    try {
-        $u.Client.Bind((New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0)))
-        $u.Client.ReceiveTimeout = $TimeoutMs
-        try { [void]$u.Client.IOControl(-1744830452, [byte[]](0, 0, 0, 0), $null) } catch { }
-        foreach ($s in @($Servers)) {
-            $row = [ordered]@{ Server = "$($s[0]):$($s[1])"; Answered = $false; MappedIp = $null; MappedPort = $null; LocalPort = $u.Client.LocalEndPoint.Port; Ms = $null }
-            try {
-                $addr = @([Net.Dns]::GetHostAddresses([string]$s[0]) | Where-Object { $_.AddressFamily -eq 'InterNetwork' })[0]
-                $req = New-Object byte[] 20; $req[1] = 1; $req[4] = 0x21; $req[5] = 0x12; $req[6] = 0xA4; $req[7] = 0x42
-                $tx = [Guid]::NewGuid().ToByteArray(); [Array]::Copy($tx, 0, $req, 8, 12)
-                $sw = [Diagnostics.Stopwatch]::StartNew()
-                [void]$u.Send($req, 20, (New-Object Net.IPEndPoint($addr, [int]$s[1])))
-                $ep = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0)
-                $r = $u.Receive([ref]$ep)
-                $row['Ms'] = [math]::Round($sw.Elapsed.TotalMilliseconds, 1); $row['Answered'] = $true
-                $p = 20
-                while ($p + 4 -le $r.Length) {
-                    $t = ([int]$r[$p] * 256) + [int]$r[$p + 1]; $l = ([int]$r[$p + 2] * 256) + [int]$r[$p + 3]
-                    if ($t -eq 0x0020 -and $l -ge 8) { $row['MappedPort'] = ((([int]$r[$p + 6] * 256) + [int]$r[$p + 7]) -bxor 0x2112); $row['MappedIp'] = '{0}.{1}.{2}.{3}' -f ([int]$r[$p + 8] -bxor 0x21), ([int]$r[$p + 9] -bxor 0x12), ([int]$r[$p + 10] -bxor 0xA4), ([int]$r[$p + 11] -bxor 0x42) }
-                    elseif ($t -eq 0x0001 -and $l -ge 8 -and -not $row['MappedIp']) { $row['MappedPort'] = ([int]$r[$p + 6] * 256) + [int]$r[$p + 7]; $row['MappedIp'] = ConvertTo-IpText $r ($p + 8) }
-                    $p += 4 + $l + ((4 - ($l % 4)) % 4)
-                }
-            } catch { }
-            $out += [pscustomobject]$row
-        }
-    } catch { } finally { try { $u.Close() } catch { } }
-    return $out
-}
-
-function Measure-VoicePath {
-    # A call sends a packet every 20 ms. This pings at that pace and reports what a call would feel:
-    # loss, bursts of loss, jitter and an estimated call-quality score (MOS, 1 to 4.4).
-    param([string]$Target, [int]$Seconds = 20, [int]$PerSecond = 50)
-    $n = $Seconds * $PerSecond; $interval = 1000.0 / $PerSecond
-    $pool = @(); for ($i = 0; $i -lt 40; $i++) { $pool += New-Object Net.NetworkInformation.Ping }
-    $tasks = New-Object object[] $n
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    for ($i = 0; $i -lt $n; $i++) {
-        while ($sw.Elapsed.TotalMilliseconds -lt $i * $interval) { [Threading.Thread]::SpinWait(300) }
-        try { $tasks[$i] = $pool[$i % 40].SendPingAsync($Target, 400) } catch { $tasks[$i] = $null }
-    }
-    Start-Sleep -Milliseconds 600
-    $rtt = New-Object 'Collections.Generic.List[double]'; $lost = 0; $burst = 0; $maxBurst = 0; $jsum = 0.0; $jn = 0; $prev = $null
-    foreach ($t in $tasks) {
-        $ok = $false
-        try { if ($t -and "$($t.Status)" -eq 'RanToCompletion' -and "$($t.Result.Status)" -eq 'Success') { $ok = $true } } catch { }
-        if ($ok) { $v = [double]$t.Result.RoundtripTime; $rtt.Add($v); if ($null -ne $prev) { $jsum += [math]::Abs($v - $prev); $jn++ }; $prev = $v; $burst = 0 }
-        else { $lost++; $burst++; if ($burst -gt $maxBurst) { $maxBurst = $burst } }
-    }
-    foreach ($p in $pool) { try { $p.Dispose() } catch { } }
-    $r = [ordered]@{ Target = $Target; Sent = $n; Received = $rtt.Count; LossPct = [math]::Round(100.0 * $lost / $n, 2); LongestLossBurst = $maxBurst; AvgMs = $null; MaxMs = $null; P99Ms = $null; JitterMs = $null; Mos = $null; Rating = $null; PacketsPerSecond = $PerSecond; Seconds = $Seconds }
-    if ($rtt.Count) {
-        $sorted = @($rtt | Sort-Object)
-        $avg = ($rtt | Measure-Object -Average).Average; $jit = if ($jn) { $jsum / $jn } else { 0 }
-        $r['AvgMs'] = [math]::Round($avg, 1); $r['MaxMs'] = $sorted[-1]; $r['P99Ms'] = $sorted[[int][math]::Floor(($sorted.Count - 1) * 0.99)]; $r['JitterMs'] = [math]::Round($jit, 2)
-        # Simplified E-model: one-way delay is half the round trip, jitter counts double, each 1% loss costs 2.5.
-        $eff = ($avg / 2) + (2 * $jit) + 10
-        $rf = if ($eff -lt 160) { 93.2 - ($eff / 40) } else { 93.2 - (($eff - 120) / 10) }
-        $rf = [math]::Max(0.0, [double]($rf - (2.5 * $r['LossPct'])))
-        $mos = 1 + (0.035 * $rf) + (0.000007 * $rf * ($rf - 60) * (100 - $rf))
-        $r['Mos'] = [math]::Round([math]::Min(4.4, [math]::Max(1.0, [double]$mos)), 2)
-        $r['Rating'] = if ($r['Mos'] -ge 4.0) { 'good' } elseif ($r['Mos'] -ge 3.6) { 'acceptable' } else { 'poor' }
-    }
-    return $r
-}
-
-# ---------------------------------------------------------------------
-# Other subnets: which ones this PC knows it can reach, which ones to sweep, and the sweep itself.
-# Only subnets listed in CONFIG or chosen at the prompt are swept; inferred ones are only reported.
-# ---------------------------------------------------------------------
-function ConvertTo-IpNumber { param([string]$Ip) $o = "$Ip".Split('.'); return ([int64]$o[0] -shl 24) + ([int64]$o[1] -shl 16) + ([int64]$o[2] -shl 8) + [int64]$o[3] }
-function ConvertFrom-IpNumber { param([int64]$N) return '{0}.{1}.{2}.{3}' -f (($N -shr 24) -band 255), (($N -shr 16) -band 255), (($N -shr 8) -band 255), ($N -band 255) }
-
-function ConvertTo-NetRange {
-    # Network number and broadcast number of $Ip/$Prefix (any prefix).
-    param([string]$Ip, [int]$Prefix)
-    $maskInt = ([int64]4294967295 -shl (32 - $Prefix)) -band [int64]4294967295
-    $net = (ConvertTo-IpNumber $Ip) -band $maskInt
-    return [pscustomobject]@{ NetInt = $net; End = $net + ([int64]1 -shl (32 - $Prefix)) - 1; Prefix = $Prefix }
 }
 
 function ConvertTo-SubnetSpec {
@@ -2073,280 +2219,6 @@ function Invoke-RemoteSweep {
 }
 
 # ---------------------------------------------------------------------
-# Router and UPS tables over SNMP (read only, same community as the rest of the SNMP step).
-# The parsers take the rows Invoke-SnmpWalk returns (Index = the OID part after the column).
-# ---------------------------------------------------------------------
-function ConvertFrom-SnmpMac {
-    # A MAC from an SNMP octet string; $null unless it is six bytes that are not all zero.
-    param($Value)
-    $v = "$Value".Trim().ToUpper() -replace ':', '-'
-    if ($v -notmatch '^([0-9A-F]{2}-){5}[0-9A-F]{2}$' -or $v -eq '00-00-00-00-00-00' -or $v -eq 'FF-FF-FF-FF-FF-FF') { return $null }
-    return $v
-}
-
-function ConvertFrom-ArpRows {
-    # ipNetToMediaPhysAddress (1.3.6.1.2.1.4.22.1.2, index ifIndex.a.b.c.d) or ipNetToPhysicalPhysAddress
-    # (1.3.6.1.2.1.4.35.1.4, index ifIndex.1.4.a.b.c.d for IPv4) -> IP, Mac, IfIndex.
-    param($Rows)
-    $out = @()
-    foreach ($r in @($Rows)) {
-        if (-not $r) { continue }
-        $p = @("$($r.Index)" -split '\.')
-        $ip = $null
-        if ($p.Count -eq 5) { $ip = ($p[1..4]) -join '.' }
-        elseif ($p.Count -eq 7 -and $p[1] -eq '1' -and $p[2] -eq '4') { $ip = ($p[3..6]) -join '.' }
-        $mac = ConvertFrom-SnmpMac $r.Value
-        if ($ip -and $mac) { $out += [pscustomobject]@{ IP = $ip; Mac = $mac; IfIndex = [int]$p[0] } }
-    }
-    return $out
-}
-
-function ConvertFrom-AddrRows {
-    # ipAdEntIfIndex (1.3.6.1.2.1.4.20.1.2) and ipAdEntNetMask (1.3.6.1.2.1.4.20.1.3), both indexed by the
-    # address -> IP, Mask, Prefix, IfIndex, Class. Loopback addresses are left out.
-    param($IfRows, $MaskRows)
-    $masks = @{}; foreach ($m in @($MaskRows)) { if ($m) { $masks["$($m.Index)"] = "$($m.Value)" } }
-    $out = @()
-    foreach ($r in @($IfRows)) {
-        if (-not $r -or -not (Test-IPv4 "$($r.Index)") -or "$($r.Index)" -like '127.*') { continue }
-        $mk = $masks["$($r.Index)"]; $pre = $null
-        if (Test-IPv4 $mk) { $pre = 0; $mi = ConvertTo-IpNumber $mk; for ($bit = 31; $bit -ge 0; $bit--) { if (($mi -shr $bit) -band 1) { $pre++ } else { break } } }
-        $out += [pscustomobject]@{ IP = "$($r.Index)"; Mask = $mk; Prefix = $pre; IfIndex = [int]$r.Value; Class = (Get-IpClass "$($r.Index)") }
-    }
-    return $out
-}
-
-function ConvertFrom-RouteRows {
-    # ipCidrRouteNextHop (1.3.6.1.2.1.4.24.4.1.4, index dest.mask.tos.nexthop) -> Destination, Prefix, NextHop.
-    # Or, with -Legacy, ipRouteNextHop (1.3.6.1.2.1.4.21.1.7, index dest) plus ipRouteMask rows.
-    param($Rows, $MaskRows = @(), [switch]$Legacy)
-    $toPrefix = { param($mk) if (-not (Test-IPv4 $mk)) { return $null }; $n = 0; $mi = ConvertTo-IpNumber $mk; for ($bit = 31; $bit -ge 0; $bit--) { if (($mi -shr $bit) -band 1) { $n++ } else { break } }; $n }
-    $out = @()
-    if ($Legacy) {
-        $masks = @{}; foreach ($m in @($MaskRows)) { if ($m) { $masks["$($m.Index)"] = "$($m.Value)" } }
-        foreach ($r in @($Rows)) { if ($r -and (Test-IPv4 "$($r.Index)")) { $out += [pscustomobject]@{ Destination = "$($r.Index)"; Prefix = (& $toPrefix $masks["$($r.Index)"]); NextHop = "$($r.Value)" } } }
-    } else {
-        foreach ($r in @($Rows)) {
-            $p = @("$($r.Index)" -split '\.')
-            if ($p.Count -ne 13) { continue }
-            $out += [pscustomobject]@{ Destination = ($p[0..3] -join '.'); Prefix = (& $toPrefix ($p[4..7] -join '.')); NextHop = "$($r.Value)" }
-        }
-    }
-    return @($out | Sort-Object { ConvertTo-IpNumber $_.Destination }, Prefix)
-}
-
-function Get-UpsOidMap {
-    # The UPS values read over SNMP: RFC 1628 UPS-MIB, or with -Apc the APC PowerNet-MIB for network
-    # cards that do not answer UPS-MIB.
-    param([switch]$Apc)
-    if ($Apc) {
-        return [ordered]@{
-            Model = '1.3.6.1.4.1.318.1.1.1.1.1.1.0'; BatteryStatus = '1.3.6.1.4.1.318.1.1.1.2.1.1.0'; ChargePct = '1.3.6.1.4.1.318.1.1.1.2.2.1.0'
-            RuntimeTicks = '1.3.6.1.4.1.318.1.1.1.2.2.3.0'; ReplaceBattery = '1.3.6.1.4.1.318.1.1.1.2.2.4.0'; OutputStatus = '1.3.6.1.4.1.318.1.1.1.4.1.1.0'; LoadPct = '1.3.6.1.4.1.318.1.1.1.4.2.3.0'
-        }
-    }
-    return [ordered]@{
-        Manufacturer = '1.3.6.1.2.1.33.1.1.1.0'; Model = '1.3.6.1.2.1.33.1.1.2.0'; BatteryStatus = '1.3.6.1.2.1.33.1.2.1.0'
-        MinutesRemaining = '1.3.6.1.2.1.33.1.2.3.0'; ChargePct = '1.3.6.1.2.1.33.1.2.4.0'; OutputSource = '1.3.6.1.2.1.33.1.4.1.0'; LoadPct = '1.3.6.1.2.1.33.1.4.4.1.5.1'
-    }
-}
-
-function ConvertTo-UpsStatus {
-    # Values read with $UpsOids (-Standard) or $ApcUpsOids (-Apc) -> one plain UPS record, or $null.
-    param($Standard, $Apc)
-    $UpsOids = Get-UpsOidMap; $ApcUpsOids = Get-UpsOidMap -Apc
-    $num = { param($v) if ($null -eq $v -or "$v" -eq '') { return $null }; try { return [double]$v } catch { return $null } }
-    if ($Standard -and ($Standard[$UpsOids.Model] -or $Standard[$UpsOids.BatteryStatus])) {
-        $bs = & $num $Standard[$UpsOids.BatteryStatus]; $src = & $num $Standard[$UpsOids.OutputSource]
-        return [pscustomobject]@{
-            Source = 'UPS-MIB'; Manufacturer = "$($Standard[$UpsOids.Manufacturer])".Trim(); Model = "$($Standard[$UpsOids.Model])".Trim()
-            Battery = $(switch ($bs) { 2 { 'normal' } 3 { 'low' } 4 { 'depleted' } default { 'unknown' } })
-            OnBattery = ($src -eq 5); ChargePct = (& $num $Standard[$UpsOids.ChargePct]); MinutesRemaining = (& $num $Standard[$UpsOids.MinutesRemaining])
-            LoadPct = (& $num $Standard[$UpsOids.LoadPct]); ReplaceBattery = $null
-        }
-    }
-    if ($Apc -and ($Apc[$ApcUpsOids.Model] -or $Apc[$ApcUpsOids.BatteryStatus])) {
-        $bs = & $num $Apc[$ApcUpsOids.BatteryStatus]; $os = & $num $Apc[$ApcUpsOids.OutputStatus]; $rt = & $num $Apc[$ApcUpsOids.RuntimeTicks]
-        return [pscustomobject]@{
-            Source = 'APC'; Manufacturer = 'APC'; Model = "$($Apc[$ApcUpsOids.Model])".Trim()
-            Battery = $(switch ($bs) { 2 { 'normal' } 3 { 'low' } 4 { 'in fault' } default { 'unknown' } })
-            OnBattery = ($os -eq 3); ChargePct = (& $num $Apc[$ApcUpsOids.ChargePct]); MinutesRemaining = $(if ($null -ne $rt) { [math]::Round($rt / 6000, 0) } else { $null })
-            LoadPct = (& $num $Apc[$ApcUpsOids.LoadPct]); ReplaceBattery = ((& $num $Apc[$ApcUpsOids.ReplaceBattery]) -eq 2)
-        }
-    }
-    return $null
-}
-
-function Get-RouterTables {
-    # A router's own addresses, ARP table and routes, read only. Returns $null when it is not a router.
-    param([string]$Ip, [string]$Community, [bool]$Force = $false)
-    $fw = Get-SnmpValues $Ip $Community @('1.3.6.1.2.1.4.1.0') 1500
-    $isRouter = ($fw -and "$($fw['1.3.6.1.2.1.4.1.0'])" -eq '1')
-    if (-not $isRouter -and -not $Force) { return $null }
-    $addr = @(ConvertFrom-AddrRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.20.1.2' 100 1500) (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.20.1.3' 100 1500))
-    $arp = @(ConvertFrom-ArpRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.22.1.2' 2000 1500))
-    if (-not $arp.Count) { $arp = @(ConvertFrom-ArpRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.35.1.4' 2000 1500)) }
-    $routes = @(ConvertFrom-RouteRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.24.4.1.4' 300 1500))
-    if (-not $routes.Count) { $routes = @(ConvertFrom-RouteRows (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.21.1.7' 300 1500) (Invoke-SnmpWalk $Ip $Community '1.3.6.1.2.1.4.21.1.11' 300 1500) -Legacy) }
-    if (-not $isRouter -and -not $addr.Count -and -not $arp.Count -and -not $routes.Count) { return $null }
-    return [ordered]@{
-        Forwarding = $isRouter
-        Addresses = $addr
-        WanAddresses = @($addr | Where-Object { $_.Class -eq 'Public' } | ForEach-Object { $_.IP })
-        Arp = $arp
-        Routes = $routes
-        DefaultRoute = @($routes | Where-Object { $_.Destination -eq '0.0.0.0' -and $_.Prefix -eq 0 } | ForEach-Object { $_.NextHop } | Select-Object -First 1)
-    }
-}
-
-# ---------------------------------------------------------------------
-# Network risks, read from what discovery already collected. Nothing extra is sent to any device.
-# Returns Severity, Category, Message rows for Add-Flag.
-# ---------------------------------------------------------------------
-function Get-NetworkRiskFlags {
-    param($R, [datetime]$Now = (Get-Date))
-    $out = New-Object Collections.Generic.List[object]
-    $flag = { param($sev, $msg) $out.Add([pscustomobject]@{ Severity = $sev; Category = 'Network risk'; Message = $msg }) }
-    $label = { param($d) $n = "$(Get-Prop $d 'Name')"; if ($n) { '{0} ({1})' -f (Get-Prop $d 'IP'), $n.Split('.')[0] } else { "$(Get-Prop $d 'IP')" } }
-    $list = { param($items) $a = @($items); $t = (@($a | Select-Object -First 6 | ForEach-Object { & $label $_ })) -join ', '; if ($a.Count -gt 6) { $t += " and $($a.Count - 6) more" }; $t }
-    $devs = @(@(Get-Prop $R 'Identify', 'Devices') | Where-Object { $_ })
-    $ports = { param($d) @(@(Get-Prop $d 'OpenPorts') | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ }) }
-
-    $smb1 = @($devs | Where-Object { Get-Prop $_ 'Smb', 'Smb1Enabled' })
-    if ($smb1.Count) { & $flag 'High' "$($smb1.Count) device(s) still accept SMBv1, the file-sharing version WannaCry spread over: $(& $list $smb1)" }
-    $telnet = @($devs | Where-Object { (& $ports $_) -contains 23 })
-    if ($telnet.Count) { & $flag 'Medium' "$($telnet.Count) device(s) accept Telnet, where logins cross the network in clear text: $(& $list $telnet)" }
-    $ftp = @($devs | Where-Object { (& $ports $_) -contains 21 })
-    if ($ftp.Count) { & $flag 'Low' "$($ftp.Count) device(s) run FTP, where logins cross the network in clear text: $(& $list $ftp)" }
-
-    # A web page only over plain HTTP: whatever is typed into its login crosses the network unencrypted.
-    $httpOnly = @($devs | Where-Object {
-        $w = @(@(Get-Prop $_ 'Web') | Where-Object { $_ -and (Get-Prop $_ 'Status') })
-        @($w | Where-Object { "$(Get-Prop $_ 'Url')" -like 'http://*' }).Count -and -not @($w | Where-Object { "$(Get-Prop $_ 'Url')" -like 'https://*' }).Count
-    })
-    if ($httpOnly.Count) { & $flag 'Low' "$($httpOnly.Count) device(s) offer their web page only over plain HTTP, so a login there is sent unencrypted: $(& $list $httpOnly)" }
-
-    $expired = @($devs | Where-Object {
-        @(@(Get-Prop $_ 'Web') | Where-Object { $na = "$(Get-Prop $_ 'CertNotAfter')"; $na -and ([datetime]$na) -lt $Now }).Count
-    })
-    if ($expired.Count) { & $flag 'Low' "$($expired.Count) device(s) present an expired HTTPS certificate, which teaches people to click through certificate warnings: $(& $list $expired)" }
-
-    # Remote Desktop and file sharing reachable from an office port across routing
-    $remote = @($devs | Where-Object { Get-Prop $_ 'Remote' })
-    $rdp = @($remote | Where-Object { (& $ports $_) -contains 3389 })
-    if ($rdp.Count) { & $flag 'Medium' "From an ordinary office port, Remote Desktop answers on $($rdp.Count) device(s) on other subnets, with nothing filtering in between: $(& $list $rdp)" }
-    $smb = @($remote | Where-Object { (& $ports $_) -contains 445 })
-    if ($smb.Count) { & $flag 'Medium' "From an ordinary office port, file sharing answers on $($smb.Count) device(s) on other subnets, the path ransomware spreads along: $(& $list $smb)" }
-
-    $snmpN = Get-Prop $R 'Snmp', 'Answered'
-    if ($snmpN -and "$(Get-Prop $R 'Snmp', 'Community')" -eq 'public') {
-        & $flag 'Medium' "$snmpN device(s) answer SNMP with the default community 'public': anyone on the network can read their configuration, ARP tables and routes"
-    }
-
-    # SSH servers from before 2017 (OpenSSH under 7.4, Dropbear before 2017)
-    $oldSsh = @($devs | Where-Object {
-        $b = "$(Get-Prop $_ 'SshBanner')"
-        ($b -match 'OpenSSH_(\d+)\.(\d+)' -and ([int]$matches[1] -lt 7 -or ([int]$matches[1] -eq 7 -and [int]$matches[2] -lt 4))) -or ($b -match 'dropbear_(\d{4})' -and [int]$matches[1] -lt 2017)
-    })
-    if ($oldSsh.Count) { & $flag 'Low' "$($oldSsh.Count) device(s) run an SSH server from before 2017, a sign of firmware that has not been updated in years: $(& $list $oldSsh)" }
-
-    # Windows that no longer gets security updates, named by the file-sharing handshake
-    $hosts = @(@(Get-Prop $R 'WindowsHosts', 'Hosts') | Where-Object { $_ })
-    $dead = @($hosts | Where-Object { "$(Get-Prop $_ 'Os')" -match '^Windows (7|8)\b' })
-    if ($dead.Count) { & $flag 'High' "$($dead.Count) machine(s) on the network run Windows that no longer gets security updates (Windows 7 or 8, Server 2008 R2 or 2012): $((@($dead | Select-Object -First 6 | ForEach-Object { '{0} ({1}, {2})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'ComputerName'), (Get-Prop $_ 'Os') })) -join ', ')" }
-    $checks = @(@(Get-Prop $R 'LeadChecks', 'Checks') | Where-Object { $_ })
-    $oldEsx = @($checks | Where-Object { "$(Get-Prop $_ 'Kind')" -eq 'Hypervisor' -and "$(Get-Prop $_ 'Version')" -match '^(5|6|7)\.' })
-    if ($oldEsx.Count) { & $flag 'High' "$($oldEsx.Count) VMware host(s) run a version out of general support (6.x ended 2022, 7.0 in October 2025): $((@($oldEsx | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'What') })) -join ', ')" }
-    $bmc = @($checks | Where-Object { "$(Get-Prop $_ 'Kind')" -eq 'ServerManagement' })
-    if ($bmc.Count) { & $flag 'Medium' "$($bmc.Count) server management controller(s) (iDRAC, iLO and similar) can be reached from an ordinary office port; they belong on a management network: $((@($bmc | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'What') })) -join ', ')" }
-    $w10 = @($hosts | Where-Object { "$(Get-Prop $_ 'Os')" -like 'Windows 10 (*' })
-    if ($w10.Count) { & $flag 'Medium' "$($w10.Count) machine(s) on the network run Windows 10, out of support since October 2025 unless they are LTSC or covered by Extended Security Updates: $((@($w10 | Select-Object -First 6 | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'ComputerName') })) -join ', ')" }
-
-    return $out.ToArray()
-}
-
-# ---------------------------------------------------------------------
-# IPv6: is it offered on this network, and does it reach the internet? Addresses are kept as /64
-# prefixes only: the rest of an IPv6 address can identify the machine.
-# ---------------------------------------------------------------------
-function ConvertTo-Ipv6Prefix64 {
-    # The /64 network of a global IPv6 address, as 'xxxx:xxxx:xxxx:xxxx::/64'; $null for anything else.
-    param([string]$Address)
-    $a = "$Address".Split('%')[0]
-    $ip = $null
-    if (-not [Net.IPAddress]::TryParse($a, [ref]$ip) -or $ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6) { return $null }
-    $b = $ip.GetAddressBytes()
-    $groups = for ($i = 0; $i -lt 8; $i += 2) { '{0:x}' -f (([int]$b[$i] -shl 8) + [int]$b[$i + 1]) }
-    return (($groups -join ':') + '::/64')
-}
-
-function Get-Ipv6Kind {
-    # Global (2000::/3), unique local (fc00::/7), link-local (fe80::/10) or other.
-    param([string]$Address)
-    $a = "$Address".Split('%')[0].ToLower()
-    if ($a -match '^fe[89ab][0-9a-f]:') { return 'LinkLocal' }
-    if ($a -match '^f[cd][0-9a-f]{2}:') { return 'UniqueLocal' }
-    if ($a -match '^[23][0-9a-f]{3}:') { return 'Global' }
-    return 'Other'
-}
-
-function Get-Ipv6Verdict {
-    # Not offered, Local only, Working or Broken, from what the PC holds and whether IPv6 reached the internet.
-    param($State)
-    $global = @(@(Get-Prop $State 'GlobalPrefixes') | Where-Object { $_ }).Count
-    $ula = [bool](Get-Prop $State 'UniqueLocal')
-    $route = [bool](Get-Prop $State 'DefaultRoute')
-    $reached = [bool](Get-Prop $State 'Egress', 'Reached')
-    if ($reached) { return 'Working' }
-    if ($global -or $route) { return 'Broken' }
-    if ($ula) { return 'Local only' }
-    return 'Not offered'
-}
-
-function Measure-Ipv6Ping {
-    # $Count pings to an IPv6 address, 100 ms apart: Sent, Received, LossPct, AvgMs.
-    param([string]$Address, [int]$Count = 10)
-    $times = @()
-    try {
-        $pg = New-Object Net.NetworkInformation.Ping
-        for ($k = 0; $k -lt $Count; $k++) { try { $rp = $pg.Send([Net.IPAddress]::Parse($Address), 1000); if ($rp.Status -eq 'Success') { $times += [int]$rp.RoundtripTime } } catch { }; Start-Sleep -Milliseconds 100 }
-    } catch { }
-    return [ordered]@{ Sent = $Count; Received = $times.Count; LossPct = [math]::Round(100 * ($Count - $times.Count) / [math]::Max(1, $Count), 1); AvgMs = $(if ($times.Count) { [math]::Round(($times | Measure-Object -Average).Average, 1) } else { $null }) }
-}
-
-function Get-Ipv6State {
-    # What this PC holds (addresses on adapters that are up, a default route, IPv6 DNS servers) and a test:
-    # Cloudflare's trace over IPv6, ten pings and an AAAA lookup.
-    $s = [ordered]@{ GlobalPrefixes = @(); TemporaryAddresses = $false; UniqueLocal = $false; DefaultRoute = $false; RouterIsLinkLocal = $null; DnsServers = @(); Egress = $null; Ping = $null; AaaaLookup = $null; Status = $null }
-    $up = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $_.ifIndex })
-    $addrs = @(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object { $up -contains $_.InterfaceIndex -and "$($_.AddressState)" -eq 'Preferred' })
-    $glob = @($addrs | Where-Object { (Get-Ipv6Kind $_.IPAddress) -eq 'Global' })
-    $s.GlobalPrefixes = @($glob | ForEach-Object { ConvertTo-Ipv6Prefix64 $_.IPAddress } | Where-Object { $_ } | Sort-Object -Unique)
-    $s.TemporaryAddresses = [bool]@($glob | Where-Object { "$($_.SuffixOrigin)" -eq 'Random' }).Count
-    $s.UniqueLocal = [bool]@($addrs | Where-Object { (Get-Ipv6Kind $_.IPAddress) -eq 'UniqueLocal' }).Count
-    $rt = @(Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Where-Object { $up -contains $_.InterfaceIndex })
-    $s.DefaultRoute = [bool]$rt.Count
-    if ($rt.Count) { $s.RouterIsLinkLocal = ((Get-Ipv6Kind "$($rt[0].NextHop)") -eq 'LinkLocal') }
-    $s.DnsServers = @(Get-DnsClientServerAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object { $up -contains $_.InterfaceIndex } | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ -and $_ -notlike 'fec0:*' } | Sort-Object -Unique)
-    if ($s.GlobalPrefixes.Count -or $s.DefaultRoute) {
-        $eg = [ordered]@{ Reached = $false; Prefix = $null; SameAsPc = $null; Colo = $null; Error = $null }
-        try {
-            $t = Invoke-WebRequest -Uri 'https://[2606:4700:4700::1111]/cdn-cgi/trace' -UseBasicParsing -TimeoutSec 8
-            $h = @{}; foreach ($l in ($t.Content -split "`n")) { if ($l -match '^([a-z_]+)=(.*)$') { $h[$matches[1]] = $matches[2].Trim() } }
-            if ($h['ip'] -and (Get-Ipv6Kind $h['ip']) -eq 'Global') {
-                $eg.Reached = $true; $eg.Prefix = ConvertTo-Ipv6Prefix64 $h['ip']; $eg.Colo = $h['colo']
-                $eg.SameAsPc = ($s.GlobalPrefixes -contains $eg.Prefix)
-            }
-        } catch { $eg.Error = $_.Exception.Message }
-        $s.Egress = $eg
-        $s.Ping = Measure-Ipv6Ping '2606:4700:4700::1111' 10
-    }
-    try { $s.AaaaLookup = [bool]@(Resolve-DnsName -Name 'one.one.one.one' -Type AAAA -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'AAAA' }).Count } catch { $s.AaaaLookup = $false }
-    $s.Status = Get-Ipv6Verdict $s
-    return $s
-}
-
-# ---------------------------------------------------------------------
 # Leads: what one step found that another step should look at. Get-Leads reads the evidence so far and
 # returns Kind, Target, Why; the later steps (SNMP, the voice sample, reach across the tunnel, the
 # follow-up checks) take their targets from it instead of fixed lists.
@@ -2440,41 +2312,6 @@ function Get-FirewallChecks {
         }
     }
     return $null
-}
-
-function Invoke-HttpText {
-    # One HTTP(S) request with certificate checks off: Status, Server, Title, Body (first 64 KB), Error.
-    param([string]$Url, [string]$Method = 'GET', [string]$Body, [string]$ContentType = 'text/xml', [hashtable]$Headers = @{}, [int]$TimeoutMs = 5000)
-    $r = [ordered]@{ Url = $Url; Status = $null; Server = $null; Title = $null; Body = $null; Error = $null }
-    $oldCb = [Net.ServicePointManager]::ServerCertificateValidationCallback
-    [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-    try {
-        $req = [Net.HttpWebRequest]::Create($Url)
-        $req.Method = $Method; $req.Timeout = $TimeoutMs; $req.ReadWriteTimeout = $TimeoutMs; $req.AllowAutoRedirect = $true; $req.MaximumAutomaticRedirections = 3
-        $req.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        foreach ($k in $Headers.Keys) { $req.Headers[$k] = $Headers[$k] }
-        if ($Body) {
-            $bytes = [Text.Encoding]::UTF8.GetBytes($Body)
-            $req.ContentType = $ContentType; $req.ContentLength = $bytes.Length
-            $st = $req.GetRequestStream(); $st.Write($bytes, 0, $bytes.Length); $st.Close()
-        }
-        $resp = $null
-        try { $resp = $req.GetResponse() } catch [Net.WebException] { $resp = $_.Exception.Response; if (-not $resp) { $r.Error = $_.Exception.Message } }
-        if ($resp) {
-            $r.Status = [int]$resp.StatusCode; $r.Server = $resp.Headers['Server']
-            try {
-                $sr = New-Object IO.StreamReader($resp.GetResponseStream())
-                $buf = New-Object char[] 65536
-                $n = $sr.Read($buf, 0, $buf.Length)
-                $r.Body = New-Object string($buf, 0, [math]::Max(0, $n))
-                if ($r.Body -match '<title[^>]*>\s*([^<]{1,120})</title>') { $r.Title = $matches[1].Trim() }
-                $sr.Close()
-            } catch { }
-            $resp.Close()
-        }
-    } catch { $r.Error = $_.Exception.Message }
-    finally { [Net.ServicePointManager]::ServerCertificateValidationCallback = $oldCb }
-    return [pscustomobject]$r
 }
 
 function ConvertFrom-RedfishRoot {
@@ -2579,6 +2416,765 @@ function Get-AdSites {
         if (-not $r.Count) { throw "Active Directory did not answer: $(@($ps.Streams.Error) | Select-Object -First 1)" }
         return [ordered]@{ Forest = $r[0].Forest; CurrentSite = $r[0].CurrentSite; Sites = @($r[0].Sites) }
     } finally { $ps.Dispose() }
+}
+
+function Get-StunMappings {
+    # Asks STUN servers, from one socket, which public address and port they see. The same port from
+    # two servers means the NAT keeps one mapping per socket (good for calls); different ports means it does not.
+    param($Servers, [int]$TimeoutMs = 1500)
+    $out = @()
+    $u = New-Object Net.Sockets.UdpClient
+    try {
+        $u.Client.Bind((New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0)))
+        $u.Client.ReceiveTimeout = $TimeoutMs
+        try { [void]$u.Client.IOControl(-1744830452, [byte[]](0, 0, 0, 0), $null) } catch { }
+        foreach ($s in @($Servers)) {
+            $row = [ordered]@{ Server = "$($s[0]):$($s[1])"; Answered = $false; MappedIp = $null; MappedPort = $null; LocalPort = $u.Client.LocalEndPoint.Port; Ms = $null }
+            try {
+                $addr = @([Net.Dns]::GetHostAddresses([string]$s[0]) | Where-Object { $_.AddressFamily -eq 'InterNetwork' })[0]
+                $req = New-Object byte[] 20; $req[1] = 1; $req[4] = 0x21; $req[5] = 0x12; $req[6] = 0xA4; $req[7] = 0x42
+                $tx = [Guid]::NewGuid().ToByteArray(); [Array]::Copy($tx, 0, $req, 8, 12)
+                $sw = [Diagnostics.Stopwatch]::StartNew()
+                [void]$u.Send($req, 20, (New-Object Net.IPEndPoint($addr, [int]$s[1])))
+                $ep = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0)
+                $r = $u.Receive([ref]$ep)
+                $row['Ms'] = [math]::Round($sw.Elapsed.TotalMilliseconds, 1); $row['Answered'] = $true
+                $p = 20
+                while ($p + 4 -le $r.Length) {
+                    $t = ([int]$r[$p] * 256) + [int]$r[$p + 1]; $l = ([int]$r[$p + 2] * 256) + [int]$r[$p + 3]
+                    if ($t -eq 0x0020 -and $l -ge 8) { $row['MappedPort'] = ((([int]$r[$p + 6] * 256) + [int]$r[$p + 7]) -bxor 0x2112); $row['MappedIp'] = '{0}.{1}.{2}.{3}' -f ([int]$r[$p + 8] -bxor 0x21), ([int]$r[$p + 9] -bxor 0x12), ([int]$r[$p + 10] -bxor 0xA4), ([int]$r[$p + 11] -bxor 0x42) }
+                    elseif ($t -eq 0x0001 -and $l -ge 8 -and -not $row['MappedIp']) { $row['MappedPort'] = ([int]$r[$p + 6] * 256) + [int]$r[$p + 7]; $row['MappedIp'] = ConvertTo-IpText $r ($p + 8) }
+                    $p += 4 + $l + ((4 - ($l % 4)) % 4)
+                }
+            } catch { }
+            $out += [pscustomobject]$row
+        }
+    } catch { } finally { try { $u.Close() } catch { } }
+    return $out
+}
+
+function Measure-VoicePath {
+    # A call sends a packet every 20 ms. This pings at that pace and reports what a call would feel:
+    # loss, bursts of loss, jitter and an estimated call-quality score (MOS, 1 to 4.4).
+    param([string]$Target, [int]$Seconds = 20, [int]$PerSecond = 50)
+    $n = $Seconds * $PerSecond; $interval = 1000.0 / $PerSecond
+    $pool = @(); for ($i = 0; $i -lt 40; $i++) { $pool += New-Object Net.NetworkInformation.Ping }
+    $tasks = New-Object object[] $n
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    for ($i = 0; $i -lt $n; $i++) {
+        while ($sw.Elapsed.TotalMilliseconds -lt $i * $interval) { [Threading.Thread]::SpinWait(300) }
+        try { $tasks[$i] = $pool[$i % 40].SendPingAsync($Target, 400) } catch { $tasks[$i] = $null }
+    }
+    Start-Sleep -Milliseconds 600
+    $rtt = New-Object 'Collections.Generic.List[double]'; $lost = 0; $burst = 0; $maxBurst = 0; $jsum = 0.0; $jn = 0; $prev = $null
+    foreach ($t in $tasks) {
+        $ok = $false
+        try { if ($t -and "$($t.Status)" -eq 'RanToCompletion' -and "$($t.Result.Status)" -eq 'Success') { $ok = $true } } catch { }
+        if ($ok) { $v = [double]$t.Result.RoundtripTime; $rtt.Add($v); if ($null -ne $prev) { $jsum += [math]::Abs($v - $prev); $jn++ }; $prev = $v; $burst = 0 }
+        else { $lost++; $burst++; if ($burst -gt $maxBurst) { $maxBurst = $burst } }
+    }
+    foreach ($p in $pool) { try { $p.Dispose() } catch { } }
+    $r = [ordered]@{ Target = $Target; Sent = $n; Received = $rtt.Count; LossPct = [math]::Round(100.0 * $lost / $n, 2); LongestLossBurst = $maxBurst; AvgMs = $null; MaxMs = $null; P99Ms = $null; JitterMs = $null; Mos = $null; Rating = $null; PacketsPerSecond = $PerSecond; Seconds = $Seconds }
+    if ($rtt.Count) {
+        $sorted = @($rtt | Sort-Object)
+        $avg = ($rtt | Measure-Object -Average).Average; $jit = if ($jn) { $jsum / $jn } else { 0 }
+        $r['AvgMs'] = [math]::Round($avg, 1); $r['MaxMs'] = $sorted[-1]; $r['P99Ms'] = $sorted[[int][math]::Floor(($sorted.Count - 1) * 0.99)]; $r['JitterMs'] = [math]::Round($jit, 2)
+        # Simplified E-model: one-way delay is half the round trip, jitter counts double, each 1% loss costs 2.5.
+        $eff = ($avg / 2) + (2 * $jit) + 10
+        $rf = if ($eff -lt 160) { 93.2 - ($eff / 40) } else { 93.2 - (($eff - 120) / 10) }
+        $rf = [math]::Max(0.0, [double]($rf - (2.5 * $r['LossPct'])))
+        $mos = 1 + (0.035 * $rf) + (0.000007 * $rf * ($rf - 60) * (100 - $rf))
+        $r['Mos'] = [math]::Round([math]::Min(4.4, [math]::Max(1.0, [double]$mos)), 2)
+        $r['Rating'] = if ($r['Mos'] -ge 4.0) { 'good' } elseif ($r['Mos'] -ge 3.6) { 'acceptable' } else { 'poor' }
+    }
+    return $r
+}
+
+function Get-PathMtu {
+    param([string]$Target)
+    $probe = {
+        param($size)
+        if ($script:FullLanguage) {
+            # Don't-fragment ping of $size bytes; PacketTooBig is the "needs to be fragmented" answer in any language.
+            try {
+                $r = (New-Object Net.NetworkInformation.Ping).Send($Target, 1500, (New-Object byte[] $size), (New-Object Net.NetworkInformation.PingOptions(64, $true)))
+                if ("$($r.Status)" -eq 'Success') { return 'ok' }
+                if ("$($r.Status)" -eq 'PacketTooBig') { return 'frag' }
+            } catch { }
+            return 'none'
+        }
+        $o = Invoke-Native 'ping.exe' "-f -l $size -n 1 -w 1500 $Target" 6
+        if ($o -match 'needs to be fragmented|Packet needs') { return 'frag' }
+        if ($o -match '[=<]\s*\d+\s*(ms|\u043c\u0441)') { return 'ok' }
+        return 'none'
+    }
+    $first = & $probe 1472
+    if ($first -eq 'ok') { return [ordered]@{ Target = $Target; MtuBytes = 1500; Note = 'Full 1500' } }
+    if ((& $probe 576) -ne 'ok') { return [ordered]@{ Target = $Target; MtuBytes = $null; Note = 'ICMP blocked or no reply' } }
+    $lo = 548; $hi = 1472
+    while ($hi - $lo -gt 4) {
+        $mid = [int](($lo + $hi) / 2)
+        if ((& $probe $mid) -eq 'ok') { $lo = $mid } else { $hi = $mid }
+    }
+    return [ordered]@{ Target = $Target; MtuBytes = $lo + 28; Note = 'Reduced (tunnel/PPPoE overhead likely)' }
+}
+
+function ConvertFrom-Tracert {
+    param([string]$Text)
+    $hops = @()
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '^\s*(\d+)\s+(\*|<?\s*\d+\s*(?:ms|\u043c\u0441))\s+(\*|<?\s*\d+\s*(?:ms|\u043c\u0441))\s+(\*|<?\s*\d+\s*(?:ms|\u043c\u0441))\s+(.+?)\s*$') {
+            $hopNum = [int]$matches[1]
+            $rtts = @($matches[2], $matches[3], $matches[4]) | Where-Object { $_ -ne '*' } | ForEach-Object { [int](($_ -replace '[^\d]', '')) }
+            $addr = $matches[5].Trim()
+            $ip = if ($addr -match '(\d{1,3}(\.\d{1,3}){3})') { $matches[1] } else { $null }
+            $hops += [pscustomobject]@{
+                Hop = $hopNum; IP = $ip; Class = if ($ip) { Get-IpClass $ip } else { 'Timeout' }
+                AvgMs = if ($rtts.Count) { [math]::Round((($rtts | Measure-Object -Average).Average), 1) } else { $null }
+                Ptr = $null
+            }
+        }
+    }
+    return $hops
+}
+
+function Get-TraceAnalysis {
+    param($Hops)
+    $firstPublic = $Hops | Where-Object { $_.Class -eq 'Public' } | Select-Object -First 1
+    $firstCgnat = $Hops | Where-Object { $_.Class -eq 'CGNAT' } | Select-Object -First 1
+    $afterGw = @($Hops | Where-Object { $_.Hop -gt 1 -and (-not $firstPublic -or $_.Hop -lt $firstPublic.Hop) })
+    $privateAfterGw = @($afterGw | Where-Object { $_.Class -eq 'Private' })
+    # Private hops after a CGNAT hop are inside the carrier's network (Starlink, cellular, some cable ISPs).
+    $carrierHops = @($privateAfterGw | Where-Object { $firstCgnat -and $_.Hop -gt $firstCgnat.Hop })
+    $customerHops = @($privateAfterGw | Where-Object { -not ($firstCgnat -and $_.Hop -gt $firstCgnat.Hop) })
+    # A customer-side private hop with real latency looks like a tunnel/MPLS (or ISP-internal); low latency = double NAT.
+    $tunnelHops = @($customerHops | Where-Object { $_.AvgMs -ge 6 })
+    [ordered]@{
+        HopCount           = $Hops.Count
+        FirstPublicHop     = if ($firstPublic) { $firstPublic.Hop } else { $null }
+        FirstPublicIP      = if ($firstPublic) { $firstPublic.IP } else { $null }
+        FirstPublicMs      = if ($firstPublic) { $firstPublic.AvgMs } else { $null }
+        PrivateHopsAfterGw = @($customerHops | ForEach-Object { '{0}@{1}ms' -f $_.IP, $_.AvgMs })
+        CarrierPrivateHops = @($carrierHops | ForEach-Object { '{0}@{1}ms' -f $_.IP, $_.AvgMs })
+        CgnatHops          = @($Hops | Where-Object { $_.Class -eq 'CGNAT' }).Count
+        TunnelIndicator    = ($tunnelHops.Count -gt 0)
+        DoubleNatLikely    = ($customerHops.Count -gt 0 -and $tunnelHops.Count -eq 0)
+        ReachedTarget      = $false
+    }
+}
+
+function ConvertFrom-PingOutput {
+    param([string]$Text, [string]$Target, [int]$Sent)
+    $times = @()
+    # 'time=12ms' in English, 'Zeit=12ms', 'temps=12 ms', 'tiempo<1 ms', Cyrillic 'ms'... the number after = or <, followed by ms.
+    foreach ($m in [regex]::Matches($Text, '[=<]\s*(\d+)\s*(?:ms|\u043c\u0441)\b')) { $times += [int]$m.Groups[1].Value }
+    $recv = $times.Count
+    $sorted = @($times | Sort-Object)
+    $jit = $null
+    if ($times.Count -gt 1) { $d = 0; for ($k = 1; $k -lt $times.Count; $k++) { $d += [math]::Abs($times[$k] - $times[$k - 1]) }; $jit = [math]::Round($d / ($times.Count - 1), 1) }
+    [ordered]@{
+        Target  = $Target
+        Sent    = $Sent
+        Received = $recv
+        LossPct = if ($Sent) { [math]::Round(100 * ($Sent - $recv) / $Sent, 1) } else { $null }
+        MinMs   = if ($recv) { $sorted[0] } else { $null }
+        AvgMs   = if ($recv) { [math]::Round(($times | Measure-Object -Average).Average, 1) } else { $null }
+        P95Ms   = if ($recv) { $sorted[[math]::Min($sorted.Count - 1, [int][math]::Ceiling(0.95 * $sorted.Count) - 1)] } else { $null }
+        MaxMs   = if ($recv) { $sorted[-1] } else { $null }
+        JitterMs = $jit
+    }
+}
+
+function ConvertTo-TraceResult {
+    # Saves the raw tracert text next to the JSON and returns the parsed hops plus analysis.
+    param([string]$Target, [string]$Text)
+    Set-Content -LiteralPath (Join-Path $OutDir ('traceroute_{0}.txt' -f ($Target -replace '[^A-Za-z0-9\.-]', '_'))) -Value $Text
+    $hops = @(ConvertFrom-Tracert $Text)
+    $pub = 0
+    foreach ($h in $hops) {
+        if ($h.Class -eq 'Public' -and $pub -lt 2) { $h.Ptr = Resolve-Ptr $h.IP; $pub++ }
+    }
+    $an = Get-TraceAnalysis $hops
+    $destIp = if ($Text -match '\[(\d{1,3}(\.\d{1,3}){3})\]') { $matches[1] } elseif (Test-IPv4 $Target) { $Target } else { $null }
+    $lastHop = $hops | Where-Object { $_.IP } | Select-Object -Last 1
+    $an['ReachedTarget'] = [bool]($destIp -and $lastHop -and $lastHop.IP -eq $destIp)
+    $an['FirstPublicPtr'] = ($hops | Where-Object { $_.Ptr } | Select-Object -First 1).Ptr
+    return [pscustomobject]@{ Target = $Target; Analysis = $an; Hops = $hops }
+}
+
+function Get-ThroughputStats {
+    # Mbps over the run minus the TCP ramp-up (first 2 s or 20%), plus the best 1-second window.
+    param($Samples, [double]$T0)
+    if ($Samples.Count -lt 2) { return @(0, 0) }
+    $dur = $Samples[$Samples.Count - 1].T - $T0
+    $skip = $T0 + [math]::Min(2.0, $dur * 0.2)
+    $a = $Samples | Where-Object { $_.T -ge $skip } | Select-Object -First 1
+    $b = $Samples[$Samples.Count - 1]
+    if (-not $a -or $b.T - $a.T -lt 0.5) { $a = $Samples[0] }
+    $mbps = if ($b.T - $a.T -gt 0) { ($b.B - $a.B) * 8 / ($b.T - $a.T) / 1e6 } else { 0 }
+    $peak = 0
+    for ($x = 0; $x -lt $Samples.Count; $x++) {
+        for ($y = $x + 1; $y -lt $Samples.Count; $y++) {
+            if ($Samples[$y].T - $Samples[$x].T -ge 1.0) { $v = ($Samples[$y].B - $Samples[$x].B) * 8 / ($Samples[$y].T - $Samples[$x].T) / 1e6; if ($v -gt $peak) { $peak = $v }; break }
+        }
+    }
+    return @([math]::Round($mbps, 1), [math]::Round($peak, 1))
+}
+
+function Invoke-HttpDownloadTest {
+    # Multi-stream HTTP download for $BandwidthSeconds; $UrlFactory returns the URL for each new request.
+    param([scriptblock]$UrlFactory, [int64]$CapBytes)
+    $out = @{ Ok = $false; Mbps = $null; PeakMbps = $null; MB = 0; LoadedLatencyMs = $null; HttpStatus = @(); Errors = @(); Had429 = $false; RetryAfterSec = $null }
+    $cts = New-Object Threading.CancellationTokenSource
+    $streams = @{}
+    $total = [int64]0
+    $samples = New-Object Collections.Generic.List[object]
+    $loaded = @()
+    $probeTask = $null; $probeStart = 0; $lastProbe = 0
+    $status = @{}; $errors = @(); $faults = 0
+    $start = $sw.Elapsed.TotalSeconds
+    $deadline = $start + $BandwidthSeconds
+    $startStream = {
+        param($slot)
+        $req = $client.GetAsync((& $UrlFactory), [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cts.Token)
+        $streams[$slot] = @{ Phase = 'head'; Req = $req; Stream = $null; Read = $null; Buf = (New-Object byte[] 262144) }
+    }
+    for ($s = 0; $s -lt $BandwidthStreams; $s++) { & $startStream $s }
+    while ($sw.Elapsed.TotalSeconds -lt $deadline -and $total -lt $CapBytes) {
+        $tasks = @()
+        foreach ($k in @($streams.Keys)) {
+            $st = $streams[$k]
+            if ($st.Phase -eq 'head') { $tasks += $st.Req } elseif ($st.Phase -eq 'body' -and $st.Read) { $tasks += $st.Read }
+        }
+        if ($tasks.Count -eq 0) { break }   # every stream gave up (errors/non-200)
+        [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$tasks, 100)
+        foreach ($k in @($streams.Keys)) {
+            $st = $streams[$k]
+            if ($st.Phase -eq 'head' -and $st.Req.IsCompleted) {
+                if ($st.Req.IsFaulted -or $st.Req.IsCanceled) {
+                    $faults++
+                    if ($st.Req.Exception) { $m = $st.Req.Exception.GetBaseException().Message; if ($errors -notcontains $m -and $errors.Count -lt 3) { $errors += $m } }
+                    if ($faults -lt 20) { & $startStream $k } else { $st.Phase = 'dead' }
+                    continue
+                }
+                $resp = $st.Req.Result
+                $code = [int]$resp.StatusCode
+                $status["$code"] = 1 + [int]$status["$code"]
+                if (-not $resp.IsSuccessStatusCode) {
+                    if ($code -eq 429) {
+                        $out.Had429 = $true
+                        try { $dlt = $resp.Headers.RetryAfter.Delta; if ($dlt) { $out.RetryAfterSec = [int]([TimeSpan]$dlt).TotalSeconds } } catch { }
+                    }
+                    # Stop this stream instead of hammering the endpoint.
+                    try { $resp.Dispose() } catch { }
+                    $st.Phase = 'dead'
+                    continue
+                }
+                $st.Stream = $resp.Content.ReadAsStreamAsync().Result
+                $st.Phase = 'body'
+                $st.Read = $st.Stream.ReadAsync($st.Buf, 0, $st.Buf.Length, $cts.Token)
+            } elseif ($st.Phase -eq 'body' -and $st.Read.IsCompleted) {
+                $n = 0
+                if (-not $st.Read.IsFaulted -and -not $st.Read.IsCanceled) { $n = $st.Read.Result }
+                if ($n -gt 0) {
+                    $total += $n
+                    $st.Read = $st.Stream.ReadAsync($st.Buf, 0, $st.Buf.Length, $cts.Token)
+                } else {
+                    try { $st.Stream.Dispose(); $st.Req.Result.Dispose() } catch { }
+                    & $startStream $k
+                }
+            }
+        }
+        $now = $sw.Elapsed.TotalSeconds
+        if ($samples.Count -eq 0 -or $now - $samples[$samples.Count - 1].T -ge 0.25) { $samples.Add([pscustomobject]@{ T = $now; B = $total }) }
+        if ($probeTask -and $probeTask.IsCompleted) {
+            $lv = & $finishProbe $probeTask $probeStart
+            if ($null -ne $lv) { $loaded += $lv }
+            $probeTask = $null
+        }
+        if (-not $probeTask -and $now - $lastProbe -ge 0.5 -and $now - $start -gt 0.3) {
+            $probeStart = $sw.Elapsed.TotalMilliseconds; $lastProbe = $now
+            $probeTask = & $startProbe
+        }
+    }
+    $cts.Cancel()
+    $samples.Add([pscustomobject]@{ T = $sw.Elapsed.TotalSeconds; B = $total })
+    foreach ($k in @($streams.Keys)) { try { if ($streams[$k].Stream) { $streams[$k].Stream.Dispose() } } catch { } }
+    if ($probeTask) { try { [void]$probeTask.Wait(2500) } catch { } }
+    $stats = Get-ThroughputStats $samples $start
+    $out.MB = [math]::Round($total / 1MB, 1)
+    $out.HttpStatus = @($status.Keys | Sort-Object | ForEach-Object { '{0} x{1}' -f $_, $status[$_] })
+    $out.Errors = $errors
+    $out.LoadedLatencyMs = Get-MedianValue $loaded
+    if ($total -ge 1MB) { $out.Ok = $true; $out.Mbps = $stats[0]; $out.PeakMbps = $stats[1] }
+    return $out
+}
+
+function Invoke-CloudflareUpload {
+    param([int64]$CapBytes)
+    $out = @{ Ok = $false; Mbps = $null; MB = 0; LoadedLatencyMs = $null; HttpStatus = @(); Errors = @(); Had429 = $false; RetryAfterSec = $null }
+    $rand = New-Object Random
+    $payload = New-Object byte[] (16MB)
+    $rand.NextBytes($payload)
+    $size = 1MB
+    $inflight = @{}
+    $ulBytes = [int64]0
+    $loaded = @(); $probeTask = $null; $probeStart = 0; $lastProbe = 0
+    $status = @{}; $errors = @()
+    $ulStart = $sw.Elapsed.TotalSeconds
+    $ulDeadline = $ulStart + $BandwidthSeconds
+    $lastDone = $ulStart
+    $sent = [int64]0
+    for ($s = 0; $s -lt $BandwidthStreams; $s++) {
+        $inflight[$s] = @{ Task = $client.PostAsync('https://speed.cloudflare.com/__up', [Net.Http.ByteArrayContent]::new($payload, 0, $size)); Size = $size; Started = $sw.Elapsed.TotalSeconds }
+        $sent += $size
+    }
+    while ($true) {
+        $now = $sw.Elapsed.TotalSeconds
+        $active = @($inflight.Keys | Where-Object { $inflight[$_] })
+        if ($active.Count -eq 0) { break }
+        if ($now -gt $ulDeadline + 8) { break }
+        $tasks = @($active | ForEach-Object { $inflight[$_].Task })
+        [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$tasks, 100)
+        foreach ($k in $active) {
+            $it = $inflight[$k]
+            if (-not $it.Task.IsCompleted) { continue }
+            $took = $sw.Elapsed.TotalSeconds - $it.Started
+            $okPost = $false
+            if (-not $it.Task.IsFaulted -and -not $it.Task.IsCanceled) {
+                $resp = $it.Task.Result
+                $code = [int]$resp.StatusCode
+                $status["$code"] = 1 + [int]$status["$code"]
+                if ($resp.IsSuccessStatusCode) {
+                    $okPost = $true
+                    $ulBytes += $it.Size; $lastDone = $sw.Elapsed.TotalSeconds
+                    if ($took -lt 0.5 -and $size -lt 16MB) { $size = [int]($size * 2) }
+                } elseif ($code -eq 429) {
+                    $out.Had429 = $true
+                    try { $dlt = $resp.Headers.RetryAfter.Delta; if ($dlt) { $out.RetryAfterSec = [int]([TimeSpan]$dlt).TotalSeconds } } catch { }
+                }
+                try { $resp.Dispose() } catch { }
+            } elseif ($it.Task.Exception) {
+                $m = $it.Task.Exception.GetBaseException().Message
+                if ($errors -notcontains $m -and $errors.Count -lt 3) { $errors += $m }
+            }
+            $inflight[$k] = $null
+            if ($okPost -and $sw.Elapsed.TotalSeconds -lt $ulDeadline -and $sent -lt $CapBytes) {
+                $inflight[$k] = @{ Task = $client.PostAsync('https://speed.cloudflare.com/__up', [Net.Http.ByteArrayContent]::new($payload, 0, $size)); Size = $size; Started = $sw.Elapsed.TotalSeconds }
+                $sent += $size
+            }
+        }
+        $now = $sw.Elapsed.TotalSeconds
+        if ($probeTask -and $probeTask.IsCompleted) {
+            $lv = & $finishProbe $probeTask $probeStart
+            if ($null -ne $lv) { $loaded += $lv }
+            $probeTask = $null
+        }
+        if (-not $probeTask -and $now - $lastProbe -ge 0.5 -and $now - $ulStart -gt 0.3 -and $now -lt $ulDeadline) {
+            $probeStart = $sw.Elapsed.TotalMilliseconds; $lastProbe = $now
+            $probeTask = & $startProbe
+        }
+    }
+    if ($probeTask) { try { [void]$probeTask.Wait(2500) } catch { } }
+    $ulDur = $lastDone - $ulStart
+    $out.MB = [math]::Round($ulBytes / 1MB, 1)
+    $out.HttpStatus = @($status.Keys | Sort-Object | ForEach-Object { '{0} x{1}' -f $_, $status[$_] })
+    $out.Errors = $errors
+    $out.LoadedLatencyMs = Get-MedianValue $loaded
+    if ($ulBytes -ge 1MB -and $ulDur -gt 0) { $out.Ok = $true; $out.Mbps = [math]::Round($ulBytes * 8 / $ulDur / 1e6, 1) }
+    return $out
+}
+
+function Get-MlabServers {
+    # M-Lab's locate API returns the nearest NDT7 servers with short-lived access tokens.
+    $l = Invoke-RestMethod -Uri 'https://locate.measurementlab.net/v2/nearest/ndt/ndt7' -UseBasicParsing -TimeoutSec 10
+    return @(@($l.results) | ForEach-Object {
+        [pscustomobject]@{ Machine = $_.machine; City = $_.location.city; Country = $_.location.country; Download = $_.urls.'wss:///ndt/v7/download'; Upload = $_.urls.'wss:///ndt/v7/upload' }
+    } | Where-Object { $_.Download -and $_.Upload })
+}
+
+function Invoke-Ndt7Test {
+    # One NDT7 test over WebSocket (protocol net.measurementlab.ndt.v7). Download: the server
+    # streams for ~10 s. Upload: we send growing binary messages for $BandwidthSeconds.
+    param([string]$Url, [string]$Direction, [int64]$CapBytes = [int64]::MaxValue)
+    $out = @{ Ok = $false; Mbps = $null; PeakMbps = $null; ClientMbps = $null; ServerMbps = $null; MinRttMs = $null; MB = 0; LoadedLatencyMs = $null; Error = $null }
+    $ws = New-Object Net.WebSockets.ClientWebSocket
+    $ws.Options.AddSubProtocol('net.measurementlab.ndt.v7')
+    $ws.Options.SetBuffer(65536, 65536)
+    $cts = New-Object Threading.CancellationTokenSource
+    $samples = New-Object Collections.Generic.List[object]
+    $loaded = @(); $probeTask = $null; $probeStart = 0; $lastProbe = 0
+    $total = [int64]0
+    $lastServer = $null
+    try {
+        $connect = $ws.ConnectAsync([Uri]$Url, $cts.Token)
+        if (-not $connect.Wait(10000)) { throw 'WebSocket connect timed out' }
+        $buf = New-Object byte[] 1048576
+        $seg = [ArraySegment[byte]]::new($buf)
+        $text = New-Object Text.StringBuilder
+        $start = $sw.Elapsed.TotalSeconds
+        $recv = $ws.ReceiveAsync($seg, $cts.Token)
+        $closed = $false
+        $handleRecv = {
+            # Returns $false once the server closes the connection.
+            if ($recv.IsFaulted -or $recv.IsCanceled) { return $false }
+            $r = $recv.Result
+            if ("$($r.MessageType)" -eq 'Close') { return $false }
+            if ("$($r.MessageType)" -eq 'Binary') { if ($Direction -eq 'download') { $script:ndtRecvBytes += $r.Count } }
+            else {
+                [void]$text.Append([Text.Encoding]::UTF8.GetString($buf, 0, $r.Count))
+                if ($r.EndOfMessage) { $script:ndtLastServer = $text.ToString(); [void]$text.Clear() }
+            }
+            return $true
+        }
+        $script:ndtRecvBytes = [int64]0; $script:ndtLastServer = $null
+        if ($Direction -eq 'download') {
+            $deadline = $start + 13
+            # The server streams for 10 s regardless of speed; stop early at the data cap.
+            while (-not $closed -and $sw.Elapsed.TotalSeconds -lt $deadline -and $total -lt $CapBytes) {
+                if ($recv.Wait(100)) {
+                    if (& $handleRecv) { $recv = $ws.ReceiveAsync($seg, $cts.Token) } else { $closed = $true }
+                }
+                $total = $script:ndtRecvBytes
+                $now = $sw.Elapsed.TotalSeconds
+                if ($samples.Count -eq 0 -or $now - $samples[$samples.Count - 1].T -ge 0.25) { $samples.Add([pscustomobject]@{ T = $now; B = $total }) }
+                if ($probeTask -and $probeTask.IsCompleted) { $lv = & $finishProbe $probeTask $probeStart; if ($null -ne $lv) { $loaded += $lv }; $probeTask = $null }
+                if (-not $probeTask -and $now - $lastProbe -ge 0.5 -and $now - $start -gt 0.3) { $probeStart = $sw.Elapsed.TotalMilliseconds; $lastProbe = $now; $probeTask = & $startProbe }
+            }
+        } else {
+            $payload = New-Object byte[] (1MB)
+            (New-Object Random).NextBytes($payload)
+            $size = 8192
+            $pending = 0
+            $send = $null
+            $deadline = $start + $BandwidthSeconds
+            while (-not $closed -and $sw.Elapsed.TotalSeconds -lt $deadline) {
+                if (-not $send -or $send.IsCompleted) {
+                    if ($send -and ($send.IsFaulted -or $send.IsCanceled)) { throw "upload send failed: $($send.Exception.GetBaseException().Message)" }
+                    if ($send) { $total += $pending }
+                    # NDT7 guidance: grow the message while it is under 1/16 of what has been sent.
+                    # Capped at 64 KB: larger frames from the .NET Framework client got reset by some servers.
+                    if ($size -lt 64KB -and $total -ge 16 * $size) { $size = $size * 2 }
+                    $pending = $size
+                    $send = $ws.SendAsync([ArraySegment[byte]]::new($payload, 0, $size), [Net.WebSockets.WebSocketMessageType]::Binary, $true, $cts.Token)
+                }
+                if ($recv.IsCompleted) { if (& $handleRecv) { $recv = $ws.ReceiveAsync($seg, $cts.Token) } else { $closed = $true } }
+                [void]$send.Wait(50)
+                $now = $sw.Elapsed.TotalSeconds
+                if ($samples.Count -eq 0 -or $now - $samples[$samples.Count - 1].T -ge 0.25) { $samples.Add([pscustomobject]@{ T = $now; B = $total }) }
+                if ($probeTask -and $probeTask.IsCompleted) { $lv = & $finishProbe $probeTask $probeStart; if ($null -ne $lv) { $loaded += $lv }; $probeTask = $null }
+                if (-not $probeTask -and $now - $lastProbe -ge 0.5 -and $now - $start -gt 0.3) { $probeStart = $sw.Elapsed.TotalMilliseconds; $lastProbe = $now; $probeTask = & $startProbe }
+            }
+            if ($send -and $send.Wait(3000) -and -not $send.IsFaulted) { $total += $pending }
+            # Give the server a moment to send its final measurement.
+            $until = $sw.Elapsed.TotalSeconds + 1.5
+            while (-not $closed -and $sw.Elapsed.TotalSeconds -lt $until) {
+                if ($recv.Wait(100)) { if (& $handleRecv) { $recv = $ws.ReceiveAsync($seg, $cts.Token) } else { $closed = $true } }
+            }
+        }
+        $samples.Add([pscustomobject]@{ T = $sw.Elapsed.TotalSeconds; B = $total })
+        $lastServer = $script:ndtLastServer
+        $stats = Get-ThroughputStats $samples $start
+        $out.ClientMbps = $stats[0]; $out.PeakMbps = $stats[1]
+        $out.MB = [math]::Round($total / 1MB, 1)
+        if ($lastServer) {
+            try {
+                $m = $lastServer | ConvertFrom-Json
+                $ti = $m.TCPInfo
+                if ($ti -and $ti.ElapsedTime -gt 0) {
+                    $bytes = if ($Direction -eq 'download') { [double]$ti.BytesAcked } else { [double]$ti.BytesReceived }
+                    if ($bytes -gt 0) { $out.ServerMbps = [math]::Round($bytes * 8 / ([double]$ti.ElapsedTime / 1e6) / 1e6, 1) }
+                    if ($ti.MinRTT) { $out.MinRttMs = [math]::Round([double]$ti.MinRTT / 1000, 1) }
+                }
+            } catch { }
+        }
+        # Upload bytes counted on our side include what is still queued in the socket, so prefer the server's figure there.
+        $out.Mbps = if ($Direction -eq 'upload' -and $out.ServerMbps) { $out.ServerMbps } else { $out.ClientMbps }
+        $out.Ok = ($total -ge 1MB -and $out.Mbps -gt 0)
+    } catch {
+        $out.Error = $_.Exception.GetBaseException().Message
+    } finally {
+        try { [void]$ws.CloseOutputAsync([Net.WebSockets.WebSocketCloseStatus]::NormalClosure, '', $cts.Token).Wait(2000) } catch { }
+        try { $ws.Abort(); $ws.Dispose() } catch { }
+        if ($probeTask) { try { [void]$probeTask.Wait(2500) } catch { } }
+    }
+    $out.LoadedLatencyMs = Get-MedianValue $loaded
+    return $out
+}
+
+function Select-VultrUrl {
+    # Fastest Vultr test file by time-to-first-response on a HEAD request.
+    $best = $null; $bestMs = [double]::MaxValue
+    foreach ($u in $VultrTestUrls) {
+        $t0 = $sw.Elapsed.TotalMilliseconds
+        try {
+            $req = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Head, $u)
+            $resp = $client.SendAsync($req).Result
+            $ms = $sw.Elapsed.TotalMilliseconds - $t0
+            if ($resp.IsSuccessStatusCode -and $ms -lt $bestMs) { $best = $u; $bestMs = $ms }
+            $resp.Dispose()
+        } catch { }
+    }
+    return $best
+}
+
+function Update-Bufferbloat {
+    # Bufferbloat = worst loaded latency minus idle latency, graded like common speed tests.
+    param($Res)
+    $worstLoaded = @($Res['DownloadLoadedLatencyMs'], $Res['UploadLoadedLatencyMs']) | Where-Object { $null -ne $_ } | Sort-Object -Descending | Select-Object -First 1
+    $Res['BufferbloatMs'] = if ($null -ne $worstLoaded -and $null -ne $Res['IdleLatencyMs']) { [math]::Round($worstLoaded - $Res['IdleLatencyMs'], 1) } else { $null }
+    $Res['BufferbloatGrade'] = if ($null -eq $Res['BufferbloatMs']) { $null } elseif ($Res['BufferbloatMs'] -lt 30) { 'A (good)' } elseif ($Res['BufferbloatMs'] -lt 100) { 'B (fair)' } elseif ($Res['BufferbloatMs'] -lt 250) { 'C (poor)' } else { 'D (bad)' }
+}
+
+function Measure-Bandwidth {
+    # -Only limits the run to one direction (the retry phase uses it for whichever direction failed).
+    param([string[]]$Only = @('Download', 'Upload'))
+    # StartedAt/FinishedAt let the merge spot two machines at a site testing at the same time.
+    $res = [ordered]@{ Providers = ($BandwidthProviders -join ' > '); Method = $null; StartedAt = Format-Date (Get-Date); FinishedAt = $null }
+    $capBytes = [int64]$MaxTestMB * 1MB
+    if (-not $script:FullLanguage) {
+        # Constrained Language: plain cmdlets only, Cloudflare only, single stream.
+        $res.Method = 'Invoke-WebRequest single stream (Constrained Language fallback, lower confidence)'
+        try {
+            $t0 = Get-Date
+            $r = Invoke-WebRequest -Uri ('https://speed.cloudflare.com/__down?bytes={0}' -f [int64]([math]::Min(25MB, $capBytes / 2))) -UseBasicParsing -TimeoutSec 60
+            $sec = ((Get-Date) - $t0).TotalSeconds
+            $res['DownloadMbps'] = [math]::Round($r.RawContentLength * 8 / $sec / 1e6, 1); $res['DownloadOk'] = $true; $res['DownloadProvider'] = 'Cloudflare'
+        } catch { $res['DownloadOk'] = $false; $res['DownloadFailure'] = $_.Exception.Message }
+        try {
+            $body = New-Object byte[] (5MB)
+            $t0 = Get-Date
+            Invoke-WebRequest -Uri 'https://speed.cloudflare.com/__up' -Method Post -Body $body -UseBasicParsing -TimeoutSec 60 | Out-Null
+            $sec = ((Get-Date) - $t0).TotalSeconds
+            $res['UploadMbps'] = [math]::Round($body.Length * 8 / $sec / 1e6, 1); $res['UploadOk'] = $true; $res['UploadProvider'] = 'Cloudflare'
+        } catch { $res['UploadOk'] = $false; $res['UploadFailure'] = $_.Exception.Message }
+        return $res
+    }
+    $res.Method = "$BandwidthStreams HTTP streams (Cloudflare/Vultr) or one WebSocket (M-Lab NDT7), $BandwidthSeconds s per direction"
+    Add-Type -AssemblyName System.Net.Http
+    $handler = New-Object Net.Http.HttpClientHandler
+    $handler.UseProxy = $true
+    $client = New-Object Net.Http.HttpClient($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(60)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+
+    # Latency is measured with ICMP to 1.1.1.1 (comparable to the ping series);
+    # HTTP round trips are the fallback when ICMP is blocked.
+    $pinger = New-Object Net.NetworkInformation.Ping
+    $useIcmp = $false
+    try { $useIcmp = ($pinger.Send('1.1.1.1', 1000).Status -eq 'Success') } catch { }
+    $res['LatencyMethod'] = if ($useIcmp) { 'ICMP to 1.1.1.1' } else { 'HTTP round trip to speed.cloudflare.com' }
+    $startProbe = {
+        if ($useIcmp) { return $pinger.SendPingAsync('1.1.1.1', 2000) }
+        return $client.GetAsync('https://speed.cloudflare.com/__down?bytes=0', [Net.Http.HttpCompletionOption]::ResponseHeadersRead)
+    }
+    $finishProbe = {
+        param($task, $startedMs)
+        if ($task.IsFaulted -or $task.IsCanceled) { return $null }
+        if ($useIcmp) { if ($task.Result.Status -eq 'Success') { return [double]$task.Result.RoundtripTime } return $null }
+        try { $task.Result.Dispose() } catch { }
+        return ($sw.Elapsed.TotalMilliseconds - $startedMs)
+    }
+
+    # Idle latency
+    $idle = @()
+    for ($i = 0; $i -lt 21; $i++) {
+        $t = $sw.Elapsed.TotalMilliseconds
+        $p = & $startProbe
+        try { [void]$p.Wait(2500) } catch { }
+        $v = & $finishProbe $p $t
+        if ($i -gt 0 -and $null -ne $v) { $idle += $v }   # first probe warms up TLS/ARP and is discarded
+        if ($useIcmp) { Start-Sleep -Milliseconds 100 }
+    }
+    $res['IdleLatencyMs'] = Get-MedianValue $idle
+    if ($idle.Count -gt 1) { $d = 0; for ($k = 1; $k -lt $idle.Count; $k++) { $d += [math]::Abs($idle[$k] - $idle[$k - 1]) }; $res['IdleJitterMs'] = [math]::Round($d / ($idle.Count - 1), 1) }
+
+    $attempts = New-Object Collections.Generic.List[object]
+    $mlabCache = @{}
+    $dlCap = [int64]($capBytes * 0.6)
+    $ulCap = [int64]($capBytes * 0.4)
+
+    $runDirection = {
+        # Tries each provider in order for one direction; returns the first good result (or $null).
+        # M-Lab upload is held back to the second pass: from Windows PowerShell's WebSocket client it
+        # reads low, so Cloudflare gets a second chance first.
+        param([string]$Dir, [int]$Pass = 1)
+        foreach ($prov in $BandwidthProviders) {
+            if ($Dir -eq 'Upload' -and $prov -eq 'MLab' -and $Pass -eq 1) { continue }
+            $r = $null; $detail = $null; $label = $prov
+            if ($prov -eq 'Cloudflare') {
+                Write-Step "  $Dir via Cloudflare"
+                $r = if ($Dir -eq 'Download') { Invoke-HttpDownloadTest { 'https://speed.cloudflare.com/__down?bytes=26214400' } $dlCap } else { Invoke-CloudflareUpload $ulCap }
+                if (-not $r.Ok -and $r.Had429 -and $r.RetryAfterSec -ge 1 -and $r.RetryAfterSec -le 20) {
+                    Write-Step ("  Cloudflare asked to wait {0} s; retrying once" -f $r.RetryAfterSec) 'Yellow'
+                    Start-Sleep -Seconds $r.RetryAfterSec
+                    $r = if ($Dir -eq 'Download') { Invoke-HttpDownloadTest { 'https://speed.cloudflare.com/__down?bytes=26214400' } $dlCap } else { Invoke-CloudflareUpload $ulCap }
+                }
+                $why = @()
+                if ($r.HttpStatus) { $why += 'HTTP ' + ($r.HttpStatus -join ', ') }
+                if ($r.Errors) { $why += $r.Errors[0] }
+                if ($r.Had429) { $why += 'rate-limited' }
+                $detail = $why -join '; '
+            } elseif ($prov -eq 'MLab') {
+                if (-not $mlabCache.ContainsKey('servers')) {
+                    try { $mlabCache['servers'] = @(Get-MlabServers) } catch { $mlabCache['servers'] = @(); $mlabCache['error'] = $_.Exception.Message }
+                }
+                $servers = @($mlabCache['servers'])
+                if ($servers.Count -eq 0) { $detail = "M-Lab locate failed: $($mlabCache['error'])" }
+                foreach ($srv in ($servers | Select-Object -First 2)) {
+                    # Each locate token is single use, so a server is only tried once per direction.
+                    Write-Step ("  {0} via M-Lab ({1}{2})" -f $Dir, $srv.Machine.Split('.')[0], $(if ($srv.City) { ", $($srv.City)" } else { '' }))
+                    $url = if ($Dir -eq 'Download') { $srv.Download } else { $srv.Upload }
+                    $r = Invoke-Ndt7Test $url $Dir.ToLower() $(if ($Dir -eq 'Download') { $dlCap } else { $ulCap })
+                    $label = "M-Lab NDT7 ($($srv.Machine.Split('.')[0]))"
+                    $detail = if ($r.Ok) { "server-side $($r.ServerMbps) Mbps, min RTT $($r.MinRttMs) ms" } else { $r.Error }
+                    if ($r.Ok -and $Dir -eq 'Upload') { $r['Note'] = 'M-Lab upload from this client reads low; treat as a lower bound' }
+                    if ($r.Ok) { break }
+                }
+                # A fresh locate is needed for any later retry.
+                $mlabCache.Remove('servers')
+            } elseif ($prov -eq 'Vultr') {
+                if ($Dir -ne 'Download') { continue }
+                $vu = Select-VultrUrl
+                if (-not $vu) { $detail = 'no Vultr test file reachable' }
+                else {
+                    $label = 'Vultr (' + ([Uri]$vu).Host.Split('.')[0] + ')'
+                    Write-Step "  Download via $label"
+                    $r = Invoke-HttpDownloadTest ([scriptblock]::Create("'$vu'")) $dlCap
+                    $detail = if ($r.Ok) { $null } else { (@(if ($r.HttpStatus) { 'HTTP ' + ($r.HttpStatus -join ', ') }) + @($r.Errors | Select-Object -First 1)) -join '; ' }
+                }
+            } else { continue }
+            $ok = [bool]($r -and $r.Ok)
+            $attempts.Add([pscustomobject]@{ Direction = $Dir; Provider = $label; Ok = $ok; Mbps = $(if ($ok) { $r.Mbps }); Detail = $detail })
+            if ($ok) { $r['Provider'] = $label; return $r }
+            Write-Step ("  {0} via {1} failed: {2}" -f $Dir, $label, $detail) 'Yellow'
+        }
+        return $null
+    }
+
+    $wantDl = ($Only -contains 'Download'); $wantUl = ($Only -contains 'Upload')
+    $dl = $null; $ul = $null
+    if ($wantDl) { $dl = & $runDirection 'Download' }
+    if ($wantUl) { $ul = & $runDirection 'Upload' }
+    if (($wantDl -and -not $dl) -or ($wantUl -and -not $ul)) {
+        # One more pass for whatever failed, after a pause (rate limits usually clear quickly).
+        Write-Step '  Bandwidth incomplete; waiting 30 s and trying every provider once more' 'Yellow'
+        Start-Sleep -Seconds 30
+        if ($wantDl -and -not $dl) { $dl = & $runDirection 'Download' 2 }
+        if ($wantUl -and -not $ul) { $ul = & $runDirection 'Upload' 2 }
+    }
+
+    foreach ($pair in @(@('Download', $dl), @('Upload', $ul))) {
+        $dir = $pair[0]; $r = $pair[1]
+        if ($Only -notcontains $dir) { continue }
+        if ($r) {
+            $res["${dir}Ok"] = $true
+            $res["${dir}Mbps"] = $r.Mbps
+            if ($dir -eq 'Download') { $res['DownloadPeakMbps'] = $r.PeakMbps }
+            $res["${dir}MB"] = $r.MB
+            $res["${dir}LoadedLatencyMs"] = $r.LoadedLatencyMs
+            $res["${dir}Provider"] = $r.Provider
+            if ($r.ServerMbps) { $res["${dir}ServerMbps"] = $r.ServerMbps }
+            if ($r.MinRttMs) { $res["${dir}MinRttMs"] = $r.MinRttMs }
+            $failedFirst = @($attempts | Where-Object { $_.Direction -eq $dir -and -not $_.Ok } | ForEach-Object { $_.Provider } | Select-Object -Unique)
+            $noteParts = @()
+            if ($failedFirst.Count) { $noteParts += "Fallback used after: $($failedFirst -join ', ')" }
+            if ($r.Note) { $noteParts += $r.Note }
+            if ($noteParts.Count) { $res["${dir}Note"] = $noteParts -join '; ' }
+        } else {
+            $res["${dir}Ok"] = $false
+            $res["${dir}Mbps"] = $null
+            $res["${dir}Failure"] = ((@($attempts | Where-Object Direction -eq $dir) | ForEach-Object { '{0}: {1}' -f $_.Provider, $_.Detail }) -join ' | ')
+        }
+    }
+    $res['Attempts'] = $attempts.ToArray()   # @() on a generic List fails when stored in an ordered dictionary
+    Update-Bufferbloat $res
+    $res['TestedOver'] = '{0} - {1}' -f $Result['Network']['PhysicalClass'], $Result['Network']['PhysicalAdapter']
+    $res['FinishedAt'] = Format-Date (Get-Date)
+    try { $client.Dispose(); $pinger.Dispose() } catch { }
+    return $res
+}
+function Test-TraceUsable { param($T) return [bool]($T -and @($T.Hops | Where-Object { $_.IP }).Count -ge 2) }
+
+# ---------------------------------------------------------------------
+# IPv6: is it offered on this network, and does it reach the internet? Addresses are kept as /64
+# prefixes only: the rest of an IPv6 address can identify the machine.
+# ---------------------------------------------------------------------
+function ConvertTo-Ipv6Prefix64 {
+    # The /64 network of a global IPv6 address, as 'xxxx:xxxx:xxxx:xxxx::/64'; $null for anything else.
+    param([string]$Address)
+    $a = "$Address".Split('%')[0]
+    $ip = $null
+    if (-not [Net.IPAddress]::TryParse($a, [ref]$ip) -or $ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6) { return $null }
+    $b = $ip.GetAddressBytes()
+    $groups = for ($i = 0; $i -lt 8; $i += 2) { '{0:x}' -f (([int]$b[$i] -shl 8) + [int]$b[$i + 1]) }
+    return (($groups -join ':') + '::/64')
+}
+
+function Get-Ipv6Kind {
+    # Global (2000::/3), unique local (fc00::/7), link-local (fe80::/10) or other.
+    param([string]$Address)
+    $a = "$Address".Split('%')[0].ToLower()
+    if ($a -match '^fe[89ab][0-9a-f]:') { return 'LinkLocal' }
+    if ($a -match '^f[cd][0-9a-f]{2}:') { return 'UniqueLocal' }
+    if ($a -match '^[23][0-9a-f]{3}:') { return 'Global' }
+    return 'Other'
+}
+
+function Get-Ipv6Verdict {
+    # Not offered, Local only, Working or Broken, from what the PC holds and whether IPv6 reached the internet.
+    param($State)
+    $global = @(@(Get-Prop $State 'GlobalPrefixes') | Where-Object { $_ }).Count
+    $ula = [bool](Get-Prop $State 'UniqueLocal')
+    $route = [bool](Get-Prop $State 'DefaultRoute')
+    $reached = [bool](Get-Prop $State 'Egress', 'Reached')
+    if ($reached) { return 'Working' }
+    if ($global -or $route) { return 'Broken' }
+    if ($ula) { return 'Local only' }
+    return 'Not offered'
+}
+
+function Measure-Ipv6Ping {
+    # $Count pings to an IPv6 address, 100 ms apart: Sent, Received, LossPct, AvgMs.
+    param([string]$Address, [int]$Count = 10)
+    $times = @()
+    try {
+        $pg = New-Object Net.NetworkInformation.Ping
+        for ($k = 0; $k -lt $Count; $k++) { try { $rp = $pg.Send([Net.IPAddress]::Parse($Address), 1000); if ($rp.Status -eq 'Success') { $times += [int]$rp.RoundtripTime } } catch { }; Start-Sleep -Milliseconds 100 }
+    } catch { }
+    return [ordered]@{ Sent = $Count; Received = $times.Count; LossPct = [math]::Round(100 * ($Count - $times.Count) / [math]::Max(1, $Count), 1); AvgMs = $(if ($times.Count) { [math]::Round(($times | Measure-Object -Average).Average, 1) } else { $null }) }
+}
+
+function Get-Ipv6State {
+    # What this PC holds (addresses on adapters that are up, a default route, IPv6 DNS servers) and a test:
+    # Cloudflare's trace over IPv6, ten pings and an AAAA lookup.
+    $s = [ordered]@{ GlobalPrefixes = @(); TemporaryAddresses = $false; UniqueLocal = $false; DefaultRoute = $false; RouterIsLinkLocal = $null; DnsServers = @(); Egress = $null; Ping = $null; AaaaLookup = $null; Status = $null }
+    $up = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $_.ifIndex })
+    $addrs = @(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object { $up -contains $_.InterfaceIndex -and "$($_.AddressState)" -eq 'Preferred' })
+    $glob = @($addrs | Where-Object { (Get-Ipv6Kind $_.IPAddress) -eq 'Global' })
+    $s.GlobalPrefixes = @($glob | ForEach-Object { ConvertTo-Ipv6Prefix64 $_.IPAddress } | Where-Object { $_ } | Sort-Object -Unique)
+    $s.TemporaryAddresses = [bool]@($glob | Where-Object { "$($_.SuffixOrigin)" -eq 'Random' }).Count
+    $s.UniqueLocal = [bool]@($addrs | Where-Object { (Get-Ipv6Kind $_.IPAddress) -eq 'UniqueLocal' }).Count
+    $rt = @(Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Where-Object { $up -contains $_.InterfaceIndex })
+    $s.DefaultRoute = [bool]$rt.Count
+    if ($rt.Count) { $s.RouterIsLinkLocal = ((Get-Ipv6Kind "$($rt[0].NextHop)") -eq 'LinkLocal') }
+    $s.DnsServers = @(Get-DnsClientServerAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object { $up -contains $_.InterfaceIndex } | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ -and $_ -notlike 'fec0:*' } | Sort-Object -Unique)
+    if ($s.GlobalPrefixes.Count -or $s.DefaultRoute) {
+        $eg = [ordered]@{ Reached = $false; Prefix = $null; SameAsPc = $null; Colo = $null; Error = $null }
+        try {
+            $t = Invoke-WebRequest -Uri 'https://[2606:4700:4700::1111]/cdn-cgi/trace' -UseBasicParsing -TimeoutSec 8
+            $h = @{}; foreach ($l in ($t.Content -split "`n")) { if ($l -match '^([a-z_]+)=(.*)$') { $h[$matches[1]] = $matches[2].Trim() } }
+            if ($h['ip'] -and (Get-Ipv6Kind $h['ip']) -eq 'Global') {
+                $eg.Reached = $true; $eg.Prefix = ConvertTo-Ipv6Prefix64 $h['ip']; $eg.Colo = $h['colo']
+                $eg.SameAsPc = ($s.GlobalPrefixes -contains $eg.Prefix)
+            }
+        } catch { $eg.Error = $_.Exception.Message }
+        $s.Egress = $eg
+        $s.Ping = Measure-Ipv6Ping '2606:4700:4700::1111' 10
+    }
+    try { $s.AaaaLookup = [bool]@(Resolve-DnsName -Name 'one.one.one.one' -Type AAAA -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'AAAA' }).Count } catch { $s.AaaaLookup = $false }
+    $s.Status = Get-Ipv6Verdict $s
+    return $s
 }
 
 # ---------------------------------------------------------------------
@@ -2700,6 +3296,72 @@ function Get-DomainFlags {
     elseif ("$(Get-Prop $dm 'Policy')" -eq 'none') { $out += & $f 'Low' "${d}: DMARC is set to p=none, which only reports and blocks nothing" }
     if ($hasMx -and "$(Get-Prop $P 'Provider')" -eq 'Microsoft 365' -and -not @(Get-Prop $P 'DkimSelectors' | Where-Object { $_ -like 'selector*' }).Count) { $out += & $f 'Low' "${d}: Microsoft 365 DKIM signing is not published (no selector1/selector2 records)" }
     return $out
+}
+
+# ---------------------------------------------------------------------
+# Network risks, read from what discovery already collected. Nothing extra is sent to any device.
+# Returns Severity, Category, Message rows for Add-Flag.
+# ---------------------------------------------------------------------
+function Get-NetworkRiskFlags {
+    param($R, [datetime]$Now = (Get-Date))
+    $out = New-Object Collections.Generic.List[object]
+    $flag = { param($sev, $msg) $out.Add([pscustomobject]@{ Severity = $sev; Category = 'Network risk'; Message = $msg }) }
+    $label = { param($d) $n = "$(Get-Prop $d 'Name')"; if ($n) { '{0} ({1})' -f (Get-Prop $d 'IP'), $n.Split('.')[0] } else { "$(Get-Prop $d 'IP')" } }
+    $list = { param($items) $a = @($items); $t = (@($a | Select-Object -First 6 | ForEach-Object { & $label $_ })) -join ', '; if ($a.Count -gt 6) { $t += " and $($a.Count - 6) more" }; $t }
+    $devs = @(@(Get-Prop $R 'Identify', 'Devices') | Where-Object { $_ })
+    $ports = { param($d) @(@(Get-Prop $d 'OpenPorts') | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ }) }
+
+    $smb1 = @($devs | Where-Object { Get-Prop $_ 'Smb', 'Smb1Enabled' })
+    if ($smb1.Count) { & $flag 'High' "$($smb1.Count) device(s) still accept SMBv1, the file-sharing version WannaCry spread over: $(& $list $smb1)" }
+    $telnet = @($devs | Where-Object { (& $ports $_) -contains 23 })
+    if ($telnet.Count) { & $flag 'Medium' "$($telnet.Count) device(s) accept Telnet, where logins cross the network in clear text: $(& $list $telnet)" }
+    $ftp = @($devs | Where-Object { (& $ports $_) -contains 21 })
+    if ($ftp.Count) { & $flag 'Low' "$($ftp.Count) device(s) run FTP, where logins cross the network in clear text: $(& $list $ftp)" }
+
+    # A web page only over plain HTTP: whatever is typed into its login crosses the network unencrypted.
+    $httpOnly = @($devs | Where-Object {
+        $w = @(@(Get-Prop $_ 'Web') | Where-Object { $_ -and (Get-Prop $_ 'Status') })
+        @($w | Where-Object { "$(Get-Prop $_ 'Url')" -like 'http://*' }).Count -and -not @($w | Where-Object { "$(Get-Prop $_ 'Url')" -like 'https://*' }).Count
+    })
+    if ($httpOnly.Count) { & $flag 'Low' "$($httpOnly.Count) device(s) offer their web page only over plain HTTP, so a login there is sent unencrypted: $(& $list $httpOnly)" }
+
+    $expired = @($devs | Where-Object {
+        @(@(Get-Prop $_ 'Web') | Where-Object { $na = "$(Get-Prop $_ 'CertNotAfter')"; $na -and ([datetime]$na) -lt $Now }).Count
+    })
+    if ($expired.Count) { & $flag 'Low' "$($expired.Count) device(s) present an expired HTTPS certificate, which teaches people to click through certificate warnings: $(& $list $expired)" }
+
+    # Remote Desktop and file sharing reachable from an office port across routing
+    $remote = @($devs | Where-Object { Get-Prop $_ 'Remote' })
+    $rdp = @($remote | Where-Object { (& $ports $_) -contains 3389 })
+    if ($rdp.Count) { & $flag 'Medium' "From an ordinary office port, Remote Desktop answers on $($rdp.Count) device(s) on other subnets, with nothing filtering in between: $(& $list $rdp)" }
+    $smb = @($remote | Where-Object { (& $ports $_) -contains 445 })
+    if ($smb.Count) { & $flag 'Medium' "From an ordinary office port, file sharing answers on $($smb.Count) device(s) on other subnets, the path ransomware spreads along: $(& $list $smb)" }
+
+    $snmpN = Get-Prop $R 'Snmp', 'Answered'
+    if ($snmpN -and "$(Get-Prop $R 'Snmp', 'Community')" -eq 'public') {
+        & $flag 'Medium' "$snmpN device(s) answer SNMP with the default community 'public': anyone on the network can read their configuration, ARP tables and routes"
+    }
+
+    # SSH servers from before 2017 (OpenSSH under 7.4, Dropbear before 2017)
+    $oldSsh = @($devs | Where-Object {
+        $b = "$(Get-Prop $_ 'SshBanner')"
+        ($b -match 'OpenSSH_(\d+)\.(\d+)' -and ([int]$matches[1] -lt 7 -or ([int]$matches[1] -eq 7 -and [int]$matches[2] -lt 4))) -or ($b -match 'dropbear_(\d{4})' -and [int]$matches[1] -lt 2017)
+    })
+    if ($oldSsh.Count) { & $flag 'Low' "$($oldSsh.Count) device(s) run an SSH server from before 2017, a sign of firmware that has not been updated in years: $(& $list $oldSsh)" }
+
+    # Windows that no longer gets security updates, named by the file-sharing handshake
+    $hosts = @(@(Get-Prop $R 'WindowsHosts', 'Hosts') | Where-Object { $_ })
+    $dead = @($hosts | Where-Object { "$(Get-Prop $_ 'Os')" -match '^Windows (7|8)\b' })
+    if ($dead.Count) { & $flag 'High' "$($dead.Count) machine(s) on the network run Windows that no longer gets security updates (Windows 7 or 8, Server 2008 R2 or 2012): $((@($dead | Select-Object -First 6 | ForEach-Object { '{0} ({1}, {2})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'ComputerName'), (Get-Prop $_ 'Os') })) -join ', ')" }
+    $checks = @(@(Get-Prop $R 'LeadChecks', 'Checks') | Where-Object { $_ })
+    $oldEsx = @($checks | Where-Object { "$(Get-Prop $_ 'Kind')" -eq 'Hypervisor' -and "$(Get-Prop $_ 'Version')" -match '^(5|6|7)\.' })
+    if ($oldEsx.Count) { & $flag 'High' "$($oldEsx.Count) VMware host(s) run a version out of general support (6.x ended 2022, 7.0 in October 2025): $((@($oldEsx | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'What') })) -join ', ')" }
+    $bmc = @($checks | Where-Object { "$(Get-Prop $_ 'Kind')" -eq 'ServerManagement' })
+    if ($bmc.Count) { & $flag 'Medium' "$($bmc.Count) server management controller(s) (iDRAC, iLO and similar) can be reached from an ordinary office port; they belong on a management network: $((@($bmc | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'What') })) -join ', ')" }
+    $w10 = @($hosts | Where-Object { "$(Get-Prop $_ 'Os')" -like 'Windows 10 (*' })
+    if ($w10.Count) { & $flag 'Medium' "$($w10.Count) machine(s) on the network run Windows 10, out of support since October 2025 unless they are LTSC or covered by Extended Security Updates: $((@($w10 | Select-Object -First 6 | ForEach-Object { '{0} ({1})' -f (Get-Prop $_ 'IP'), (Get-Prop $_ 'ComputerName') })) -join ', ')" }
+
+    return $out.ToArray()
 }
 
 function Get-AssessmentFindings {
@@ -3300,6 +3962,387 @@ function Get-AssessmentFindings {
     }
     return $out.ToArray()
 }
+
+# =====================================================================
+# PHASE 7: analysis, flags, summary
+# =====================================================================
+function Get-TopologyVerdict {
+    # Scores backhaul and split-tunnel signals from one run. Uses $ProviderAsn and $HostedLabel from CONFIG.
+    param($Result, [string[]]$RdpHosts = @())
+    $signals = @()
+    $backhaul = 0; $split = 0
+    $eg = $Result['Egress']
+    $carrier = Get-Val $eg 'Carrier'
+    if ($carrier -match $ProviderAsn) { $backhaul += 3; $signals += "Egress ASN is '$carrier' ($HostedLabel provider): internet exits via the provider" }
+    elseif ($carrier) { $signals += "Egress ISP/ASN: $carrier ($(Get-Val $eg 'EgressCity'))" }
+
+    $inet = $Result['Traceroutes'] | Where-Object { $_.Target -eq '1.1.1.1' } | Select-Object -First 1
+    if ($inet) {
+        $a = $inet.Analysis
+        # On its own a private hop is only a hint (some ISPs number their edge privately); it needs a second signal.
+        if ($a['TunnelIndicator']) { $backhaul += 1; $signals += "Internet trace crosses private hop(s) with latency before reaching the ISP (tunnel/MPLS or ISP-internal): $($a['PrivateHopsAfterGw'] -join ', ')" }
+        elseif ($a['DoubleNatLikely']) { $signals += "Internet trace shows low-latency private hop(s) after gateway (double NAT, e.g. ISP modem + firewall): $($a['PrivateHopsAfterGw'] -join ', ')" }
+        elseif ($a['CgnatHops'] -gt 0) { $signals += 'Internet trace goes from the gateway into carrier-grade NAT (ISP-side), i.e. straight out the local circuit' }
+        else { $signals += 'Internet trace goes straight from the gateway to a public ISP hop' }
+        if (@($a['CarrierPrivateHops']).Count -gt 0) { $signals += "Private hops after the CGNAT hop are carrier-internal, ignored: $($a['CarrierPrivateHops'] -join ', ')" }
+        # A distant first public hop only hints at backhaul when it is not just access latency:
+        # skip satellite/cellular/CGNAT paths and cases where it roughly equals end-to-end latency.
+        $inetPing = @($Result['PingSeries']) | Where-Object { $_ -and $_.Target -eq '1.1.1.1' } | Select-Object -First 1
+        $e2e = if ($inetPing) { $inetPing.AvgMs } else { $null }
+        $accessLatency = ($a['CgnatHops'] -gt 0) -or ($e2e -and $a['FirstPublicMs'] -ge 0.7 * $e2e)
+        if ($a['FirstPublicMs'] -ge 30 -and -not $accessLatency) { $backhaul += 1; $signals += "First public hop is far away ($($a['FirstPublicMs']) ms) compared with end-to-end latency" }
+        elseif ($a['FirstPublicMs'] -ge 30) { $signals += "First public hop at $($a['FirstPublicMs']) ms is access-link latency (satellite/cellular/CGNAT or similar), not counted as backhaul" }
+        if ($a['FirstPublicPtr']) { $signals += "First public hop rDNS: $($a['FirstPublicPtr'])" }
+    }
+
+    $rdpTraces = @($Result['Traceroutes'] | Where-Object { $RdpHosts -contains $_.Target })
+    foreach ($t in $rdpTraces) {
+        if ($t.Analysis['TunnelIndicator'] -and -not ($inet -and $inet.Analysis['TunnelIndicator'])) { $split += 2; $signals += "RDP trace to $($t.Target) goes through a private tunnel hop that internet traffic does not" }
+    }
+    foreach ($r in @($Result['RdpPath'])) {
+        if ($r -and $r.ResolvesPrivate) { $split += 2; $signals += "RDP host $($r.Host) resolves to a private IP ($($r.ResolvedIPs -join ', ')): reached over a tunnel" }
+    }
+    $actPriv = @(Get-Val $Result['Rdp'] 'ActiveTcp' | Where-Object { $_.Class -eq 'Private' })
+    if ($actPriv.Count -gt 0) { $split += 2; $signals += "Live RDP session is connected to a private IP ($(($actPriv | ForEach-Object { $_.RemoteAddress }) -join ', '))" }
+
+    # DNS on this machine's own subnet is an on-prem server (DC, file server, firewall DNS), not a tunnel.
+    # Private DNS on some other subnet hints that DNS is reached over a tunnel; it counts once.
+    $localNets = @()
+    foreach ($a in @(Get-Val $Result['Network'] 'Adapters' | Where-Object { $_ -and $_.Status -eq 'Up' })) {
+        $ips = @($a.IPv4); $masks = @($a.SubnetMask)
+        for ($q = 0; $q -lt $ips.Count; $q++) { if ($ips[$q] -and $masks.Count -gt $q) { $localNets += [pscustomobject]@{ Ip = $ips[$q]; Mask = $masks[$q] } } }
+    }
+    $onPremDns = @(); $remoteDns = @()
+    foreach ($d in @(Get-Val $Result['NetworkExtra'] 'DnsServers')) {
+        if (-not $d -or $d.Type -notlike 'Private, not the gateway*') { continue }
+        if (@($localNets | Where-Object { Test-SameSubnet $d.Server $_.Ip $_.Mask }).Count) { $onPremDns += $d.Server } else { $remoteDns += $d.Server }
+    }
+    if ($onPremDns.Count) { $signals += "DNS server(s) on this machine's own subnet ($($onPremDns -join ', ')): on-prem server or DC, not a tunnel" }
+    if ($remoteDns.Count) { $split += 1; $signals += "DNS server(s) on another private subnet ($($remoteDns -join ', ')): DNS may be reached over a tunnel" }
+    $script:OnPremDns = $onPremDns
+    $mtu = @($Result['Mtu'])
+    $mtuInet = ($mtu | Where-Object { $_.Target -eq '1.1.1.1' } | Select-Object -First 1)
+    $mtuRdp = ($mtu | Where-Object { $_.Target -ne '1.1.1.1' } | Select-Object -First 1)
+    if ($mtuInet -and $mtuInet.MtuBytes -and $mtuInet.MtuBytes -lt 1500) { $signals += "Internet path MTU is $($mtuInet.MtuBytes) (PPPoE or tunnel overhead)"; if ($mtuInet.MtuBytes -lt 1440) { $backhaul += 1 } }
+    if ($mtuRdp -and $mtuRdp.MtuBytes -and $mtuRdp.MtuBytes -lt 1440 -and (-not $mtuInet.MtuBytes -or $mtuInet.MtuBytes -ge 1492)) { $split += 1; $signals += "RDP path MTU is $($mtuRdp.MtuBytes) while internet is $($mtuInet.MtuBytes): tunnel to RDP" }
+    if (Get-Val $Result['Network'] 'VpnHoldsDefaultRoute') { $backhaul += 2; $signals += 'A client VPN adapter holds the default route on this PC (full tunnel)' }
+
+    $verdict = 'Local breakout'
+    if ($backhaul -ge 2) { $verdict = 'Full backhaul' }
+    elseif ($split -ge 2) { $verdict = 'Split tunnel (local internet, RDP over tunnel)' }
+    $score = [math]::Max($backhaul, $split)
+    $confidence = if ($verdict -eq 'Local breakout') { if ($signals.Count -ge 3) { 'Medium-High' } else { 'Medium' } } elseif ($score -ge 4) { 'High' } elseif ($score -ge 2) { 'Medium' } else { 'Low' }
+    [ordered]@{ Verdict = $verdict; Confidence = $confidence; BackhaulScore = $backhaul; SplitScore = $split; Signals = $signals }
+}
+
+function Get-UserFolder {
+    # Resolves a shell folder (Desktop, Personal, Downloads GUID) for the inventoried user.
+    param([string]$ValueName, [string]$Fallback)
+    $paths = @("$($script:UserHive)\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+               "$($script:UserHive)\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
+    foreach ($k in $paths) {
+        try {
+            # Read unexpanded so %USERPROFILE% maps to the inventoried user, not the runner.
+            $v = (Get-Item -LiteralPath $k -ErrorAction Stop).GetValue($ValueName, $null, 'DoNotExpandEnvironmentNames')
+            if ($v) {
+                $v = $v -replace '%USERPROFILE%', $script:UserProfile
+                $v = [Environment]::ExpandEnvironmentVariables($v)
+                if (Test-Path -LiteralPath $v) { return $v }
+            }
+        } catch { }
+    }
+    return (Join-Path $script:UserProfile $Fallback)
+}
+function Test-WritableFolder {
+    param([string]$Folder)
+    try {
+        if (-not (Test-Path -LiteralPath $Folder)) { New-Item -ItemType Directory -Path $Folder -Force | Out-Null }
+        $probe = Join-Path $Folder ('.sa_write_test_{0}' -f (Get-Random))
+        Set-Content -LiteralPath $probe -Value 'x'
+        Remove-Item -LiteralPath $probe -Force
+        return $true
+    } catch { return $false }
+}
+
+function Get-ConnectionClass {
+    param($Adapter)
+    $desc = "$($Adapter.InterfaceDescription) $($Adapter.Name)"
+    $ndis = "$($Adapter.NdisPhysicalMedium)"
+    $pmt  = "$($Adapter.PhysicalMediaType)"
+    if ($desc -match 'Remote NDIS|RNDIS') { return 'Phone tether (USB)' }
+    if ($ndis -eq '9' -or $ndis -match '802_11' -or $pmt -match '802\.11|Wireless LAN') { return 'Wi-Fi' }
+    if ($ndis -eq '8' -or $pmt -match 'Wireless WAN|Mobile Broadband') { return 'Cellular' }
+    if ($desc -match $VpnRegex -or $Adapter.Virtual) { return 'Virtual/VPN' }
+    if ($ndis -eq '14' -or $ndis -match '802_3' -or $pmt -match '802\.3') {
+        if ($desc -match $UsbRegex) { return 'Wired (USB/dock)' }
+        return 'Wired (onboard)'
+    }
+    return 'Unknown'
+}
+
+function Read-RdpFile {
+    param([string]$Path)
+    $h = [ordered]@{ Path = $Path; Modified = Format-Date (Get-Item -LiteralPath $Path).LastWriteTime }
+    foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        if ($line -match '^([^:]+):([isb]):(.*)$') {
+            $k = $matches[1].Trim().ToLower()
+            if ($k -match 'password|signature') { continue }
+            if ($RdpSafeKeys -contains $k) { $h[$k] = $matches[3].Trim() }
+        }
+    }
+    return $h
+}
+
+function Get-LocationPolicy {
+    $r = [ordered]@{ PolicyBlocked = $false; PolicyReason = $null; DeviceValue = $null; UserValue = $null; DesktopAppsValue = $null }
+    $policies = @(
+        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'; N = 'LetAppsAccessLocation'; Bad = 2 },
+        @{ P = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Privacy'; N = 'LetAppsAccessLocation'; Bad = 2 },
+        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors'; N = 'DisableLocation'; Bad = 1 },
+        @{ P = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\System'; N = 'AllowLocation'; Bad = 0 }
+    )
+    foreach ($p in $policies) {
+        $v = Get-RegString $p.P $p.N
+        if ($null -ne $v -and [int]$v -eq $p.Bad) { $r.PolicyBlocked = $true; $r.PolicyReason = '{0}\{1}={2}' -f $p.P, $p.N, $v }
+    }
+    $r.DeviceValue = Get-RegString "HKLM:\$LocKey" 'Value'
+    $r.UserValue = Get-RegString "HKCU:\$LocKey" 'Value'
+    $r.DesktopAppsValue = Get-RegString "HKCU:\$LocKey\NonPackaged" 'Value'
+    return $r
+}
+
+function Enable-TempLocation {
+    # Returns the list of changes so Restore-TempLocation can undo exactly what was touched.
+    param([bool]$IncludeDevice)
+    $paths = @("HKCU:\$LocKey", "HKCU:\$LocKey\NonPackaged")
+    if ($IncludeDevice) { $paths = @("HKLM:\$LocKey") + $paths }
+    $changes = @()
+    foreach ($p in $paths) {
+        $existed = Test-Path -LiteralPath $p
+        $orig = Get-RegString $p 'Value'
+        if ($orig -eq 'Allow') { continue }
+        if (-not $existed) { New-Item -Path $p -Force | Out-Null }
+        New-ItemProperty -LiteralPath $p -Name 'Value' -Value 'Allow' -PropertyType String -Force | Out-Null
+        $changes += [pscustomobject]@{ Path = $p; Existed = $existed; Original = $orig }
+    }
+    return $changes
+}
+
+function Restore-TempLocation {
+    param($Changes)
+    $failed = @()
+    foreach ($c in @($Changes)[($Changes.Count - 1)..0]) {
+        try {
+            if ($null -ne $c.Original) { New-ItemProperty -LiteralPath $c.Path -Name 'Value' -Value $c.Original -PropertyType String -Force | Out-Null }
+            else { Remove-ItemProperty -LiteralPath $c.Path -Name 'Value' -ErrorAction Stop }
+            if (-not $c.Existed) { Remove-Item -LiteralPath $c.Path -Force -ErrorAction SilentlyContinue }
+        } catch { $failed += $c.Path }
+    }
+    return $failed
+}
+function Add-Line { param([string]$Text = '') $L.Add($Text) }
+
+# =====================================================================
+# PHASE 8: data check. assessment.json is read back from disk exactly as the merge
+# will read it, and every section the reports depend on is checked for real values.
+# =====================================================================
+function Get-Field {
+    # Property or key lookup that works on both live results and JSON read back from disk.
+    param($Obj, [string]$Name)
+    if ($null -eq $Obj -or $Obj -is [string]) { return $null }
+    if ($Obj -is [System.Collections.IDictionary]) { if ($Obj.Contains($Name)) { return $Obj[$Name] }; return $null }
+    $p = $Obj.PSObject.Properties[$Name]
+    if ($p) { return $p.Value }
+    return $null
+}
+
+function Test-AssessmentData {
+    # Returns one row per check: Status OK, INFO (expected gap), WARN (usable, something missing) or FAIL (re-run).
+    param($D, [string]$Folder)
+    $rows = New-Object Collections.Generic.List[object]
+    $add = { param($Check, $Status, $Detail) $rows.Add([pscustomobject]@{ Check = $Check; Status = $Status; Detail = "$Detail" }) }
+
+    $meta = Get-Field $D 'Meta'
+    if ((Get-Field $meta 'Hostname') -and (Get-Field $meta 'RunStart')) { & $add 'Run identity' 'OK' ('{0} at {1}' -f (Get-Field $meta 'Hostname'), (Get-Field $meta 'RunStart')) }
+    else { & $add 'Run identity' 'FAIL' 'hostname or run time missing' }
+    $site = "$(Get-Field $meta 'SiteName')"
+    if ($site -and $site -ne 'UNSPECIFIED') { & $add 'Site name' 'OK' $site } else { & $add 'Site name' 'WARN' 'no site name (can be fixed in the merge with -SiteMap)' }
+
+    $net = Get-Field $D 'Network'
+    $cls = "$(Get-Field $net 'PhysicalClass')"
+    if ($cls -and $cls -ne 'No route' -and (Get-Field $net 'SourceIp')) { & $add 'Connection' 'OK' ('{0}, {1} via gateway {2}' -f $cls, (Get-Field $net 'SourceIp'), (Get-Field $net 'Gateway')) }
+    else { & $add 'Connection' 'FAIL' 'no network route found' }
+
+    $eg = Get-Field $D 'Egress'
+    if (Get-Field $eg 'PublicIPv4') { & $add 'Public IP / carrier' 'OK' ('{0} ({1})' -f (Get-Field $eg 'PublicIPv4'), (Get-Field $eg 'Carrier')) }
+    else { & $add 'Public IP / carrier' 'FAIL' 'public IP not identified' }
+
+    $bwD = Get-Field $D 'Bandwidth'
+    if ("$(Get-Field $bwD 'Status')" -eq 'disabled in config') { & $add 'Bandwidth' 'WARN' 'disabled in config' }
+    else {
+        foreach ($dir in 'Download', 'Upload') {
+            $mbps = Get-Field $bwD "${dir}Mbps"
+            if ((Get-Field $bwD "${dir}Ok") -and $null -ne $mbps -and [double]$mbps -gt 0) { & $add "Bandwidth $($dir.ToLower())" 'OK' ('{0} Mbps via {1}' -f $mbps, (Get-Field $bwD "${dir}Provider")) }
+            else {
+                $why = if (Get-Field $bwD "${dir}Failure") { Get-Field $bwD "${dir}Failure" } elseif (Get-Field $bwD 'Status') { Get-Field $bwD 'Status' } else { 'no provider returned a result (check $BandwidthProviders)' }
+                & $add "Bandwidth $($dir.ToLower())" 'FAIL' $why
+            }
+        }
+        if ($null -ne (Get-Field $bwD 'BufferbloatMs')) { & $add 'Latency under load' 'OK' ('{0:+0.#;-0.#;0} ms over idle, grade {1}' -f [double](Get-Field $bwD 'BufferbloatMs'), (Get-Field $bwD 'BufferbloatGrade')) }
+        else { & $add 'Latency under load' 'WARN' 'not measured' }
+    }
+
+    $traces = @(@(Get-Field $D 'Traceroutes') | Where-Object { $_ })
+    foreach ($tgt in '1.1.1.1', '8.8.8.8') {
+        $t = $traces | Where-Object { $_.Target -eq $tgt } | Select-Object -First 1
+        $answered = @(@(Get-Field $t 'Hops') | Where-Object { $_ -and $_.IP }).Count
+        $an = Get-Field $t 'Analysis'
+        if ($answered -ge 2 -and (Test-Path -LiteralPath (Join-Path $Folder ('traceroute_{0}.txt' -f $tgt)))) {
+            & $add "Traceroute $tgt" 'OK' ('{0} hops, first public hop #{1} {2}' -f @(Get-Field $t 'Hops').Count, (Get-Field $an 'FirstPublicHop'), (Get-Field $an 'FirstPublicIP'))
+        } else {
+            & $add "Traceroute $tgt" $(if ($tgt -eq '1.1.1.1') { 'FAIL' } else { 'WARN' }) $(if (-not $t) { 'missing' } else { "only $answered hop(s) answered" })
+        }
+    }
+
+    $pings = @(@(Get-Field $D 'PingSeries') | Where-Object { $_ })
+    $tcps = @(@(Get-Field $D 'TcpSeries') | Where-Object { $_ })
+    $inet = @($pings + $tcps) | Where-Object { $_.Target -eq '1.1.1.1' -and $_.Received -gt 0 } | Select-Object -First 1
+    if ($inet) { & $add 'Internet loss / latency' 'OK' ('1.1.1.1 loss {0}%, avg {1} ms, jitter {2} ms ({3})' -f $inet.LossPct, $inet.AvgMs, $inet.JitterMs, $(if (Get-Field $inet 'Method') { 'TCP' } else { 'ping' })) }
+    else { & $add 'Internet loss / latency' 'FAIL' 'no replies from 1.1.1.1 by ping or TCP' }
+    $gw = Get-Field $net 'Gateway'
+    $gp = $pings | Where-Object { $_.Target -eq $gw -and $_.Received -gt 0 } | Select-Object -First 1
+    if ($gp) { & $add 'Gateway loss / latency' 'OK' ('loss {0}%, avg {1} ms' -f $gp.LossPct, $gp.AvgMs) } else { & $add 'Gateway loss / latency' 'WARN' 'gateway does not answer ping' }
+
+    $rdpD = Get-Field $D 'Rdp'
+    $targets = @(@(Get-Field $rdpD 'SelectedTargets') | Where-Object { $_ })
+    $ownTargets = @($targets | Where-Object { $extraHosts -notcontains $_ })
+    if ($targets.Count -eq 0) { & $add 'Remote desktop targets' 'WARN' 'none resolved' }
+    elseif ($ownTargets.Count -eq 0) { & $add 'Remote desktop targets' 'WARN' ("only the fixed target ({0}); no remote desktop use found on this PC, so no session history. A PC whose user works in the hosted desktop gives more" -f ($targets -join ', ')) }
+    else { & $add 'Remote desktop targets' 'OK' ($targets -join ', ') }
+    if ($targets.Count) {
+        $traceInfo = foreach ($tg in $targets) { $t = $traces | Where-Object { $_.Target -eq $tg } | Select-Object -First 1; '{0}: {1} hops' -f $tg, @(@(Get-Field $t 'Hops') | Where-Object { $_ -and $_.IP }).Count }
+        $noTrace = @($targets | Where-Object { $tg = $_; -not ($traces | Where-Object { $_.Target -eq $tg -and @($_.Hops | Where-Object { $_ -and $_.IP }).Count -ge 1 }) })
+        & $add 'Traceroutes to targets' $(if ($noTrace.Count) { 'WARN' } else { 'OK' }) (@($traceInfo) -join '; ')
+        $series = @(@($pings + $tcps) | Where-Object { $targets -contains $_.Target -and $_.Received -gt 0 })
+        if ($series.Count) { & $add 'Remote desktop loss / latency' 'OK' ((@($series | ForEach-Object { '{0}{1} loss {2}% avg {3} ms' -f $_.Target, $(if (Get-Field $_ 'Port') { " tcp/$($_.Port)" } else { '' }), $_.LossPct, $_.AvgMs })) -join '; ') }
+        else { & $add 'Remote desktop loss / latency' 'WARN' 'no ping or TCP replies from any target' }
+        $openT = @(@(Get-Field $D 'RdpPath') | Where-Object { $_ -and @(@($_.Tcp) | Where-Object { $_ -and $_.Open }).Count })
+        if ($openT.Count) { & $add 'Remote desktop reachability' 'OK' ("{0} of {1} target(s) answer on TCP" -f $openT.Count, $targets.Count) } else { & $add 'Remote desktop reachability' 'WARN' 'no target answered on any TCP port' }
+    }
+
+    $mD = Get-Field $D 'Machine'
+    if ((Get-Field $mD 'SerialNumber') -and (Get-Field $mD 'Model') -and (Get-Field $mD 'OsBuild')) { & $add 'Machine inventory' 'OK' ('{0} {1}, S/N {2}' -f (Get-Field $mD 'Manufacturer'), (Get-Field $mD 'Model'), (Get-Field $mD 'SerialNumber')) }
+    else { & $add 'Machine inventory' 'WARN' 'model, serial or OS missing' }
+    $appCount = Get-Field (Get-Field $D 'Software') 'AppCount'
+    if ($appCount -gt 0) { & $add 'Software inventory' 'OK' "$appCount apps" } else { & $add 'Software inventory' 'WARN' 'no installed apps read' }
+    $topo = Get-Field $D 'Topology'
+    if (Get-Field $topo 'Verdict') { & $add 'Topology verdict' 'OK' ('{0} ({1})' -f (Get-Field $topo 'Verdict'), (Get-Field $topo 'Confidence')) } else { & $add 'Topology verdict' 'WARN' 'not decided' }
+
+    if ($EnableSubnetSweep) {
+        $sw = Get-Field $D 'SubnetSweep'
+        $cnt = Get-Field $sw 'ArpEntries'
+        if ($cnt -gt 0) { & $add 'Subnet sweep' 'OK' ('{0} devices on {1}, {2} identified by name or ports{3}' -f $cnt, (Get-Field $sw 'Subnet'), [int](Get-Field $sw 'Identified'), $(if (Get-Field $sw 'Note') { " ($(Get-Field $sw 'Note'))" } else { '' })) }
+        else { & $add 'Subnet sweep' 'WARN' $(if (Get-Field $sw 'Status') { Get-Field $sw 'Status' } else { 'no devices found' }) }
+    }
+    $tlsD = Get-Field $D 'Tls'
+    if ($tlsD -and (Get-Field $tlsD 'Checks')) {
+        $answered = @(@(Get-Field $tlsD 'Checks') | Where-Object { $_ -and $_.Issuer }).Count
+        if (Get-Field $tlsD 'InspectionSuspected') { & $add 'HTTPS certificates' 'WARN' 'HTTPS inspection suspected (see HTTPS CERTIFICATES in summary.txt)' }
+        elseif ($answered) { & $add 'HTTPS certificates' 'OK' "$answered certificate(s) read, no inspection seen" }
+        else { & $add 'HTTPS certificates' 'WARN' 'no certificate could be read' }
+    }
+    $hdaD = Get-Field (Get-Field $D 'Rdp') 'HostedDesktopApp'
+    if ($hdaD) {
+        if (Get-Field $hdaD 'Found') { & $add 'Hosted-desktop app' 'OK' ('found, {0} host name(s) in its files' -f @(@(Get-Field $hdaD 'Hosts') | Where-Object { $_ }).Count) }
+        else { & $add 'Hosted-desktop app' 'INFO' 'No app matching the hosted desktop profile for this user (run on a PC whose user works in it)' }
+    }
+    if ($cls -eq 'Wi-Fi') {
+        $wl = Get-Field $D 'Wireless'; $wc = Get-Field $wl 'Current'
+        if ($null -ne (Get-Field $wc 'SignalPct')) { & $add 'Wi-Fi details' 'OK' ('{0}, {1}%, {2}' -f (Get-Field $wc 'SSID'), (Get-Field $wc 'SignalPct'), (Get-Field $wc 'Band')) }
+        else {
+            # Say why: a policy block applies to every managed PC, so a second machine will not fill the gap.
+            $why = Get-Field (Get-Field $wl 'LocationWorkaround') 'Result'
+            if (-not $why) { $why = Get-Field $wl 'Status' }
+            & $add 'Wi-Fi details' 'WARN' ("radio details not read ({0}); SSID {1}" -f $why, (Get-Field $wc 'SSID'))
+        }
+    }
+    if (Get-Field $meta 'AdminTierActive') {
+        $adm = Get-Field $D 'Admin'
+        if ($adm -and -not (Get-Field $adm 'Status')) { & $add 'Admin checks' 'OK' 'TPM, BitLocker, disk health and sign-ins collected' } else { & $add 'Admin checks' 'WARN' (Get-Field $adm 'Status') }
+        if ($cls -like 'Wired*') {
+            $nb = @(@(Get-Field (Get-Field $D 'Lldp') 'Neighbors') | Where-Object { $_ })
+            if ($nb.Count) { & $add 'Switch (LLDP/CDP)' 'OK' ((@($nb | ForEach-Object { '{0} port {1}' -f $(if ($_.Model) { $_.Model } else { $_.SystemName }), $_.Port })) -join '; ') }
+            else { & $add 'Switch (LLDP/CDP)' 'WARN' 'nothing heard: unmanaged switch, or LLDP/CDP turned off' }
+        }
+    } else { & $add 'Admin checks' 'INFO' 'skipped: ISE was not run as administrator' }
+
+    $errs = @(@(Get-Field $D 'Errors') | Where-Object { $_ })
+    if ($errs.Count) { & $add 'Collector errors' 'WARN' ((@($errs | ForEach-Object { $_.Collector } | Select-Object -Unique)) -join ', ') } else { & $add 'Collector errors' 'OK' 'none' }
+    return $rows.ToArray()
+}
+
+function Test-ZipOutput {
+    # Opens the finished zip the way the merge will and confirms the files and data are in it.
+    param([string]$Zip, [string[]]$Required)
+    $problems = @()
+    $tmp = Join-Path $env:TEMP ('sa_verify_{0}' -f (Get-Random))
+    try {
+        Expand-Archive -LiteralPath $Zip -DestinationPath $tmp -Force
+        foreach ($f in $Required) { if (-not (Test-Path -LiteralPath (Join-Path $tmp $f))) { $problems += "$f missing from the zip" } }
+        $j = [IO.File]::ReadAllText((Join-Path $tmp 'assessment.json')) | ConvertFrom-Json
+        if ((Get-Field (Get-Field $j 'Meta') 'Hostname') -ne $env:COMPUTERNAME) { $problems += 'assessment.json in the zip is not from this machine' }
+        if (-not (Get-Field (Get-Field $j 'Validation') 'Overall')) { $problems += 'assessment.json in the zip has no data check' }
+    } catch { $problems += "zip could not be read back: $($_.Exception.Message)" }
+    finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    $size = (Get-Item -LiteralPath $Zip -ErrorAction SilentlyContinue).Length
+    return [pscustomobject]@{ Ok = ($problems.Count -eq 0); Problems = $problems; SizeKB = $(if ($size) { [math]::Round($size / 1KB) } else { 0 }) }
+}
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+$RunStart = Get-Date
+
+# Paste check: a copy cut short by the clipboard could run part-way and save nothing.
+# The last line of this file is a marker; if it is missing, stop before doing anything.
+$endMarker = '# END OF ' + 'COLLECTOR SCRIPT'
+$selfText = $null
+try {
+    if ($PSCommandPath) { $selfText = Get-Content -LiteralPath $PSCommandPath -Raw -ErrorAction Stop }
+    elseif ($psISE -and $psISE.CurrentFile) { $selfText = $psISE.CurrentFile.Editor.Text }
+} catch { }
+if ($selfText -and $selfText -notlike "*$endMarker*") {
+    Write-Host ''
+    Write-Host 'STOP: this copy of the script is incomplete (the end of the file is missing).' -ForegroundColor Red
+    Write-Host 'The paste was probably cut short. Nothing was run. Paste it again, or transfer the .ps1 file and open that.' -ForegroundColor Red
+    return
+}
+
+# ---------------------------------------------------------------------
+# Console + bookkeeping helpers
+# ---------------------------------------------------------------------
+$script:Errors  = @()
+$script:Flags   = @()
+$script:Timings = [ordered]@{}
+
+# ---------------------------------------------------------------------
+# MAC vendor lookup (embedded table for network gear, online fallback)
+# ---------------------------------------------------------------------
+$script:OuiTable = @{}
+$ouiSeed = @{
+    'Fortinet'   = '00090F 085B0E 704CA5 906CAC E81CBA 04D590 94FF3C'
+    'SonicWall'  = '0017C5 C0EAE4 18B169'
+    'Cisco Meraki' = '00180A 0C8DDB 881544 E0553D AC17C8 2C3F0B 683A1E E0CBBC'
+    'Ubiquiti'   = '00156D 002722 0418D6 24A43C 44D9E7 687251 788A20 802AA8 B4FBE4 DC9FDB F09FC2 FCECDA 74ACB9 18E829 E063DA 245A4C 784558 68D79A 70A741 D021F9 AC8BA9'
+    'WatchGuard' = '00907F'
+    'Sophos'     = '001A8C'
+    'Palo Alto Networks' = '001B17 00869C B40C25 08306B'
+    'Aruba (HPE)' = '000B86 001A1E 24DEC6 6CF37F 94B40F D8C7C8 204C03 9C1C12 84D47E 40E3D6 B45D50 F05C19'
+}
+foreach ($vendor in $ouiSeed.Keys) {
+    foreach ($o in ($ouiSeed[$vendor] -split ' ')) { $script:OuiTable[$o] = $vendor }
+}
+$script:OuiOnlineCount = 0
+
 # (end of v1.6.0 helpers)
 
 # =====================================================================
@@ -3377,25 +4420,6 @@ try {
 } catch { }
 $script:UserHive = "Registry::HKEY_USERS\$($script:UserSid)"
 $script:SameUser = ($script:UserSid -eq $currentId.User.Value)
-
-function Get-UserFolder {
-    # Resolves a shell folder (Desktop, Personal, Downloads GUID) for the inventoried user.
-    param([string]$ValueName, [string]$Fallback)
-    $paths = @("$($script:UserHive)\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
-               "$($script:UserHive)\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
-    foreach ($k in $paths) {
-        try {
-            # Read unexpanded so %USERPROFILE% maps to the inventoried user, not the runner.
-            $v = (Get-Item -LiteralPath $k -ErrorAction Stop).GetValue($ValueName, $null, 'DoNotExpandEnvironmentNames')
-            if ($v) {
-                $v = $v -replace '%USERPROFILE%', $script:UserProfile
-                $v = [Environment]::ExpandEnvironmentVariables($v)
-                if (Test-Path -LiteralPath $v) { return $v }
-            }
-        } catch { }
-    }
-    return (Join-Path $script:UserProfile $Fallback)
-}
 $script:UserDesktop   = Get-UserFolder 'Desktop' 'Desktop'
 $script:UserDocuments = Get-UserFolder 'Personal' 'Documents'
 $script:UserDownloads = Get-UserFolder '{374DE290-123F-4565-9164-39C4925E467B}' 'Downloads'
@@ -3405,16 +4429,6 @@ $script:UserRoaming   = Join-Path $script:UserProfile 'AppData\Roaming'
 # Output folder
 if ($OutputPath) { $OutputRoot = $OutputPath }
 if ($NoPrompt) { $OpenFolderWhenDone = $false; $CopySummaryToClipboard = $false }
-function Test-WritableFolder {
-    param([string]$Folder)
-    try {
-        if (-not (Test-Path -LiteralPath $Folder)) { New-Item -ItemType Directory -Path $Folder -Force | Out-Null }
-        $probe = Join-Path $Folder ('.sa_write_test_{0}' -f (Get-Random))
-        Set-Content -LiteralPath $probe -Value 'x'
-        Remove-Item -LiteralPath $probe -Force
-        return $true
-    } catch { return $false }
-}
 if (-not $OutputRoot) {
     # Same path on every machine, writable by standard users, not synced to the client's OneDrive.
     $candidates = @((Join-Path ([Environment]::GetFolderPath('CommonDocuments')) 'SiteAssessment'),
@@ -3473,22 +4487,6 @@ $Result['Meta'] = [ordered]@{
 # ---------------------------------------------------------------------
 $VpnRegex  = 'TAP-|TAP |TUN|Wintun|WireGuard|Fortinet|FortiClient|PANGP|GlobalProtect|AnyConnect|Cisco Secure|Juniper|SonicWall|NetExtender|WatchGuard|Sophos|OpenVPN|Zscaler|WARP|Cloudflare|Tailscale|ZeroTier|Check Point|Pulse|Ivanti|NordLynx|Hyper-V|vEthernet|VMware|VirtualBox|Npcap|Loopback|Teredo|ISATAP|Bluetooth'
 $UsbRegex  = 'USB|Dock|DisplayLink|ASIX|Thunderbolt|Belkin|Anker|Plugable|CalDigit|Targus|Kensington|Dell .*WD|ThinkPad .*Dock|Lenovo .*Dock|HP .*Dock'
-
-function Get-ConnectionClass {
-    param($Adapter)
-    $desc = "$($Adapter.InterfaceDescription) $($Adapter.Name)"
-    $ndis = "$($Adapter.NdisPhysicalMedium)"
-    $pmt  = "$($Adapter.PhysicalMediaType)"
-    if ($desc -match 'Remote NDIS|RNDIS') { return 'Phone tether (USB)' }
-    if ($ndis -eq '9' -or $ndis -match '802_11' -or $pmt -match '802\.11|Wireless LAN') { return 'Wi-Fi' }
-    if ($ndis -eq '8' -or $pmt -match 'Wireless WAN|Mobile Broadband') { return 'Cellular' }
-    if ($desc -match $VpnRegex -or $Adapter.Virtual) { return 'Virtual/VPN' }
-    if ($ndis -eq '14' -or $ndis -match '802_3' -or $pmt -match '802\.3') {
-        if ($desc -match $UsbRegex) { return 'Wired (USB/dock)' }
-        return 'Wired (onboard)'
-    }
-    return 'Unknown'
-}
 
 $Result['Network'] = Invoke-Collector 'Network adapters and IP config' {
     $adapters = @(Get-NetAdapter -IncludeHidden:$false)
@@ -3645,19 +4643,6 @@ $RdpSafeKeys = @('full address','alternate full address','gateway hostname','gat
     'smart sizing','connection type','networkautodetect','bandwidthautodetect','autoreconnection enabled','username',
     'prompt for credentials','authentication level','enablecredsspsupport','kdcproxyname','use redirection server name',
     'loadbalanceinfo','server port','enablerdsaadauth','targetisaadjoined')
-
-function Read-RdpFile {
-    param([string]$Path)
-    $h = [ordered]@{ Path = $Path; Modified = Format-Date (Get-Item -LiteralPath $Path).LastWriteTime }
-    foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction Stop)) {
-        if ($line -match '^([^:]+):([isb]):(.*)$') {
-            $k = $matches[1].Trim().ToLower()
-            if ($k -match 'password|signature') { continue }
-            if ($RdpSafeKeys -contains $k) { $h[$k] = $matches[3].Trim() }
-        }
-    }
-    return $h
-}
 
 $Result['Rdp'] = Invoke-Collector 'RDP client footprint' {
     $out = [ordered]@{}
@@ -4461,59 +5446,6 @@ $Result['Peripherals'] = Invoke-Collector 'Printers and peripherals' {
 # ---------------------------------------------------------------------
 $LocKey = 'Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
 
-function Get-RegString {
-    param([string]$Path, [string]$Name)
-    try { return (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name } catch { return $null }
-}
-
-function Get-LocationPolicy {
-    $r = [ordered]@{ PolicyBlocked = $false; PolicyReason = $null; DeviceValue = $null; UserValue = $null; DesktopAppsValue = $null }
-    $policies = @(
-        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'; N = 'LetAppsAccessLocation'; Bad = 2 },
-        @{ P = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Privacy'; N = 'LetAppsAccessLocation'; Bad = 2 },
-        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors'; N = 'DisableLocation'; Bad = 1 },
-        @{ P = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\System'; N = 'AllowLocation'; Bad = 0 }
-    )
-    foreach ($p in $policies) {
-        $v = Get-RegString $p.P $p.N
-        if ($null -ne $v -and [int]$v -eq $p.Bad) { $r.PolicyBlocked = $true; $r.PolicyReason = '{0}\{1}={2}' -f $p.P, $p.N, $v }
-    }
-    $r.DeviceValue = Get-RegString "HKLM:\$LocKey" 'Value'
-    $r.UserValue = Get-RegString "HKCU:\$LocKey" 'Value'
-    $r.DesktopAppsValue = Get-RegString "HKCU:\$LocKey\NonPackaged" 'Value'
-    return $r
-}
-
-function Enable-TempLocation {
-    # Returns the list of changes so Restore-TempLocation can undo exactly what was touched.
-    param([bool]$IncludeDevice)
-    $paths = @("HKCU:\$LocKey", "HKCU:\$LocKey\NonPackaged")
-    if ($IncludeDevice) { $paths = @("HKLM:\$LocKey") + $paths }
-    $changes = @()
-    foreach ($p in $paths) {
-        $existed = Test-Path -LiteralPath $p
-        $orig = Get-RegString $p 'Value'
-        if ($orig -eq 'Allow') { continue }
-        if (-not $existed) { New-Item -Path $p -Force | Out-Null }
-        New-ItemProperty -LiteralPath $p -Name 'Value' -Value 'Allow' -PropertyType String -Force | Out-Null
-        $changes += [pscustomobject]@{ Path = $p; Existed = $existed; Original = $orig }
-    }
-    return $changes
-}
-
-function Restore-TempLocation {
-    param($Changes)
-    $failed = @()
-    foreach ($c in @($Changes)[($Changes.Count - 1)..0]) {
-        try {
-            if ($null -ne $c.Original) { New-ItemProperty -LiteralPath $c.Path -Name 'Value' -Value $c.Original -PropertyType String -Force | Out-Null }
-            else { Remove-ItemProperty -LiteralPath $c.Path -Name 'Value' -ErrorAction Stop }
-            if (-not $c.Existed) { Remove-Item -LiteralPath $c.Path -Force -ErrorAction SilentlyContinue }
-        } catch { $failed += $c.Path }
-    }
-    return $failed
-}
-
 $Result['Wireless'] = Invoke-Collector 'Wireless' {
     $hasWifi = @($Result['Network']['Adapters'] | Where-Object { $_.Class -eq 'Wi-Fi' }).Count -gt 0
     if (-not $hasWifi) { return [ordered]@{ Status = 'No Wi-Fi adapter' } }
@@ -5256,35 +6188,6 @@ if ($EnableTlsCheck -and $script:FullLanguage) {
     }
 }
 
-function Get-PathMtu {
-    param([string]$Target)
-    $probe = {
-        param($size)
-        if ($script:FullLanguage) {
-            # Don't-fragment ping of $size bytes; PacketTooBig is the "needs to be fragmented" answer in any language.
-            try {
-                $r = (New-Object Net.NetworkInformation.Ping).Send($Target, 1500, (New-Object byte[] $size), (New-Object Net.NetworkInformation.PingOptions(64, $true)))
-                if ("$($r.Status)" -eq 'Success') { return 'ok' }
-                if ("$($r.Status)" -eq 'PacketTooBig') { return 'frag' }
-            } catch { }
-            return 'none'
-        }
-        $o = Invoke-Native 'ping.exe' "-f -l $size -n 1 -w 1500 $Target" 6
-        if ($o -match 'needs to be fragmented|Packet needs') { return 'frag' }
-        if ($o -match '[=<]\s*\d+\s*(ms|\u043c\u0441)') { return 'ok' }
-        return 'none'
-    }
-    $first = & $probe 1472
-    if ($first -eq 'ok') { return [ordered]@{ Target = $Target; MtuBytes = 1500; Note = 'Full 1500' } }
-    if ((& $probe 576) -ne 'ok') { return [ordered]@{ Target = $Target; MtuBytes = $null; Note = 'ICMP blocked or no reply' } }
-    $lo = 548; $hi = 1472
-    while ($hi - $lo -gt 4) {
-        $mid = [int](($lo + $hi) / 2)
-        if ((& $probe $mid) -eq 'ok') { $lo = $mid } else { $hi = $mid }
-    }
-    return [ordered]@{ Target = $Target; MtuBytes = $lo + 28; Note = 'Reduced (tunnel/PPPoE overhead likely)' }
-}
-
 $Result['Mtu'] = Invoke-Collector 'Path MTU probe' {
     $res = @(Get-PathMtu '1.1.1.1')
     if ($RdpHosts.Count -gt 0) { $res += Get-PathMtu $RdpHosts[0] }
@@ -5292,173 +6195,6 @@ $Result['Mtu'] = Invoke-Collector 'Path MTU probe' {
     $privTarget = @($RdpHosts | Where-Object { (Test-IPv4 $_) -and (Get-IpClass $_) -eq 'Private' }) | Select-Object -First 1
     if ($privTarget -and $privTarget -ne $RdpHosts[0]) { $res += Get-PathMtu $privTarget }
     $res
-}
-
-# =====================================================================
-# PHASE 5: collect background jobs
-# =====================================================================
-function ConvertFrom-NeighborCapture {
-    # Parses LLDP and CDP frames out of a pktmon pcapng file.
-    param([string]$Path)
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    $frames = @()
-    $pos = 0
-    while ($pos + 12 -le $bytes.Length) {
-        $type = [BitConverter]::ToUInt32($bytes, $pos)
-        $len  = [BitConverter]::ToUInt32($bytes, $pos + 4)
-        if ($len -lt 12 -or $pos + $len -gt $bytes.Length) { break }
-        if ($type -eq 6) {
-            $capLen = [BitConverter]::ToUInt32($bytes, $pos + 20)
-            $data = New-Object byte[] $capLen
-            [Array]::Copy($bytes, $pos + 28, $data, 0, $capLen)
-            $frames += ,$data
-        }
-        $pos += $len
-    }
-    $txt = { param($b, $off) [Text.Encoding]::ASCII.GetString($b, $off, $b.Length - $off) -replace '[^\x20-\x7E]', '' }
-    $mac = { param($b, $off) (($b[$off..($off + 5)] | ForEach-Object { '{0:X2}' -f $_ }) -join '-') }
-    # IEEE 802.3 operational MAU types seen most often (RFC 4836).
-    $mau = @{ 10 = '10BASE-T full'; 15 = '100BASE-TX half'; 16 = '100BASE-TX full'; 29 = '1000BASE-T half'; 30 = '1000BASE-T full'; 54 = '10GBASE-T' }
-    $found = @()
-    foreach ($f in $frames) {
-        if ($f.Length -lt 16) { continue }
-        $etype = ($f[12] * 256) + $f[13]
-        if ($etype -eq 0x88CC) {
-            $info = [ordered]@{ Protocol = 'LLDP'; SystemName = $null; Model = $null; Port = $null; PortId = $null; PortDescription = $null; LinkMode = $null; Vlan = $null; MgmtIP = $null; ChassisMac = $null; ChassisVendor = $null; SystemDescription = $null }
-            $p = 14
-            while ($p + 2 -le $f.Length) {
-                $hdr = ($f[$p] * 256) + $f[$p + 1]
-                $tt = $hdr -shr 9; $tl = $hdr -band 0x1FF
-                $p += 2
-                if ($tt -eq 0 -or $p + $tl -gt $f.Length) { break }
-                $val = New-Object byte[] $tl
-                [Array]::Copy($f, $p, $val, 0, $tl)
-                switch ($tt) {
-                    1 { if ($tl -ge 7 -and $val[0] -eq 4) { $info['ChassisMac'] = & $mac $val 1 } }
-                    # Port ID subtype 3 is a MAC address; the others are text (interface alias/name, local).
-                    2 { if ($tl -ge 7 -and $val[0] -eq 3) { $info['PortId'] = 'MAC ' + (& $mac $val 1) } else { $info['PortId'] = & $txt $val 1 } }
-                    4 { $info['PortDescription'] = & $txt $val 0 }
-                    5 { $info['SystemName'] = & $txt $val 0 }
-                    6 { $info['SystemDescription'] = & $txt $val 0 }
-                    8 { if ($tl -ge 6 -and $val[1] -eq 1) { $info['MgmtIP'] = '{0}.{1}.{2}.{3}' -f $val[2], $val[3], $val[4], $val[5] } }
-                    127 {
-                        if ($tl -ge 6 -and $val[0] -eq 0x00 -and $val[1] -eq 0x80 -and $val[2] -eq 0xC2 -and $val[3] -eq 1) { $info['Vlan'] = ($val[4] * 256) + $val[5] }
-                        elseif ($tl -ge 9 -and $val[0] -eq 0x00 -and $val[1] -eq 0x12 -and $val[2] -eq 0x0F -and $val[3] -eq 1) {
-                            $m = ($val[7] * 256) + $val[8]
-                            $info['LinkMode'] = if ($mau.ContainsKey($m)) { $mau[$m] } else { "MAU type $m" }
-                        }
-                    }
-                }
-                $p += $tl
-            }
-            # Human-friendly port: a short description (often just the port number) beats a MAC-style port ID.
-            $info['Port'] = if ($info['PortDescription'] -and $info['PortDescription'].Length -le 24) { $info['PortDescription'] } else { $info['PortId'] }
-            if ($info['SystemDescription']) { $info['Model'] = ($info['SystemDescription'] -split ',')[0].Trim() }
-            if ($info['ChassisMac']) { $info['ChassisVendor'] = Get-MacVendor $info['ChassisMac'] }
-            $found += [pscustomobject]$info
-        } elseif ($f[0] -eq 0x01 -and $f[1] -eq 0x00 -and $f[2] -eq 0x0C -and $f[3] -eq 0xCC) {
-            # CDP over 802.3 + LLC/SNAP: header 14 + 8, then version/ttl/checksum (4)
-            $info = [ordered]@{ Protocol = 'CDP'; SystemName = $null; Model = $null; Port = $null; PortId = $null; PortDescription = $null; LinkMode = $null; Vlan = $null; MgmtIP = $null; ChassisMac = $null; ChassisVendor = $null; SystemDescription = $null }
-            $p = 26
-            while ($p + 4 -le $f.Length) {
-                $tt = ($f[$p] * 256) + $f[$p + 1]; $tl = ($f[$p + 2] * 256) + $f[$p + 3]
-                if ($tl -lt 4 -or $p + $tl -gt $f.Length) { break }
-                $s = [Text.Encoding]::ASCII.GetString($f, $p + 4, $tl - 4) -replace '[^\x20-\x7E]', ''
-                switch ($tt) { 1 { $info['SystemName'] = $s } 3 { $info['PortId'] = $s } 5 { $info['SystemDescription'] = $s } 6 { $info['Model'] = $s } 10 { if ($tl -ge 6) { $info['Vlan'] = ($f[$p + 4] * 256) + $f[$p + 5] } } }
-                $p += $tl
-            }
-            $info['Port'] = $info['PortId']
-            $found += [pscustomobject]$info
-        }
-    }
-    [ordered]@{
-        FramesCaptured = $frames.Count
-        Neighbors = @($found | Sort-Object Protocol, SystemName, Port -Unique)
-        Note = if ($found.Count -eq 0) { 'No LLDP/CDP seen: switch is unmanaged, LLDP disabled, or interval > capture window' } else { $null }
-    }
-}
-
-function ConvertFrom-Tracert {
-    param([string]$Text)
-    $hops = @()
-    foreach ($line in ($Text -split "`r?`n")) {
-        if ($line -match '^\s*(\d+)\s+(\*|<?\s*\d+\s*(?:ms|\u043c\u0441))\s+(\*|<?\s*\d+\s*(?:ms|\u043c\u0441))\s+(\*|<?\s*\d+\s*(?:ms|\u043c\u0441))\s+(.+?)\s*$') {
-            $hopNum = [int]$matches[1]
-            $rtts = @($matches[2], $matches[3], $matches[4]) | Where-Object { $_ -ne '*' } | ForEach-Object { [int](($_ -replace '[^\d]', '')) }
-            $addr = $matches[5].Trim()
-            $ip = if ($addr -match '(\d{1,3}(\.\d{1,3}){3})') { $matches[1] } else { $null }
-            $hops += [pscustomobject]@{
-                Hop = $hopNum; IP = $ip; Class = if ($ip) { Get-IpClass $ip } else { 'Timeout' }
-                AvgMs = if ($rtts.Count) { [math]::Round((($rtts | Measure-Object -Average).Average), 1) } else { $null }
-                Ptr = $null
-            }
-        }
-    }
-    return $hops
-}
-
-function Get-TraceAnalysis {
-    param($Hops)
-    $firstPublic = $Hops | Where-Object { $_.Class -eq 'Public' } | Select-Object -First 1
-    $firstCgnat = $Hops | Where-Object { $_.Class -eq 'CGNAT' } | Select-Object -First 1
-    $afterGw = @($Hops | Where-Object { $_.Hop -gt 1 -and (-not $firstPublic -or $_.Hop -lt $firstPublic.Hop) })
-    $privateAfterGw = @($afterGw | Where-Object { $_.Class -eq 'Private' })
-    # Private hops after a CGNAT hop are inside the carrier's network (Starlink, cellular, some cable ISPs).
-    $carrierHops = @($privateAfterGw | Where-Object { $firstCgnat -and $_.Hop -gt $firstCgnat.Hop })
-    $customerHops = @($privateAfterGw | Where-Object { -not ($firstCgnat -and $_.Hop -gt $firstCgnat.Hop) })
-    # A customer-side private hop with real latency looks like a tunnel/MPLS (or ISP-internal); low latency = double NAT.
-    $tunnelHops = @($customerHops | Where-Object { $_.AvgMs -ge 6 })
-    [ordered]@{
-        HopCount           = $Hops.Count
-        FirstPublicHop     = if ($firstPublic) { $firstPublic.Hop } else { $null }
-        FirstPublicIP      = if ($firstPublic) { $firstPublic.IP } else { $null }
-        FirstPublicMs      = if ($firstPublic) { $firstPublic.AvgMs } else { $null }
-        PrivateHopsAfterGw = @($customerHops | ForEach-Object { '{0}@{1}ms' -f $_.IP, $_.AvgMs })
-        CarrierPrivateHops = @($carrierHops | ForEach-Object { '{0}@{1}ms' -f $_.IP, $_.AvgMs })
-        CgnatHops          = @($Hops | Where-Object { $_.Class -eq 'CGNAT' }).Count
-        TunnelIndicator    = ($tunnelHops.Count -gt 0)
-        DoubleNatLikely    = ($customerHops.Count -gt 0 -and $tunnelHops.Count -eq 0)
-        ReachedTarget      = $false
-    }
-}
-
-function ConvertFrom-PingOutput {
-    param([string]$Text, [string]$Target, [int]$Sent)
-    $times = @()
-    # 'time=12ms' in English, 'Zeit=12ms', 'temps=12 ms', 'tiempo<1 ms', Cyrillic 'ms'... the number after = or <, followed by ms.
-    foreach ($m in [regex]::Matches($Text, '[=<]\s*(\d+)\s*(?:ms|\u043c\u0441)\b')) { $times += [int]$m.Groups[1].Value }
-    $recv = $times.Count
-    $sorted = @($times | Sort-Object)
-    $jit = $null
-    if ($times.Count -gt 1) { $d = 0; for ($k = 1; $k -lt $times.Count; $k++) { $d += [math]::Abs($times[$k] - $times[$k - 1]) }; $jit = [math]::Round($d / ($times.Count - 1), 1) }
-    [ordered]@{
-        Target  = $Target
-        Sent    = $Sent
-        Received = $recv
-        LossPct = if ($Sent) { [math]::Round(100 * ($Sent - $recv) / $Sent, 1) } else { $null }
-        MinMs   = if ($recv) { $sorted[0] } else { $null }
-        AvgMs   = if ($recv) { [math]::Round(($times | Measure-Object -Average).Average, 1) } else { $null }
-        P95Ms   = if ($recv) { $sorted[[math]::Min($sorted.Count - 1, [int][math]::Ceiling(0.95 * $sorted.Count) - 1)] } else { $null }
-        MaxMs   = if ($recv) { $sorted[-1] } else { $null }
-        JitterMs = $jit
-    }
-}
-
-function ConvertTo-TraceResult {
-    # Saves the raw tracert text next to the JSON and returns the parsed hops plus analysis.
-    param([string]$Target, [string]$Text)
-    Set-Content -LiteralPath (Join-Path $OutDir ('traceroute_{0}.txt' -f ($Target -replace '[^A-Za-z0-9\.-]', '_'))) -Value $Text
-    $hops = @(ConvertFrom-Tracert $Text)
-    $pub = 0
-    foreach ($h in $hops) {
-        if ($h.Class -eq 'Public' -and $pub -lt 2) { $h.Ptr = Resolve-Ptr $h.IP; $pub++ }
-    }
-    $an = Get-TraceAnalysis $hops
-    $destIp = if ($Text -match '\[(\d{1,3}(\.\d{1,3}){3})\]') { $matches[1] } elseif (Test-IPv4 $Target) { $Target } else { $null }
-    $lastHop = $hops | Where-Object { $_.IP } | Select-Object -Last 1
-    $an['ReachedTarget'] = [bool]($destIp -and $lastHop -and $lastHop.IP -eq $destIp)
-    $an['FirstPublicPtr'] = ($hops | Where-Object { $_.Ptr } | Select-Object -First 1).Ptr
-    return [pscustomobject]@{ Target = $Target; Analysis = $an; Hops = $hops }
 }
 
 $seriesLeft = [math]::Max(0, [int]($PingCount + 15 - ((Get-Date) - $RunStart).TotalSeconds))
@@ -5512,509 +6248,6 @@ if ($script:PktmonStarted) {
     }
 }
 
-# =====================================================================
-# PHASE 6: bandwidth (after the ping, TCP and trace series, so it does not distort them;
-# before active discovery, so nothing that might upset security software runs ahead of it)
-# Each direction fails over through $BandwidthProviders in order:
-#   Cloudflare (download + upload) -> M-Lab NDT7 (download + upload) -> Vultr (download only).
-# The helper functions below run inside Measure-Bandwidth and use its $client, $sw,
-# $startProbe and $finishProbe through PowerShell's dynamic scoping.
-# =====================================================================
-function Get-MedianValue { param($Values) $s = @($Values | Where-Object { $null -ne $_ } | Sort-Object); if ($s.Count) { return [math]::Round([double]$s[[int][math]::Floor($s.Count / 2)], 1) } return $null }
-
-function Get-ThroughputStats {
-    # Mbps over the run minus the TCP ramp-up (first 2 s or 20%), plus the best 1-second window.
-    param($Samples, [double]$T0)
-    if ($Samples.Count -lt 2) { return @(0, 0) }
-    $dur = $Samples[$Samples.Count - 1].T - $T0
-    $skip = $T0 + [math]::Min(2.0, $dur * 0.2)
-    $a = $Samples | Where-Object { $_.T -ge $skip } | Select-Object -First 1
-    $b = $Samples[$Samples.Count - 1]
-    if (-not $a -or $b.T - $a.T -lt 0.5) { $a = $Samples[0] }
-    $mbps = if ($b.T - $a.T -gt 0) { ($b.B - $a.B) * 8 / ($b.T - $a.T) / 1e6 } else { 0 }
-    $peak = 0
-    for ($x = 0; $x -lt $Samples.Count; $x++) {
-        for ($y = $x + 1; $y -lt $Samples.Count; $y++) {
-            if ($Samples[$y].T - $Samples[$x].T -ge 1.0) { $v = ($Samples[$y].B - $Samples[$x].B) * 8 / ($Samples[$y].T - $Samples[$x].T) / 1e6; if ($v -gt $peak) { $peak = $v }; break }
-        }
-    }
-    return @([math]::Round($mbps, 1), [math]::Round($peak, 1))
-}
-
-function Invoke-HttpDownloadTest {
-    # Multi-stream HTTP download for $BandwidthSeconds; $UrlFactory returns the URL for each new request.
-    param([scriptblock]$UrlFactory, [int64]$CapBytes)
-    $out = @{ Ok = $false; Mbps = $null; PeakMbps = $null; MB = 0; LoadedLatencyMs = $null; HttpStatus = @(); Errors = @(); Had429 = $false; RetryAfterSec = $null }
-    $cts = New-Object Threading.CancellationTokenSource
-    $streams = @{}
-    $total = [int64]0
-    $samples = New-Object Collections.Generic.List[object]
-    $loaded = @()
-    $probeTask = $null; $probeStart = 0; $lastProbe = 0
-    $status = @{}; $errors = @(); $faults = 0
-    $start = $sw.Elapsed.TotalSeconds
-    $deadline = $start + $BandwidthSeconds
-    $startStream = {
-        param($slot)
-        $req = $client.GetAsync((& $UrlFactory), [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cts.Token)
-        $streams[$slot] = @{ Phase = 'head'; Req = $req; Stream = $null; Read = $null; Buf = (New-Object byte[] 262144) }
-    }
-    for ($s = 0; $s -lt $BandwidthStreams; $s++) { & $startStream $s }
-    while ($sw.Elapsed.TotalSeconds -lt $deadline -and $total -lt $CapBytes) {
-        $tasks = @()
-        foreach ($k in @($streams.Keys)) {
-            $st = $streams[$k]
-            if ($st.Phase -eq 'head') { $tasks += $st.Req } elseif ($st.Phase -eq 'body' -and $st.Read) { $tasks += $st.Read }
-        }
-        if ($tasks.Count -eq 0) { break }   # every stream gave up (errors/non-200)
-        [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$tasks, 100)
-        foreach ($k in @($streams.Keys)) {
-            $st = $streams[$k]
-            if ($st.Phase -eq 'head' -and $st.Req.IsCompleted) {
-                if ($st.Req.IsFaulted -or $st.Req.IsCanceled) {
-                    $faults++
-                    if ($st.Req.Exception) { $m = $st.Req.Exception.GetBaseException().Message; if ($errors -notcontains $m -and $errors.Count -lt 3) { $errors += $m } }
-                    if ($faults -lt 20) { & $startStream $k } else { $st.Phase = 'dead' }
-                    continue
-                }
-                $resp = $st.Req.Result
-                $code = [int]$resp.StatusCode
-                $status["$code"] = 1 + [int]$status["$code"]
-                if (-not $resp.IsSuccessStatusCode) {
-                    if ($code -eq 429) {
-                        $out.Had429 = $true
-                        try { $dlt = $resp.Headers.RetryAfter.Delta; if ($dlt) { $out.RetryAfterSec = [int]([TimeSpan]$dlt).TotalSeconds } } catch { }
-                    }
-                    # Stop this stream instead of hammering the endpoint.
-                    try { $resp.Dispose() } catch { }
-                    $st.Phase = 'dead'
-                    continue
-                }
-                $st.Stream = $resp.Content.ReadAsStreamAsync().Result
-                $st.Phase = 'body'
-                $st.Read = $st.Stream.ReadAsync($st.Buf, 0, $st.Buf.Length, $cts.Token)
-            } elseif ($st.Phase -eq 'body' -and $st.Read.IsCompleted) {
-                $n = 0
-                if (-not $st.Read.IsFaulted -and -not $st.Read.IsCanceled) { $n = $st.Read.Result }
-                if ($n -gt 0) {
-                    $total += $n
-                    $st.Read = $st.Stream.ReadAsync($st.Buf, 0, $st.Buf.Length, $cts.Token)
-                } else {
-                    try { $st.Stream.Dispose(); $st.Req.Result.Dispose() } catch { }
-                    & $startStream $k
-                }
-            }
-        }
-        $now = $sw.Elapsed.TotalSeconds
-        if ($samples.Count -eq 0 -or $now - $samples[$samples.Count - 1].T -ge 0.25) { $samples.Add([pscustomobject]@{ T = $now; B = $total }) }
-        if ($probeTask -and $probeTask.IsCompleted) {
-            $lv = & $finishProbe $probeTask $probeStart
-            if ($null -ne $lv) { $loaded += $lv }
-            $probeTask = $null
-        }
-        if (-not $probeTask -and $now - $lastProbe -ge 0.5 -and $now - $start -gt 0.3) {
-            $probeStart = $sw.Elapsed.TotalMilliseconds; $lastProbe = $now
-            $probeTask = & $startProbe
-        }
-    }
-    $cts.Cancel()
-    $samples.Add([pscustomobject]@{ T = $sw.Elapsed.TotalSeconds; B = $total })
-    foreach ($k in @($streams.Keys)) { try { if ($streams[$k].Stream) { $streams[$k].Stream.Dispose() } } catch { } }
-    if ($probeTask) { try { [void]$probeTask.Wait(2500) } catch { } }
-    $stats = Get-ThroughputStats $samples $start
-    $out.MB = [math]::Round($total / 1MB, 1)
-    $out.HttpStatus = @($status.Keys | Sort-Object | ForEach-Object { '{0} x{1}' -f $_, $status[$_] })
-    $out.Errors = $errors
-    $out.LoadedLatencyMs = Get-MedianValue $loaded
-    if ($total -ge 1MB) { $out.Ok = $true; $out.Mbps = $stats[0]; $out.PeakMbps = $stats[1] }
-    return $out
-}
-
-function Invoke-CloudflareUpload {
-    param([int64]$CapBytes)
-    $out = @{ Ok = $false; Mbps = $null; MB = 0; LoadedLatencyMs = $null; HttpStatus = @(); Errors = @(); Had429 = $false; RetryAfterSec = $null }
-    $rand = New-Object Random
-    $payload = New-Object byte[] (16MB)
-    $rand.NextBytes($payload)
-    $size = 1MB
-    $inflight = @{}
-    $ulBytes = [int64]0
-    $loaded = @(); $probeTask = $null; $probeStart = 0; $lastProbe = 0
-    $status = @{}; $errors = @()
-    $ulStart = $sw.Elapsed.TotalSeconds
-    $ulDeadline = $ulStart + $BandwidthSeconds
-    $lastDone = $ulStart
-    $sent = [int64]0
-    for ($s = 0; $s -lt $BandwidthStreams; $s++) {
-        $inflight[$s] = @{ Task = $client.PostAsync('https://speed.cloudflare.com/__up', [Net.Http.ByteArrayContent]::new($payload, 0, $size)); Size = $size; Started = $sw.Elapsed.TotalSeconds }
-        $sent += $size
-    }
-    while ($true) {
-        $now = $sw.Elapsed.TotalSeconds
-        $active = @($inflight.Keys | Where-Object { $inflight[$_] })
-        if ($active.Count -eq 0) { break }
-        if ($now -gt $ulDeadline + 8) { break }
-        $tasks = @($active | ForEach-Object { $inflight[$_].Task })
-        [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$tasks, 100)
-        foreach ($k in $active) {
-            $it = $inflight[$k]
-            if (-not $it.Task.IsCompleted) { continue }
-            $took = $sw.Elapsed.TotalSeconds - $it.Started
-            $okPost = $false
-            if (-not $it.Task.IsFaulted -and -not $it.Task.IsCanceled) {
-                $resp = $it.Task.Result
-                $code = [int]$resp.StatusCode
-                $status["$code"] = 1 + [int]$status["$code"]
-                if ($resp.IsSuccessStatusCode) {
-                    $okPost = $true
-                    $ulBytes += $it.Size; $lastDone = $sw.Elapsed.TotalSeconds
-                    if ($took -lt 0.5 -and $size -lt 16MB) { $size = [int]($size * 2) }
-                } elseif ($code -eq 429) {
-                    $out.Had429 = $true
-                    try { $dlt = $resp.Headers.RetryAfter.Delta; if ($dlt) { $out.RetryAfterSec = [int]([TimeSpan]$dlt).TotalSeconds } } catch { }
-                }
-                try { $resp.Dispose() } catch { }
-            } elseif ($it.Task.Exception) {
-                $m = $it.Task.Exception.GetBaseException().Message
-                if ($errors -notcontains $m -and $errors.Count -lt 3) { $errors += $m }
-            }
-            $inflight[$k] = $null
-            if ($okPost -and $sw.Elapsed.TotalSeconds -lt $ulDeadline -and $sent -lt $CapBytes) {
-                $inflight[$k] = @{ Task = $client.PostAsync('https://speed.cloudflare.com/__up', [Net.Http.ByteArrayContent]::new($payload, 0, $size)); Size = $size; Started = $sw.Elapsed.TotalSeconds }
-                $sent += $size
-            }
-        }
-        $now = $sw.Elapsed.TotalSeconds
-        if ($probeTask -and $probeTask.IsCompleted) {
-            $lv = & $finishProbe $probeTask $probeStart
-            if ($null -ne $lv) { $loaded += $lv }
-            $probeTask = $null
-        }
-        if (-not $probeTask -and $now - $lastProbe -ge 0.5 -and $now - $ulStart -gt 0.3 -and $now -lt $ulDeadline) {
-            $probeStart = $sw.Elapsed.TotalMilliseconds; $lastProbe = $now
-            $probeTask = & $startProbe
-        }
-    }
-    if ($probeTask) { try { [void]$probeTask.Wait(2500) } catch { } }
-    $ulDur = $lastDone - $ulStart
-    $out.MB = [math]::Round($ulBytes / 1MB, 1)
-    $out.HttpStatus = @($status.Keys | Sort-Object | ForEach-Object { '{0} x{1}' -f $_, $status[$_] })
-    $out.Errors = $errors
-    $out.LoadedLatencyMs = Get-MedianValue $loaded
-    if ($ulBytes -ge 1MB -and $ulDur -gt 0) { $out.Ok = $true; $out.Mbps = [math]::Round($ulBytes * 8 / $ulDur / 1e6, 1) }
-    return $out
-}
-
-function Get-MlabServers {
-    # M-Lab's locate API returns the nearest NDT7 servers with short-lived access tokens.
-    $l = Invoke-RestMethod -Uri 'https://locate.measurementlab.net/v2/nearest/ndt/ndt7' -UseBasicParsing -TimeoutSec 10
-    return @(@($l.results) | ForEach-Object {
-        [pscustomobject]@{ Machine = $_.machine; City = $_.location.city; Country = $_.location.country; Download = $_.urls.'wss:///ndt/v7/download'; Upload = $_.urls.'wss:///ndt/v7/upload' }
-    } | Where-Object { $_.Download -and $_.Upload })
-}
-
-function Invoke-Ndt7Test {
-    # One NDT7 test over WebSocket (protocol net.measurementlab.ndt.v7). Download: the server
-    # streams for ~10 s. Upload: we send growing binary messages for $BandwidthSeconds.
-    param([string]$Url, [string]$Direction, [int64]$CapBytes = [int64]::MaxValue)
-    $out = @{ Ok = $false; Mbps = $null; PeakMbps = $null; ClientMbps = $null; ServerMbps = $null; MinRttMs = $null; MB = 0; LoadedLatencyMs = $null; Error = $null }
-    $ws = New-Object Net.WebSockets.ClientWebSocket
-    $ws.Options.AddSubProtocol('net.measurementlab.ndt.v7')
-    $ws.Options.SetBuffer(65536, 65536)
-    $cts = New-Object Threading.CancellationTokenSource
-    $samples = New-Object Collections.Generic.List[object]
-    $loaded = @(); $probeTask = $null; $probeStart = 0; $lastProbe = 0
-    $total = [int64]0
-    $lastServer = $null
-    try {
-        $connect = $ws.ConnectAsync([Uri]$Url, $cts.Token)
-        if (-not $connect.Wait(10000)) { throw 'WebSocket connect timed out' }
-        $buf = New-Object byte[] 1048576
-        $seg = [ArraySegment[byte]]::new($buf)
-        $text = New-Object Text.StringBuilder
-        $start = $sw.Elapsed.TotalSeconds
-        $recv = $ws.ReceiveAsync($seg, $cts.Token)
-        $closed = $false
-        $handleRecv = {
-            # Returns $false once the server closes the connection.
-            if ($recv.IsFaulted -or $recv.IsCanceled) { return $false }
-            $r = $recv.Result
-            if ("$($r.MessageType)" -eq 'Close') { return $false }
-            if ("$($r.MessageType)" -eq 'Binary') { if ($Direction -eq 'download') { $script:ndtRecvBytes += $r.Count } }
-            else {
-                [void]$text.Append([Text.Encoding]::UTF8.GetString($buf, 0, $r.Count))
-                if ($r.EndOfMessage) { $script:ndtLastServer = $text.ToString(); [void]$text.Clear() }
-            }
-            return $true
-        }
-        $script:ndtRecvBytes = [int64]0; $script:ndtLastServer = $null
-        if ($Direction -eq 'download') {
-            $deadline = $start + 13
-            # The server streams for 10 s regardless of speed; stop early at the data cap.
-            while (-not $closed -and $sw.Elapsed.TotalSeconds -lt $deadline -and $total -lt $CapBytes) {
-                if ($recv.Wait(100)) {
-                    if (& $handleRecv) { $recv = $ws.ReceiveAsync($seg, $cts.Token) } else { $closed = $true }
-                }
-                $total = $script:ndtRecvBytes
-                $now = $sw.Elapsed.TotalSeconds
-                if ($samples.Count -eq 0 -or $now - $samples[$samples.Count - 1].T -ge 0.25) { $samples.Add([pscustomobject]@{ T = $now; B = $total }) }
-                if ($probeTask -and $probeTask.IsCompleted) { $lv = & $finishProbe $probeTask $probeStart; if ($null -ne $lv) { $loaded += $lv }; $probeTask = $null }
-                if (-not $probeTask -and $now - $lastProbe -ge 0.5 -and $now - $start -gt 0.3) { $probeStart = $sw.Elapsed.TotalMilliseconds; $lastProbe = $now; $probeTask = & $startProbe }
-            }
-        } else {
-            $payload = New-Object byte[] (1MB)
-            (New-Object Random).NextBytes($payload)
-            $size = 8192
-            $pending = 0
-            $send = $null
-            $deadline = $start + $BandwidthSeconds
-            while (-not $closed -and $sw.Elapsed.TotalSeconds -lt $deadline) {
-                if (-not $send -or $send.IsCompleted) {
-                    if ($send -and ($send.IsFaulted -or $send.IsCanceled)) { throw "upload send failed: $($send.Exception.GetBaseException().Message)" }
-                    if ($send) { $total += $pending }
-                    # NDT7 guidance: grow the message while it is under 1/16 of what has been sent.
-                    # Capped at 64 KB: larger frames from the .NET Framework client got reset by some servers.
-                    if ($size -lt 64KB -and $total -ge 16 * $size) { $size = $size * 2 }
-                    $pending = $size
-                    $send = $ws.SendAsync([ArraySegment[byte]]::new($payload, 0, $size), [Net.WebSockets.WebSocketMessageType]::Binary, $true, $cts.Token)
-                }
-                if ($recv.IsCompleted) { if (& $handleRecv) { $recv = $ws.ReceiveAsync($seg, $cts.Token) } else { $closed = $true } }
-                [void]$send.Wait(50)
-                $now = $sw.Elapsed.TotalSeconds
-                if ($samples.Count -eq 0 -or $now - $samples[$samples.Count - 1].T -ge 0.25) { $samples.Add([pscustomobject]@{ T = $now; B = $total }) }
-                if ($probeTask -and $probeTask.IsCompleted) { $lv = & $finishProbe $probeTask $probeStart; if ($null -ne $lv) { $loaded += $lv }; $probeTask = $null }
-                if (-not $probeTask -and $now - $lastProbe -ge 0.5 -and $now - $start -gt 0.3) { $probeStart = $sw.Elapsed.TotalMilliseconds; $lastProbe = $now; $probeTask = & $startProbe }
-            }
-            if ($send -and $send.Wait(3000) -and -not $send.IsFaulted) { $total += $pending }
-            # Give the server a moment to send its final measurement.
-            $until = $sw.Elapsed.TotalSeconds + 1.5
-            while (-not $closed -and $sw.Elapsed.TotalSeconds -lt $until) {
-                if ($recv.Wait(100)) { if (& $handleRecv) { $recv = $ws.ReceiveAsync($seg, $cts.Token) } else { $closed = $true } }
-            }
-        }
-        $samples.Add([pscustomobject]@{ T = $sw.Elapsed.TotalSeconds; B = $total })
-        $lastServer = $script:ndtLastServer
-        $stats = Get-ThroughputStats $samples $start
-        $out.ClientMbps = $stats[0]; $out.PeakMbps = $stats[1]
-        $out.MB = [math]::Round($total / 1MB, 1)
-        if ($lastServer) {
-            try {
-                $m = $lastServer | ConvertFrom-Json
-                $ti = $m.TCPInfo
-                if ($ti -and $ti.ElapsedTime -gt 0) {
-                    $bytes = if ($Direction -eq 'download') { [double]$ti.BytesAcked } else { [double]$ti.BytesReceived }
-                    if ($bytes -gt 0) { $out.ServerMbps = [math]::Round($bytes * 8 / ([double]$ti.ElapsedTime / 1e6) / 1e6, 1) }
-                    if ($ti.MinRTT) { $out.MinRttMs = [math]::Round([double]$ti.MinRTT / 1000, 1) }
-                }
-            } catch { }
-        }
-        # Upload bytes counted on our side include what is still queued in the socket, so prefer the server's figure there.
-        $out.Mbps = if ($Direction -eq 'upload' -and $out.ServerMbps) { $out.ServerMbps } else { $out.ClientMbps }
-        $out.Ok = ($total -ge 1MB -and $out.Mbps -gt 0)
-    } catch {
-        $out.Error = $_.Exception.GetBaseException().Message
-    } finally {
-        try { [void]$ws.CloseOutputAsync([Net.WebSockets.WebSocketCloseStatus]::NormalClosure, '', $cts.Token).Wait(2000) } catch { }
-        try { $ws.Abort(); $ws.Dispose() } catch { }
-        if ($probeTask) { try { [void]$probeTask.Wait(2500) } catch { } }
-    }
-    $out.LoadedLatencyMs = Get-MedianValue $loaded
-    return $out
-}
-
-function Select-VultrUrl {
-    # Fastest Vultr test file by time-to-first-response on a HEAD request.
-    $best = $null; $bestMs = [double]::MaxValue
-    foreach ($u in $VultrTestUrls) {
-        $t0 = $sw.Elapsed.TotalMilliseconds
-        try {
-            $req = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Head, $u)
-            $resp = $client.SendAsync($req).Result
-            $ms = $sw.Elapsed.TotalMilliseconds - $t0
-            if ($resp.IsSuccessStatusCode -and $ms -lt $bestMs) { $best = $u; $bestMs = $ms }
-            $resp.Dispose()
-        } catch { }
-    }
-    return $best
-}
-
-function Update-Bufferbloat {
-    # Bufferbloat = worst loaded latency minus idle latency, graded like common speed tests.
-    param($Res)
-    $worstLoaded = @($Res['DownloadLoadedLatencyMs'], $Res['UploadLoadedLatencyMs']) | Where-Object { $null -ne $_ } | Sort-Object -Descending | Select-Object -First 1
-    $Res['BufferbloatMs'] = if ($null -ne $worstLoaded -and $null -ne $Res['IdleLatencyMs']) { [math]::Round($worstLoaded - $Res['IdleLatencyMs'], 1) } else { $null }
-    $Res['BufferbloatGrade'] = if ($null -eq $Res['BufferbloatMs']) { $null } elseif ($Res['BufferbloatMs'] -lt 30) { 'A (good)' } elseif ($Res['BufferbloatMs'] -lt 100) { 'B (fair)' } elseif ($Res['BufferbloatMs'] -lt 250) { 'C (poor)' } else { 'D (bad)' }
-}
-
-function Measure-Bandwidth {
-    # -Only limits the run to one direction (the retry phase uses it for whichever direction failed).
-    param([string[]]$Only = @('Download', 'Upload'))
-    # StartedAt/FinishedAt let the merge spot two machines at a site testing at the same time.
-    $res = [ordered]@{ Providers = ($BandwidthProviders -join ' > '); Method = $null; StartedAt = Format-Date (Get-Date); FinishedAt = $null }
-    $capBytes = [int64]$MaxTestMB * 1MB
-    if (-not $script:FullLanguage) {
-        # Constrained Language: plain cmdlets only, Cloudflare only, single stream.
-        $res.Method = 'Invoke-WebRequest single stream (Constrained Language fallback, lower confidence)'
-        try {
-            $t0 = Get-Date
-            $r = Invoke-WebRequest -Uri ('https://speed.cloudflare.com/__down?bytes={0}' -f [int64]([math]::Min(25MB, $capBytes / 2))) -UseBasicParsing -TimeoutSec 60
-            $sec = ((Get-Date) - $t0).TotalSeconds
-            $res['DownloadMbps'] = [math]::Round($r.RawContentLength * 8 / $sec / 1e6, 1); $res['DownloadOk'] = $true; $res['DownloadProvider'] = 'Cloudflare'
-        } catch { $res['DownloadOk'] = $false; $res['DownloadFailure'] = $_.Exception.Message }
-        try {
-            $body = New-Object byte[] (5MB)
-            $t0 = Get-Date
-            Invoke-WebRequest -Uri 'https://speed.cloudflare.com/__up' -Method Post -Body $body -UseBasicParsing -TimeoutSec 60 | Out-Null
-            $sec = ((Get-Date) - $t0).TotalSeconds
-            $res['UploadMbps'] = [math]::Round($body.Length * 8 / $sec / 1e6, 1); $res['UploadOk'] = $true; $res['UploadProvider'] = 'Cloudflare'
-        } catch { $res['UploadOk'] = $false; $res['UploadFailure'] = $_.Exception.Message }
-        return $res
-    }
-    $res.Method = "$BandwidthStreams HTTP streams (Cloudflare/Vultr) or one WebSocket (M-Lab NDT7), $BandwidthSeconds s per direction"
-    Add-Type -AssemblyName System.Net.Http
-    $handler = New-Object Net.Http.HttpClientHandler
-    $handler.UseProxy = $true
-    $client = New-Object Net.Http.HttpClient($handler)
-    $client.Timeout = [TimeSpan]::FromSeconds(60)
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-
-    # Latency is measured with ICMP to 1.1.1.1 (comparable to the ping series);
-    # HTTP round trips are the fallback when ICMP is blocked.
-    $pinger = New-Object Net.NetworkInformation.Ping
-    $useIcmp = $false
-    try { $useIcmp = ($pinger.Send('1.1.1.1', 1000).Status -eq 'Success') } catch { }
-    $res['LatencyMethod'] = if ($useIcmp) { 'ICMP to 1.1.1.1' } else { 'HTTP round trip to speed.cloudflare.com' }
-    $startProbe = {
-        if ($useIcmp) { return $pinger.SendPingAsync('1.1.1.1', 2000) }
-        return $client.GetAsync('https://speed.cloudflare.com/__down?bytes=0', [Net.Http.HttpCompletionOption]::ResponseHeadersRead)
-    }
-    $finishProbe = {
-        param($task, $startedMs)
-        if ($task.IsFaulted -or $task.IsCanceled) { return $null }
-        if ($useIcmp) { if ($task.Result.Status -eq 'Success') { return [double]$task.Result.RoundtripTime } return $null }
-        try { $task.Result.Dispose() } catch { }
-        return ($sw.Elapsed.TotalMilliseconds - $startedMs)
-    }
-
-    # Idle latency
-    $idle = @()
-    for ($i = 0; $i -lt 21; $i++) {
-        $t = $sw.Elapsed.TotalMilliseconds
-        $p = & $startProbe
-        try { [void]$p.Wait(2500) } catch { }
-        $v = & $finishProbe $p $t
-        if ($i -gt 0 -and $null -ne $v) { $idle += $v }   # first probe warms up TLS/ARP and is discarded
-        if ($useIcmp) { Start-Sleep -Milliseconds 100 }
-    }
-    $res['IdleLatencyMs'] = Get-MedianValue $idle
-    if ($idle.Count -gt 1) { $d = 0; for ($k = 1; $k -lt $idle.Count; $k++) { $d += [math]::Abs($idle[$k] - $idle[$k - 1]) }; $res['IdleJitterMs'] = [math]::Round($d / ($idle.Count - 1), 1) }
-
-    $attempts = New-Object Collections.Generic.List[object]
-    $mlabCache = @{}
-    $dlCap = [int64]($capBytes * 0.6)
-    $ulCap = [int64]($capBytes * 0.4)
-
-    $runDirection = {
-        # Tries each provider in order for one direction; returns the first good result (or $null).
-        # M-Lab upload is held back to the second pass: from Windows PowerShell's WebSocket client it
-        # reads low, so Cloudflare gets a second chance first.
-        param([string]$Dir, [int]$Pass = 1)
-        foreach ($prov in $BandwidthProviders) {
-            if ($Dir -eq 'Upload' -and $prov -eq 'MLab' -and $Pass -eq 1) { continue }
-            $r = $null; $detail = $null; $label = $prov
-            if ($prov -eq 'Cloudflare') {
-                Write-Step "  $Dir via Cloudflare"
-                $r = if ($Dir -eq 'Download') { Invoke-HttpDownloadTest { 'https://speed.cloudflare.com/__down?bytes=26214400' } $dlCap } else { Invoke-CloudflareUpload $ulCap }
-                if (-not $r.Ok -and $r.Had429 -and $r.RetryAfterSec -ge 1 -and $r.RetryAfterSec -le 20) {
-                    Write-Step ("  Cloudflare asked to wait {0} s; retrying once" -f $r.RetryAfterSec) 'Yellow'
-                    Start-Sleep -Seconds $r.RetryAfterSec
-                    $r = if ($Dir -eq 'Download') { Invoke-HttpDownloadTest { 'https://speed.cloudflare.com/__down?bytes=26214400' } $dlCap } else { Invoke-CloudflareUpload $ulCap }
-                }
-                $why = @()
-                if ($r.HttpStatus) { $why += 'HTTP ' + ($r.HttpStatus -join ', ') }
-                if ($r.Errors) { $why += $r.Errors[0] }
-                if ($r.Had429) { $why += 'rate-limited' }
-                $detail = $why -join '; '
-            } elseif ($prov -eq 'MLab') {
-                if (-not $mlabCache.ContainsKey('servers')) {
-                    try { $mlabCache['servers'] = @(Get-MlabServers) } catch { $mlabCache['servers'] = @(); $mlabCache['error'] = $_.Exception.Message }
-                }
-                $servers = @($mlabCache['servers'])
-                if ($servers.Count -eq 0) { $detail = "M-Lab locate failed: $($mlabCache['error'])" }
-                foreach ($srv in ($servers | Select-Object -First 2)) {
-                    # Each locate token is single use, so a server is only tried once per direction.
-                    Write-Step ("  {0} via M-Lab ({1}{2})" -f $Dir, $srv.Machine.Split('.')[0], $(if ($srv.City) { ", $($srv.City)" } else { '' }))
-                    $url = if ($Dir -eq 'Download') { $srv.Download } else { $srv.Upload }
-                    $r = Invoke-Ndt7Test $url $Dir.ToLower() $(if ($Dir -eq 'Download') { $dlCap } else { $ulCap })
-                    $label = "M-Lab NDT7 ($($srv.Machine.Split('.')[0]))"
-                    $detail = if ($r.Ok) { "server-side $($r.ServerMbps) Mbps, min RTT $($r.MinRttMs) ms" } else { $r.Error }
-                    if ($r.Ok -and $Dir -eq 'Upload') { $r['Note'] = 'M-Lab upload from this client reads low; treat as a lower bound' }
-                    if ($r.Ok) { break }
-                }
-                # A fresh locate is needed for any later retry.
-                $mlabCache.Remove('servers')
-            } elseif ($prov -eq 'Vultr') {
-                if ($Dir -ne 'Download') { continue }
-                $vu = Select-VultrUrl
-                if (-not $vu) { $detail = 'no Vultr test file reachable' }
-                else {
-                    $label = 'Vultr (' + ([Uri]$vu).Host.Split('.')[0] + ')'
-                    Write-Step "  Download via $label"
-                    $r = Invoke-HttpDownloadTest ([scriptblock]::Create("'$vu'")) $dlCap
-                    $detail = if ($r.Ok) { $null } else { (@(if ($r.HttpStatus) { 'HTTP ' + ($r.HttpStatus -join ', ') }) + @($r.Errors | Select-Object -First 1)) -join '; ' }
-                }
-            } else { continue }
-            $ok = [bool]($r -and $r.Ok)
-            $attempts.Add([pscustomobject]@{ Direction = $Dir; Provider = $label; Ok = $ok; Mbps = $(if ($ok) { $r.Mbps }); Detail = $detail })
-            if ($ok) { $r['Provider'] = $label; return $r }
-            Write-Step ("  {0} via {1} failed: {2}" -f $Dir, $label, $detail) 'Yellow'
-        }
-        return $null
-    }
-
-    $wantDl = ($Only -contains 'Download'); $wantUl = ($Only -contains 'Upload')
-    $dl = $null; $ul = $null
-    if ($wantDl) { $dl = & $runDirection 'Download' }
-    if ($wantUl) { $ul = & $runDirection 'Upload' }
-    if (($wantDl -and -not $dl) -or ($wantUl -and -not $ul)) {
-        # One more pass for whatever failed, after a pause (rate limits usually clear quickly).
-        Write-Step '  Bandwidth incomplete; waiting 30 s and trying every provider once more' 'Yellow'
-        Start-Sleep -Seconds 30
-        if ($wantDl -and -not $dl) { $dl = & $runDirection 'Download' 2 }
-        if ($wantUl -and -not $ul) { $ul = & $runDirection 'Upload' 2 }
-    }
-
-    foreach ($pair in @(@('Download', $dl), @('Upload', $ul))) {
-        $dir = $pair[0]; $r = $pair[1]
-        if ($Only -notcontains $dir) { continue }
-        if ($r) {
-            $res["${dir}Ok"] = $true
-            $res["${dir}Mbps"] = $r.Mbps
-            if ($dir -eq 'Download') { $res['DownloadPeakMbps'] = $r.PeakMbps }
-            $res["${dir}MB"] = $r.MB
-            $res["${dir}LoadedLatencyMs"] = $r.LoadedLatencyMs
-            $res["${dir}Provider"] = $r.Provider
-            if ($r.ServerMbps) { $res["${dir}ServerMbps"] = $r.ServerMbps }
-            if ($r.MinRttMs) { $res["${dir}MinRttMs"] = $r.MinRttMs }
-            $failedFirst = @($attempts | Where-Object { $_.Direction -eq $dir -and -not $_.Ok } | ForEach-Object { $_.Provider } | Select-Object -Unique)
-            $noteParts = @()
-            if ($failedFirst.Count) { $noteParts += "Fallback used after: $($failedFirst -join ', ')" }
-            if ($r.Note) { $noteParts += $r.Note }
-            if ($noteParts.Count) { $res["${dir}Note"] = $noteParts -join '; ' }
-        } else {
-            $res["${dir}Ok"] = $false
-            $res["${dir}Mbps"] = $null
-            $res["${dir}Failure"] = ((@($attempts | Where-Object Direction -eq $dir) | ForEach-Object { '{0}: {1}' -f $_.Provider, $_.Detail }) -join ' | ')
-        }
-    }
-    $res['Attempts'] = $attempts.ToArray()   # @() on a generic List fails when stored in an ordered dictionary
-    Update-Bufferbloat $res
-    $res['TestedOver'] = '{0} - {1}' -f $Result['Network']['PhysicalClass'], $Result['Network']['PhysicalAdapter']
-    $res['FinishedAt'] = Format-Date (Get-Date)
-    try { $client.Dispose(); $pinger.Dispose() } catch { }
-    return $res
-}
-
 if ($EnableBandwidth) {
     $Result['Bandwidth'] = Invoke-Collector 'Bandwidth test' { Measure-Bandwidth }
 } else {
@@ -6053,7 +6286,6 @@ if ($EnableBandwidth -and $BandwidthRounds -gt 1 -and (Get-Val $Result['Bandwidt
 # There is only one visit, so a gap is retried now instead of found later.
 # =====================================================================
 $script:Retried = @()
-function Test-TraceUsable { param($T) return [bool]($T -and @($T.Hops | Where-Object { $_.IP }).Count -ge 2) }
 
 $tr1 = @($Result['Traceroutes']) | Where-Object { $_ -and $_.Target -eq '1.1.1.1' } | Select-Object -First 1
 if (-not (Test-TraceUsable $tr1)) {
@@ -7078,77 +7310,6 @@ if ($EnableSnmp -and $script:FullLanguage -and $SnmpCommunity -and $srcIp -and $
     }
 }
 
-# =====================================================================
-# PHASE 7: analysis, flags, summary
-# =====================================================================
-function Get-TopologyVerdict {
-    # Scores backhaul and split-tunnel signals from one run. Uses $ProviderAsn and $HostedLabel from CONFIG.
-    param($Result, [string[]]$RdpHosts = @())
-    $signals = @()
-    $backhaul = 0; $split = 0
-    $eg = $Result['Egress']
-    $carrier = Get-Val $eg 'Carrier'
-    if ($carrier -match $ProviderAsn) { $backhaul += 3; $signals += "Egress ASN is '$carrier' ($HostedLabel provider): internet exits via the provider" }
-    elseif ($carrier) { $signals += "Egress ISP/ASN: $carrier ($(Get-Val $eg 'EgressCity'))" }
-
-    $inet = $Result['Traceroutes'] | Where-Object { $_.Target -eq '1.1.1.1' } | Select-Object -First 1
-    if ($inet) {
-        $a = $inet.Analysis
-        # On its own a private hop is only a hint (some ISPs number their edge privately); it needs a second signal.
-        if ($a['TunnelIndicator']) { $backhaul += 1; $signals += "Internet trace crosses private hop(s) with latency before reaching the ISP (tunnel/MPLS or ISP-internal): $($a['PrivateHopsAfterGw'] -join ', ')" }
-        elseif ($a['DoubleNatLikely']) { $signals += "Internet trace shows low-latency private hop(s) after gateway (double NAT, e.g. ISP modem + firewall): $($a['PrivateHopsAfterGw'] -join ', ')" }
-        elseif ($a['CgnatHops'] -gt 0) { $signals += 'Internet trace goes from the gateway into carrier-grade NAT (ISP-side), i.e. straight out the local circuit' }
-        else { $signals += 'Internet trace goes straight from the gateway to a public ISP hop' }
-        if (@($a['CarrierPrivateHops']).Count -gt 0) { $signals += "Private hops after the CGNAT hop are carrier-internal, ignored: $($a['CarrierPrivateHops'] -join ', ')" }
-        # A distant first public hop only hints at backhaul when it is not just access latency:
-        # skip satellite/cellular/CGNAT paths and cases where it roughly equals end-to-end latency.
-        $inetPing = @($Result['PingSeries']) | Where-Object { $_ -and $_.Target -eq '1.1.1.1' } | Select-Object -First 1
-        $e2e = if ($inetPing) { $inetPing.AvgMs } else { $null }
-        $accessLatency = ($a['CgnatHops'] -gt 0) -or ($e2e -and $a['FirstPublicMs'] -ge 0.7 * $e2e)
-        if ($a['FirstPublicMs'] -ge 30 -and -not $accessLatency) { $backhaul += 1; $signals += "First public hop is far away ($($a['FirstPublicMs']) ms) compared with end-to-end latency" }
-        elseif ($a['FirstPublicMs'] -ge 30) { $signals += "First public hop at $($a['FirstPublicMs']) ms is access-link latency (satellite/cellular/CGNAT or similar), not counted as backhaul" }
-        if ($a['FirstPublicPtr']) { $signals += "First public hop rDNS: $($a['FirstPublicPtr'])" }
-    }
-
-    $rdpTraces = @($Result['Traceroutes'] | Where-Object { $RdpHosts -contains $_.Target })
-    foreach ($t in $rdpTraces) {
-        if ($t.Analysis['TunnelIndicator'] -and -not ($inet -and $inet.Analysis['TunnelIndicator'])) { $split += 2; $signals += "RDP trace to $($t.Target) goes through a private tunnel hop that internet traffic does not" }
-    }
-    foreach ($r in @($Result['RdpPath'])) {
-        if ($r -and $r.ResolvesPrivate) { $split += 2; $signals += "RDP host $($r.Host) resolves to a private IP ($($r.ResolvedIPs -join ', ')): reached over a tunnel" }
-    }
-    $actPriv = @(Get-Val $Result['Rdp'] 'ActiveTcp' | Where-Object { $_.Class -eq 'Private' })
-    if ($actPriv.Count -gt 0) { $split += 2; $signals += "Live RDP session is connected to a private IP ($(($actPriv | ForEach-Object { $_.RemoteAddress }) -join ', '))" }
-
-    # DNS on this machine's own subnet is an on-prem server (DC, file server, firewall DNS), not a tunnel.
-    # Private DNS on some other subnet hints that DNS is reached over a tunnel; it counts once.
-    $localNets = @()
-    foreach ($a in @(Get-Val $Result['Network'] 'Adapters' | Where-Object { $_ -and $_.Status -eq 'Up' })) {
-        $ips = @($a.IPv4); $masks = @($a.SubnetMask)
-        for ($q = 0; $q -lt $ips.Count; $q++) { if ($ips[$q] -and $masks.Count -gt $q) { $localNets += [pscustomobject]@{ Ip = $ips[$q]; Mask = $masks[$q] } } }
-    }
-    $onPremDns = @(); $remoteDns = @()
-    foreach ($d in @(Get-Val $Result['NetworkExtra'] 'DnsServers')) {
-        if (-not $d -or $d.Type -notlike 'Private, not the gateway*') { continue }
-        if (@($localNets | Where-Object { Test-SameSubnet $d.Server $_.Ip $_.Mask }).Count) { $onPremDns += $d.Server } else { $remoteDns += $d.Server }
-    }
-    if ($onPremDns.Count) { $signals += "DNS server(s) on this machine's own subnet ($($onPremDns -join ', ')): on-prem server or DC, not a tunnel" }
-    if ($remoteDns.Count) { $split += 1; $signals += "DNS server(s) on another private subnet ($($remoteDns -join ', ')): DNS may be reached over a tunnel" }
-    $script:OnPremDns = $onPremDns
-    $mtu = @($Result['Mtu'])
-    $mtuInet = ($mtu | Where-Object { $_.Target -eq '1.1.1.1' } | Select-Object -First 1)
-    $mtuRdp = ($mtu | Where-Object { $_.Target -ne '1.1.1.1' } | Select-Object -First 1)
-    if ($mtuInet -and $mtuInet.MtuBytes -and $mtuInet.MtuBytes -lt 1500) { $signals += "Internet path MTU is $($mtuInet.MtuBytes) (PPPoE or tunnel overhead)"; if ($mtuInet.MtuBytes -lt 1440) { $backhaul += 1 } }
-    if ($mtuRdp -and $mtuRdp.MtuBytes -and $mtuRdp.MtuBytes -lt 1440 -and (-not $mtuInet.MtuBytes -or $mtuInet.MtuBytes -ge 1492)) { $split += 1; $signals += "RDP path MTU is $($mtuRdp.MtuBytes) while internet is $($mtuInet.MtuBytes): tunnel to RDP" }
-    if (Get-Val $Result['Network'] 'VpnHoldsDefaultRoute') { $backhaul += 2; $signals += 'A client VPN adapter holds the default route on this PC (full tunnel)' }
-
-    $verdict = 'Local breakout'
-    if ($backhaul -ge 2) { $verdict = 'Full backhaul' }
-    elseif ($split -ge 2) { $verdict = 'Split tunnel (local internet, RDP over tunnel)' }
-    $score = [math]::Max($backhaul, $split)
-    $confidence = if ($verdict -eq 'Local breakout') { if ($signals.Count -ge 3) { 'Medium-High' } else { 'Medium' } } elseif ($score -ge 4) { 'High' } elseif ($score -ge 2) { 'Medium' } else { 'Low' }
-    [ordered]@{ Verdict = $verdict; Confidence = $confidence; BackhaulScore = $backhaul; SplitScore = $split; Signals = $signals }
-}
 try { $Result['Leads'] = @(Get-Leads $Result) } catch { $script:Errors += [pscustomobject]@{ Collector = 'Leads'; Error = $_.Exception.Message } }
 $Topology = Invoke-Collector 'Topology verdict' { Get-TopologyVerdict $Result $RdpHosts }
 $Result['Topology'] = $Topology
@@ -7328,7 +7489,6 @@ $Result['Meta']['RunSeconds'] = [int]((Get-Date) - $RunStart).TotalSeconds
 
 # ---------------- Summary text ----------------
 $L = New-Object Collections.Generic.List[string]
-function Add-Line { param([string]$Text = '') $L.Add($Text) }
 # Wrapped so a formatting problem in the summary can never stop the data from being written and checked.
 try {
 $m = $Result['Machine']; $n = $Result['Network']; $eg = $Result['Egress']; $bw = $Result['Bandwidth']; $w = Get-Val $Result['Wireless'] 'Current'
@@ -7589,162 +7749,6 @@ if ($script:PktmonStarted) {
     try { Invoke-Native 'pktmon.exe' 'stop' 60 | Out-Null; Invoke-Native 'pktmon.exe' 'filter remove' 15 | Out-Null } catch { }
 }
 
-# =====================================================================
-# PHASE 8: data check. assessment.json is read back from disk exactly as the merge
-# will read it, and every section the reports depend on is checked for real values.
-# =====================================================================
-function Get-Field {
-    # Property or key lookup that works on both live results and JSON read back from disk.
-    param($Obj, [string]$Name)
-    if ($null -eq $Obj -or $Obj -is [string]) { return $null }
-    if ($Obj -is [System.Collections.IDictionary]) { if ($Obj.Contains($Name)) { return $Obj[$Name] }; return $null }
-    $p = $Obj.PSObject.Properties[$Name]
-    if ($p) { return $p.Value }
-    return $null
-}
-
-function Test-AssessmentData {
-    # Returns one row per check: Status OK, INFO (expected gap), WARN (usable, something missing) or FAIL (re-run).
-    param($D, [string]$Folder)
-    $rows = New-Object Collections.Generic.List[object]
-    $add = { param($Check, $Status, $Detail) $rows.Add([pscustomobject]@{ Check = $Check; Status = $Status; Detail = "$Detail" }) }
-
-    $meta = Get-Field $D 'Meta'
-    if ((Get-Field $meta 'Hostname') -and (Get-Field $meta 'RunStart')) { & $add 'Run identity' 'OK' ('{0} at {1}' -f (Get-Field $meta 'Hostname'), (Get-Field $meta 'RunStart')) }
-    else { & $add 'Run identity' 'FAIL' 'hostname or run time missing' }
-    $site = "$(Get-Field $meta 'SiteName')"
-    if ($site -and $site -ne 'UNSPECIFIED') { & $add 'Site name' 'OK' $site } else { & $add 'Site name' 'WARN' 'no site name (can be fixed in the merge with -SiteMap)' }
-
-    $net = Get-Field $D 'Network'
-    $cls = "$(Get-Field $net 'PhysicalClass')"
-    if ($cls -and $cls -ne 'No route' -and (Get-Field $net 'SourceIp')) { & $add 'Connection' 'OK' ('{0}, {1} via gateway {2}' -f $cls, (Get-Field $net 'SourceIp'), (Get-Field $net 'Gateway')) }
-    else { & $add 'Connection' 'FAIL' 'no network route found' }
-
-    $eg = Get-Field $D 'Egress'
-    if (Get-Field $eg 'PublicIPv4') { & $add 'Public IP / carrier' 'OK' ('{0} ({1})' -f (Get-Field $eg 'PublicIPv4'), (Get-Field $eg 'Carrier')) }
-    else { & $add 'Public IP / carrier' 'FAIL' 'public IP not identified' }
-
-    $bwD = Get-Field $D 'Bandwidth'
-    if ("$(Get-Field $bwD 'Status')" -eq 'disabled in config') { & $add 'Bandwidth' 'WARN' 'disabled in config' }
-    else {
-        foreach ($dir in 'Download', 'Upload') {
-            $mbps = Get-Field $bwD "${dir}Mbps"
-            if ((Get-Field $bwD "${dir}Ok") -and $null -ne $mbps -and [double]$mbps -gt 0) { & $add "Bandwidth $($dir.ToLower())" 'OK' ('{0} Mbps via {1}' -f $mbps, (Get-Field $bwD "${dir}Provider")) }
-            else {
-                $why = if (Get-Field $bwD "${dir}Failure") { Get-Field $bwD "${dir}Failure" } elseif (Get-Field $bwD 'Status') { Get-Field $bwD 'Status' } else { 'no provider returned a result (check $BandwidthProviders)' }
-                & $add "Bandwidth $($dir.ToLower())" 'FAIL' $why
-            }
-        }
-        if ($null -ne (Get-Field $bwD 'BufferbloatMs')) { & $add 'Latency under load' 'OK' ('{0:+0.#;-0.#;0} ms over idle, grade {1}' -f [double](Get-Field $bwD 'BufferbloatMs'), (Get-Field $bwD 'BufferbloatGrade')) }
-        else { & $add 'Latency under load' 'WARN' 'not measured' }
-    }
-
-    $traces = @(@(Get-Field $D 'Traceroutes') | Where-Object { $_ })
-    foreach ($tgt in '1.1.1.1', '8.8.8.8') {
-        $t = $traces | Where-Object { $_.Target -eq $tgt } | Select-Object -First 1
-        $answered = @(@(Get-Field $t 'Hops') | Where-Object { $_ -and $_.IP }).Count
-        $an = Get-Field $t 'Analysis'
-        if ($answered -ge 2 -and (Test-Path -LiteralPath (Join-Path $Folder ('traceroute_{0}.txt' -f $tgt)))) {
-            & $add "Traceroute $tgt" 'OK' ('{0} hops, first public hop #{1} {2}' -f @(Get-Field $t 'Hops').Count, (Get-Field $an 'FirstPublicHop'), (Get-Field $an 'FirstPublicIP'))
-        } else {
-            & $add "Traceroute $tgt" $(if ($tgt -eq '1.1.1.1') { 'FAIL' } else { 'WARN' }) $(if (-not $t) { 'missing' } else { "only $answered hop(s) answered" })
-        }
-    }
-
-    $pings = @(@(Get-Field $D 'PingSeries') | Where-Object { $_ })
-    $tcps = @(@(Get-Field $D 'TcpSeries') | Where-Object { $_ })
-    $inet = @($pings + $tcps) | Where-Object { $_.Target -eq '1.1.1.1' -and $_.Received -gt 0 } | Select-Object -First 1
-    if ($inet) { & $add 'Internet loss / latency' 'OK' ('1.1.1.1 loss {0}%, avg {1} ms, jitter {2} ms ({3})' -f $inet.LossPct, $inet.AvgMs, $inet.JitterMs, $(if (Get-Field $inet 'Method') { 'TCP' } else { 'ping' })) }
-    else { & $add 'Internet loss / latency' 'FAIL' 'no replies from 1.1.1.1 by ping or TCP' }
-    $gw = Get-Field $net 'Gateway'
-    $gp = $pings | Where-Object { $_.Target -eq $gw -and $_.Received -gt 0 } | Select-Object -First 1
-    if ($gp) { & $add 'Gateway loss / latency' 'OK' ('loss {0}%, avg {1} ms' -f $gp.LossPct, $gp.AvgMs) } else { & $add 'Gateway loss / latency' 'WARN' 'gateway does not answer ping' }
-
-    $rdpD = Get-Field $D 'Rdp'
-    $targets = @(@(Get-Field $rdpD 'SelectedTargets') | Where-Object { $_ })
-    $ownTargets = @($targets | Where-Object { $extraHosts -notcontains $_ })
-    if ($targets.Count -eq 0) { & $add 'Remote desktop targets' 'WARN' 'none resolved' }
-    elseif ($ownTargets.Count -eq 0) { & $add 'Remote desktop targets' 'WARN' ("only the fixed target ({0}); no remote desktop use found on this PC, so no session history. A PC whose user works in the hosted desktop gives more" -f ($targets -join ', ')) }
-    else { & $add 'Remote desktop targets' 'OK' ($targets -join ', ') }
-    if ($targets.Count) {
-        $traceInfo = foreach ($tg in $targets) { $t = $traces | Where-Object { $_.Target -eq $tg } | Select-Object -First 1; '{0}: {1} hops' -f $tg, @(@(Get-Field $t 'Hops') | Where-Object { $_ -and $_.IP }).Count }
-        $noTrace = @($targets | Where-Object { $tg = $_; -not ($traces | Where-Object { $_.Target -eq $tg -and @($_.Hops | Where-Object { $_ -and $_.IP }).Count -ge 1 }) })
-        & $add 'Traceroutes to targets' $(if ($noTrace.Count) { 'WARN' } else { 'OK' }) (@($traceInfo) -join '; ')
-        $series = @(@($pings + $tcps) | Where-Object { $targets -contains $_.Target -and $_.Received -gt 0 })
-        if ($series.Count) { & $add 'Remote desktop loss / latency' 'OK' ((@($series | ForEach-Object { '{0}{1} loss {2}% avg {3} ms' -f $_.Target, $(if (Get-Field $_ 'Port') { " tcp/$($_.Port)" } else { '' }), $_.LossPct, $_.AvgMs })) -join '; ') }
-        else { & $add 'Remote desktop loss / latency' 'WARN' 'no ping or TCP replies from any target' }
-        $openT = @(@(Get-Field $D 'RdpPath') | Where-Object { $_ -and @(@($_.Tcp) | Where-Object { $_ -and $_.Open }).Count })
-        if ($openT.Count) { & $add 'Remote desktop reachability' 'OK' ("{0} of {1} target(s) answer on TCP" -f $openT.Count, $targets.Count) } else { & $add 'Remote desktop reachability' 'WARN' 'no target answered on any TCP port' }
-    }
-
-    $mD = Get-Field $D 'Machine'
-    if ((Get-Field $mD 'SerialNumber') -and (Get-Field $mD 'Model') -and (Get-Field $mD 'OsBuild')) { & $add 'Machine inventory' 'OK' ('{0} {1}, S/N {2}' -f (Get-Field $mD 'Manufacturer'), (Get-Field $mD 'Model'), (Get-Field $mD 'SerialNumber')) }
-    else { & $add 'Machine inventory' 'WARN' 'model, serial or OS missing' }
-    $appCount = Get-Field (Get-Field $D 'Software') 'AppCount'
-    if ($appCount -gt 0) { & $add 'Software inventory' 'OK' "$appCount apps" } else { & $add 'Software inventory' 'WARN' 'no installed apps read' }
-    $topo = Get-Field $D 'Topology'
-    if (Get-Field $topo 'Verdict') { & $add 'Topology verdict' 'OK' ('{0} ({1})' -f (Get-Field $topo 'Verdict'), (Get-Field $topo 'Confidence')) } else { & $add 'Topology verdict' 'WARN' 'not decided' }
-
-    if ($EnableSubnetSweep) {
-        $sw = Get-Field $D 'SubnetSweep'
-        $cnt = Get-Field $sw 'ArpEntries'
-        if ($cnt -gt 0) { & $add 'Subnet sweep' 'OK' ('{0} devices on {1}, {2} identified by name or ports{3}' -f $cnt, (Get-Field $sw 'Subnet'), [int](Get-Field $sw 'Identified'), $(if (Get-Field $sw 'Note') { " ($(Get-Field $sw 'Note'))" } else { '' })) }
-        else { & $add 'Subnet sweep' 'WARN' $(if (Get-Field $sw 'Status') { Get-Field $sw 'Status' } else { 'no devices found' }) }
-    }
-    $tlsD = Get-Field $D 'Tls'
-    if ($tlsD -and (Get-Field $tlsD 'Checks')) {
-        $answered = @(@(Get-Field $tlsD 'Checks') | Where-Object { $_ -and $_.Issuer }).Count
-        if (Get-Field $tlsD 'InspectionSuspected') { & $add 'HTTPS certificates' 'WARN' 'HTTPS inspection suspected (see HTTPS CERTIFICATES in summary.txt)' }
-        elseif ($answered) { & $add 'HTTPS certificates' 'OK' "$answered certificate(s) read, no inspection seen" }
-        else { & $add 'HTTPS certificates' 'WARN' 'no certificate could be read' }
-    }
-    $hdaD = Get-Field (Get-Field $D 'Rdp') 'HostedDesktopApp'
-    if ($hdaD) {
-        if (Get-Field $hdaD 'Found') { & $add 'Hosted-desktop app' 'OK' ('found, {0} host name(s) in its files' -f @(@(Get-Field $hdaD 'Hosts') | Where-Object { $_ }).Count) }
-        else { & $add 'Hosted-desktop app' 'INFO' 'No app matching the hosted desktop profile for this user (run on a PC whose user works in it)' }
-    }
-    if ($cls -eq 'Wi-Fi') {
-        $wl = Get-Field $D 'Wireless'; $wc = Get-Field $wl 'Current'
-        if ($null -ne (Get-Field $wc 'SignalPct')) { & $add 'Wi-Fi details' 'OK' ('{0}, {1}%, {2}' -f (Get-Field $wc 'SSID'), (Get-Field $wc 'SignalPct'), (Get-Field $wc 'Band')) }
-        else {
-            # Say why: a policy block applies to every managed PC, so a second machine will not fill the gap.
-            $why = Get-Field (Get-Field $wl 'LocationWorkaround') 'Result'
-            if (-not $why) { $why = Get-Field $wl 'Status' }
-            & $add 'Wi-Fi details' 'WARN' ("radio details not read ({0}); SSID {1}" -f $why, (Get-Field $wc 'SSID'))
-        }
-    }
-    if (Get-Field $meta 'AdminTierActive') {
-        $adm = Get-Field $D 'Admin'
-        if ($adm -and -not (Get-Field $adm 'Status')) { & $add 'Admin checks' 'OK' 'TPM, BitLocker, disk health and sign-ins collected' } else { & $add 'Admin checks' 'WARN' (Get-Field $adm 'Status') }
-        if ($cls -like 'Wired*') {
-            $nb = @(@(Get-Field (Get-Field $D 'Lldp') 'Neighbors') | Where-Object { $_ })
-            if ($nb.Count) { & $add 'Switch (LLDP/CDP)' 'OK' ((@($nb | ForEach-Object { '{0} port {1}' -f $(if ($_.Model) { $_.Model } else { $_.SystemName }), $_.Port })) -join '; ') }
-            else { & $add 'Switch (LLDP/CDP)' 'WARN' 'nothing heard: unmanaged switch, or LLDP/CDP turned off' }
-        }
-    } else { & $add 'Admin checks' 'INFO' 'skipped: ISE was not run as administrator' }
-
-    $errs = @(@(Get-Field $D 'Errors') | Where-Object { $_ })
-    if ($errs.Count) { & $add 'Collector errors' 'WARN' ((@($errs | ForEach-Object { $_.Collector } | Select-Object -Unique)) -join ', ') } else { & $add 'Collector errors' 'OK' 'none' }
-    return $rows.ToArray()
-}
-
-function Test-ZipOutput {
-    # Opens the finished zip the way the merge will and confirms the files and data are in it.
-    param([string]$Zip, [string[]]$Required)
-    $problems = @()
-    $tmp = Join-Path $env:TEMP ('sa_verify_{0}' -f (Get-Random))
-    try {
-        Expand-Archive -LiteralPath $Zip -DestinationPath $tmp -Force
-        foreach ($f in $Required) { if (-not (Test-Path -LiteralPath (Join-Path $tmp $f))) { $problems += "$f missing from the zip" } }
-        $j = [IO.File]::ReadAllText((Join-Path $tmp 'assessment.json')) | ConvertFrom-Json
-        if ((Get-Field (Get-Field $j 'Meta') 'Hostname') -ne $env:COMPUTERNAME) { $problems += 'assessment.json in the zip is not from this machine' }
-        if (-not (Get-Field (Get-Field $j 'Validation') 'Overall')) { $problems += 'assessment.json in the zip has no data check' }
-    } catch { $problems += "zip could not be read back: $($_.Exception.Message)" }
-    finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
-    $size = (Get-Item -LiteralPath $Zip -ErrorAction SilentlyContinue).Length
-    return [pscustomobject]@{ Ok = ($problems.Count -eq 0); Problems = $problems; SizeKB = $(if ($size) { [math]::Round($size / 1KB) } else { 0 }) }
-}
-
 Write-Step 'Checking the collected data'
 $checks = @()
 try {
@@ -7859,4 +7863,5 @@ if ($OpenFolderWhenDone) {
         else { Invoke-Item -LiteralPath $OutputRoot }
     } catch { }
 }
+
 # END OF COLLECTOR SCRIPT (keep this as the last line: the paste check at the top looks for it)
