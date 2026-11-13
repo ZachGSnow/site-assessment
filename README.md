@@ -121,6 +121,25 @@ _merged\Report.html + Sites, Endpoints, Findings, Flags, Devices, RouterAddresse
 
 **The verdict.** Each machine scores backhaul signals (the egress network belongs to the hosted desktop provider, a client VPN holds the default route, slow private hops before the ISP, a reduced internet MTU, a distant first public hop that is not just access latency) against split-tunnel signals (the remote desktop host resolves to a private address, its trace crosses a tunnel the internet trace does not, DNS on another private subnet, a lower MTU on the remote desktop path). Carrier-grade NAT and satellite or cellular access latency are recognised and not counted as backhaul. The merge takes the most common verdict per site and turns "local breakout" into "shared egress" when two sites leave through the same public address.
 
+## Working on the code
+
+`Collect-SiteAssessment.ps1` is built, not edited. It is used as one file (pasted into ISE, or copied to a PC on its own), but it is kept as small pieces under `src/collector`:
+
+| Path | What is in it |
+|---|---|
+| `00-header.ps1`, `10-config.ps1` | Help, parameters and the CONFIG block |
+| `lib/*.ps1` | Every function, by area: core, addresses and ports, web and TLS, device identity, wire capture, SNMP, other subnets, leads, path and bandwidth, IPv6, email domain, findings, this PC |
+| `run/*.ps1` | What a run does, in order: preflight, inventory, background traces and pings, egress, bandwidth, retries, discovery, identification and follow-up checks, analysis, data check |
+| `99-end.ps1` | The paste-check marker |
+
+Edit the pieces, rebuild, and commit both:
+
+```powershell
+.\tools\Build-Collector.ps1
+```
+
+A test fails when the committed `Collect-SiteAssessment.ps1` does not match what the pieces build. `Merge-SiteAssessment.ps1` is still a single file.
+
 ## Testing
 
 ```powershell

@@ -758,3 +758,17 @@ Describe 'DKIM keys' {
         (Get-DomainPosture 'example.com').DkimSelectors | Should -Be @('k1')
     }
 }
+
+Describe 'Collector build' {
+    It 'Collect-SiteAssessment.ps1 is what tools\Build-Collector.ps1 makes from src\collector' {
+        $out = Join-Path $TestDrive 'built.ps1'
+        & (Join-Path $RepoRoot 'tools\Build-Collector.ps1') -OutFile $out | Out-Null
+        ([IO.File]::ReadAllText($out) -replace "`r`n", "`n") | Should -Be ([IO.File]::ReadAllText($CollectorPath) -replace "`r`n", "`n") -Because 'edit src\collector, run tools\Build-Collector.ps1, and commit both'
+    }
+    It 'keeps every function in src\collector\lib and none in the run files' {
+        foreach ($f in Get-ChildItem (Join-Path $RepoRoot 'src\collector\run') -Filter *.ps1) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+            @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] }).Count | Should -Be 0 -Because "$($f.Name) is run code"
+        }
+    }
+}
