@@ -1207,7 +1207,7 @@ function New-SiteDiagramSvg {
     $h = [math]::Max($top + $spine.Count * ($bh + $gap), $top + $side.Count * ($bh + $gap) + 80) + 10
     $fg = if ($Standalone) { '#1f2328' } else { 'currentColor' }
     $sb = New-Object Text.StringBuilder
-    [void]$sb.Append(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="100%" role="img" aria-label="{2}" font-family="Segoe UI, Arial, sans-serif">' -f $w, $h, (Enc $Title)))
+    [void]$sb.Append(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="100%" style="max-width:{0}px" role="img" aria-label="{2}" font-family="Segoe UI, Arial, sans-serif">' -f $w, $h, (Enc $Title)))
     if ($Standalone) { [void]$sb.Append(('<rect width="{0}" height="{1}" fill="#ffffff"/>' -f $w, $h)) }
     [void]$sb.Append(('<text x="{0}" y="24" font-size="15" font-weight="600" fill="{1}">{2}</text>' -f $bx, $fg, (Enc $Title)))
     $box = {
@@ -1479,6 +1479,10 @@ a.scard.Red { border-top-color:var(--red); } a.scard.Amber { border-top-color:va
 .t-sub { font-size:12.5px; color:var(--muted); overflow-wrap:anywhere; }
 .note { border:1px solid var(--line); border-left:4px solid var(--amber); background:var(--card); border-radius:8px; padding:8px 12px; margin:0 0 14px; }
 .note ul { margin:4px 0 0 18px; padding:0; }
+.fix { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 16px 12px; margin:0 0 18px; box-shadow:var(--shadow); }
+.fix ol { margin:6px 0 4px 20px; padding:0; } .fix li { margin:7px 0; line-height:1.4; } .fix .where { color:var(--muted); font-size:13px; }
+.sev { display:inline-block; font-size:11px; font-weight:700; letter-spacing:.02em; padding:1px 8px; border-radius:9px; margin-right:6px; color:#fff; vertical-align:1px; }
+.sev.High { background:var(--red); } .sev.Medium { background:var(--amber); }
 
 /* Panels */
 .grid2 { display:grid; grid-template-columns:repeat(auto-fit, minmax(440px, 1fr)); gap:14px; margin-bottom:14px; }
@@ -1645,10 +1649,33 @@ foreach ($s in $sites) {
 
 [void]$sb.Append("<!doctype html><html lang=""en""><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width, initial-scale=1""><title>$(Enc $ClientName) - Site Assessment</title><style>$css</style></head><body>")
 [void]$sb.Append("<header class=""top""><div class=""top-row""><h1>$(Enc $ClientName)</h1><span class=""meta"">Site assessment - $($sites.Count) site(s), $($endpoints.Count) endpoint(s) - generated $gen</span><input id=""search"" type=""search"" placeholder=""Search all tables...""><button id=""expandAll"" type=""button"">Expand all</button><button id=""collapseAll"" type=""button"">Collapse all</button></div>")
-[void]$sb.Append('<nav class="jump"><a href="#overview">Overview</a>')
+[void]$sb.Append('<nav class="jump"><a href="#fix">What to fix first</a><a href="#overview">Overview</a>')
 foreach ($s in $sites) { [void]$sb.Append(('<a href="#{0}">{1}</a>' -f $siteView[$s.Site].Id, (Enc $s.Site))) }
 if ($ipInfo.Count) { [void]$sb.Append('<a href="#addresses">Addresses</a>') }
 [void]$sb.Append('<a href="#fleet">Fleet</a><a href="#method">Methodology</a></nav></header><main>')
+
+# ---- What to fix first: the high and medium findings across every site, worst and widest first.
+# The same finding on several machines or sites is one line, with where it was seen.
+$fixItems = @($flags | Where-Object { $_.Scope -eq 'Site' -and $_.Severity -in @('High', 'Medium') } | Group-Object Severity, Category, Message | ForEach-Object {
+    $g = @($_.Group)
+    [pscustomobject]@{ Severity = $g[0].Severity; Category = $g[0].Category; Message = $g[0].Message
+        Sites = @($g | ForEach-Object Site | Sort-Object -Unique); Machines = @($g | ForEach-Object Hostname | Where-Object { $_ } | Sort-Object -Unique) }
+} | Sort-Object @{ Expression = { if ($_.Severity -eq 'High') { 0 } else { 1 } } }, @{ Expression = { $_.Machines.Count }; Descending = $true }, @{ Expression = { $_.Sites.Count }; Descending = $true }, Message)
+[void]$sb.Append('<h2 id="fix">What to fix first</h2><div class="fix">')
+if ($fixItems.Count) {
+    [void]$sb.Append('<ol>')
+    foreach ($fi in @($fixItems | Select-Object -First 10)) {
+        $machinePart = if ($fi.Category -in @('Network risk', 'Email security', 'Active Directory') -or $fi.Machines.Count -eq 0) { '' } elseif ($fi.Machines.Count -le 3) { " - $($fi.Machines -join ', ')" } else { " - $($fi.Machines.Count) machines" }
+        [void]$sb.Append(('<li><span class="sev {0}">{0}</span>{1} <span class="where">({2}{3})</span></li>' -f $fi.Severity, (Enc $fi.Message), (Enc ($fi.Sites -join ', ')), (Enc $machinePart)))
+    }
+    [void]$sb.Append('</ol>')
+    $rest = $fixItems.Count - [math]::Min(10, $fixItems.Count)
+    $lows = @($flags | Where-Object { $_.Scope -eq 'Site' -and $_.Severity -eq 'Low' }).Count
+    [void]$sb.Append(('<p class="muted">{0}Every finding, with the machine it came from, is in each site''s Findings section below{1}.</p>' -f $(if ($rest -gt 0) { "$rest more high or medium finding(s) are not shown here. " } else { '' }), $(if ($lows) { " ($lows low-severity finding(s) as well)" } else { '' })))
+} else {
+    [void]$sb.Append('<p class="muted">No high or medium findings. Each site''s Findings section below lists the low ones.</p>')
+}
+[void]$sb.Append('</div>')
 
 # ---- Overview: one card per site, bandwidth first
 [void]$sb.Append('<h2 id="overview">Overview</h2><div class="scards">')
@@ -1698,13 +1725,9 @@ if ($sites.Count -gt 1) {
     [void]$sb.Append('</div>')
 }
 
-$topHigh = @($flags | Where-Object Severity -eq 'High' | Sort-Object Site, Hostname | Select-Object -First 12)
-if ($domainRows.Count) { [void]$sb.Append((New-Section 'Email and domain (public DNS)' (New-Table $domainRows @('Domain', 'Provider|Mail goes to', 'Mx|MX', 'Spf|SPF', 'Dmarc|DMARC', 'Dkim|DKIM selectors', 'MtaSts|MTA-STS', 'CheckedFrom|Checked from')) -Open)) }
-[void]$sb.Append('<h2>Key findings</h2>')
-if ($topHigh.Count) { [void]$sb.Append((New-Table $topHigh @('Site', 'Hostname|Machine', 'Category', 'Message|Finding'))) }
-else { [void]$sb.Append('<p class="muted">No high-severity findings.</p>') }
 
-if ($sites.Count -ge 2) { [void]$sb.Append((New-Section 'Site comparison table (every site-level figure)' (New-Table $sites @('Status', 'Site', 'Endpoints', 'Wired', 'WiFi|Wi-Fi', 'Verdict', 'CarrierName|Carrier', 'PublicIPs|Public IP', 'CircuitDownMbps|Circuit down', 'CircuitUpMbps|Circuit up', 'CircuitBasis|Circuit basis', 'WifiMedianDown|Wi-Fi down (median)', 'MedianIdleMs|Latency ms', 'WorstBufferbloatMs|Bufferbloat ms', 'WorstInetLossPct|Loss %', "HostedMedianMs|$HostedLabel ms", "HostedWorstLossPct|$HostedLabel loss %", 'RdpNetworkDrops|RDP network drops (30d)', 'DataChecks|Data check', 'FirewallModel|Firewall', 'GatewayVendors|Gateway MAC vendor', 'FirewallHints|Firewall (admin ports)', 'VpnClientVendors|VPN client vendor', 'ApVendors|AP vendors', 'KnownSubnets|Subnets', 'Win10Count|Win10', 'Notes')) -Open:($sites.Count -gt 1))) }
+if ($sites.Count -ge 2) { [void]$sb.Append((New-Section 'Site comparison table (every site-level figure)' (New-Table $sites @('Status', 'Site', 'Endpoints', 'Wired', 'WiFi|Wi-Fi', 'Verdict', 'CarrierName|Carrier', 'PublicIPs|Public IP', 'CircuitDownMbps|Circuit down', 'CircuitUpMbps|Circuit up', 'CircuitBasis|Circuit basis', 'WifiMedianDown|Wi-Fi down (median)', 'MedianIdleMs|Latency ms', 'WorstBufferbloatMs|Bufferbloat ms', 'WorstInetLossPct|Loss %', "HostedMedianMs|$HostedLabel ms", "HostedWorstLossPct|$HostedLabel loss %", 'RdpNetworkDrops|RDP network drops (30d)', 'DataChecks|Data check', 'FirewallModel|Firewall', 'GatewayVendors|Gateway MAC vendor', 'FirewallHints|Firewall (admin ports)', 'VpnClientVendors|VPN client vendor', 'ApVendors|AP vendors', 'KnownSubnets|Subnets', 'Win10Count|Win10')) -Open:($sites.Count -gt 1))) }
+if ($domainRows.Count) { [void]$sb.Append((New-Section 'Email and domain (public DNS)' (New-Table $domainRows @('Domain', 'Provider|Mail goes to', 'Mx|MX', 'Spf|SPF', 'Dmarc|DMARC', 'Dkim|DKIM selectors', 'MtaSts|MTA-STS', 'CheckedFrom|Checked from')) -Open)) }
 
 # ---- Per site: bandwidth and path first, then everything else
 foreach ($s in $sites) {
