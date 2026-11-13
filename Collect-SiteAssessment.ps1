@@ -4320,8 +4320,14 @@ function Test-AssessmentData {
 
     $rdpD = Get-Field $D 'Rdp'
     $targets = @(@(Get-Field $rdpD 'SelectedTargets') | Where-Object { $_ })
-    $ownTargets = @($targets | Where-Object { $extraHosts -notcontains $_ })
-    if ($targets.Count -eq 0) { & $add 'Remote desktop targets' 'WARN' 'none resolved' }
+    # The fixed targets (the hosted desktop profile and $ExtraTargets) are the ones that must answer. Targets
+    # found only in this PC's RDP history may be old or office-only hosts: their silence is not a gap.
+    $fixedHosts = @(@(Get-Field (Get-Field (Get-Field $D 'Meta') 'HostedDesktop') 'Targets') | Where-Object { $_ } | ForEach-Object { ((("$_".Trim().ToLower() -replace '^[a-z]+://', '') -split '/')[0] -replace ':\d+$', '') })
+    if (-not $fixedHosts.Count) { $fixedHosts = @($extraHosts | Where-Object { $_ }) }
+    $ownTargets = @($targets | Where-Object { $fixedHosts -notcontains $_ })
+    $historyOnly = ($targets.Count -gt 0 -and $ownTargets.Count -eq $targets.Count)
+    if ($targets.Count -eq 0 -and -not $fixedHosts.Count) { & $add 'Remote desktop targets' 'INFO' 'no remote desktop use found on this PC and no hosted desktop profile targets set' }
+    elseif ($targets.Count -eq 0) { & $add 'Remote desktop targets' 'WARN' 'none resolved' }
     elseif ($ownTargets.Count -eq 0) { & $add 'Remote desktop targets' 'WARN' ("only the fixed target ({0}); no remote desktop use found on this PC, so no session history. A PC whose user works in the hosted desktop gives more" -f ($targets -join ', ')) }
     else { & $add 'Remote desktop targets' 'OK' ($targets -join ', ') }
     if ($targets.Count) {
@@ -4330,9 +4336,12 @@ function Test-AssessmentData {
         & $add 'Traceroutes to targets' $(if ($noTrace.Count) { 'WARN' } else { 'OK' }) (@($traceInfo) -join '; ')
         $series = @(@($pings + $tcps) | Where-Object { $targets -contains $_.Target -and $_.Received -gt 0 })
         if ($series.Count) { & $add 'Remote desktop loss / latency' 'OK' ((@($series | ForEach-Object { '{0}{1} loss {2}% avg {3} ms' -f $_.Target, $(if (Get-Field $_ 'Port') { " tcp/$($_.Port)" } else { '' }), $_.LossPct, $_.AvgMs })) -join '; ') }
+        elseif ($historyOnly) { & $add 'Remote desktop loss / latency' 'INFO' 'the hosts in this PC''s RDP history do not answer from here (old or office-only hosts); set a hosted desktop profile or $ExtraTargets to measure the one that matters' }
         else { & $add 'Remote desktop loss / latency' 'WARN' 'no ping or TCP replies from any target' }
         $openT = @(@(Get-Field $D 'RdpPath') | Where-Object { $_ -and @(@($_.Tcp) | Where-Object { $_ -and $_.Open }).Count })
-        if ($openT.Count) { & $add 'Remote desktop reachability' 'OK' ("{0} of {1} target(s) answer on TCP" -f $openT.Count, $targets.Count) } else { & $add 'Remote desktop reachability' 'WARN' 'no target answered on any TCP port' }
+        if ($openT.Count) { & $add 'Remote desktop reachability' 'OK' ("{0} of {1} target(s) answer on TCP" -f $openT.Count, $targets.Count) }
+        elseif ($historyOnly) { & $add 'Remote desktop reachability' 'INFO' 'no host from the RDP history answered on TCP' }
+        else { & $add 'Remote desktop reachability' 'WARN' 'no target answered on any TCP port' }
     }
 
     $mD = Get-Field $D 'Machine'
@@ -4368,7 +4377,8 @@ function Test-AssessmentData {
             # Say why: a policy block applies to every managed PC, so a second machine will not fill the gap.
             $why = Get-Field (Get-Field $wl 'LocationWorkaround') 'Result'
             if (-not $why) { $why = Get-Field $wl 'Status' }
-            & $add 'Wi-Fi details' 'WARN' ("radio details not read ({0}); SSID {1}" -f $why, (Get-Field $wc 'SSID'))
+            # Blocked by policy is how most managed PCs are set up: report it, but it is not a gap to fix by re-running
+            & $add 'Wi-Fi details' $(if ("$why" -like 'Blocked by policy*') { 'INFO' } else { 'WARN' }) ("radio details not read ({0}); SSID {1}" -f $why, (Get-Field $wc 'SSID'))
         }
     }
     if (Get-Field $meta 'AdminTierActive') {
