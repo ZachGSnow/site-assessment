@@ -157,6 +157,7 @@ function New-MultiSiteFixture {
                 [ordered]@{ IP = '10.20.2.31'; Mac = $null; Vendor = $null; RespondedToPing = $false; Name = $null; OpenPorts = @(445); Role = 'Windows PC, server or NAS (file sharing on)'; Subnet = '10.20.2.0/24'; Remote = $true }
             )
         }
+        RdpTransport = [ordered]@{ Verdict = 'UDP possible'; Shortpath = $false; Caveats = @(); Evidence = @('STUN on UDP: 3 of 3 servers answered') }
         AdSites = [ordered]@{ Forest = 'northwind.local'; CurrentSite = 'Main-Office'; Sites = @(
             [ordered]@{ Name = 'Main-Office'; Location = ''; Subnets = @('10.20.1.0/24') }
             [ordered]@{ Name = 'Warehouse'; Location = ''; Subnets = @('10.20.2.0/24') }

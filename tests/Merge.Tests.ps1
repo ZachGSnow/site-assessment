@@ -243,3 +243,11 @@ Describe 'Site diagrams' {
         [IO.File]::ReadAllText((Join-Path $MultiOut 'Report.html')) | Should -Match 'Site diagram'
     }
 }
+
+Describe 'Remote desktop transport in the merged report' {
+    It 'shows each machine''s transport and the site''s' {
+        $e = @(Import-Csv (Join-Path $MultiOut 'Endpoints.csv')) | Where-Object Hostname -eq 'NW-FRONT01'
+        $e.RdpTransport | Should -Be 'UDP possible'
+        (@(Import-Csv (Join-Path $MultiOut 'Sites.csv')) | Where-Object Site -eq 'Main office').RdpTransport | Should -Be 'UDP possible'
+    }
+}

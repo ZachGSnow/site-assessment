@@ -5,7 +5,7 @@ $Result['Topology'] = $Topology
 # What the evidence adds up to: saved with the data and printed at the end of the run.
 $script:Findings = @()
 try {
-    $areaOrder = @('This run', 'Speed test', 'Switch port', 'Switching', 'Internet service', 'Traffic design', 'Tunnel', 'DNS and DHCP', 'Cloud services', 'Gateway', 'Network equipment', 'Network layout', 'Phones', 'Windows machines', 'Printers', 'Cameras', 'Other offices', 'Directory')
+    $areaOrder = @('This run', 'Speed test', 'Switch port', 'Switching', 'Internet service', 'Traffic design', 'Remote desktop', 'Tunnel', 'DNS and DHCP', 'Cloud services', 'Gateway', 'Network equipment', 'Network layout', 'Phones', 'Windows machines', 'Printers', 'Cameras', 'Other offices', 'Directory')
     $fi = 0
     $script:Findings = @(Get-AssessmentFindings $Result | ForEach-Object { $fi++; $ix = [array]::IndexOf($areaOrder, "$($_.Area)"); if ($ix -lt 0) { $ix = 99 }; [pscustomobject]@{ Sort = ($ix * 1000) + $fi; Item = $_ } } | Sort-Object Sort | ForEach-Object { $_.Item })
 } catch { $script:Errors += [pscustomobject]@{ Collector = 'Findings'; Error = $_.Exception.Message } }
@@ -15,6 +15,8 @@ $Result['Findings'] = $script:Findings
 try {
     foreach ($dp in @(Get-Val $Result['Domains'] 'Domains')) { foreach ($df in @(Get-DomainFlags $dp)) { Add-Flag $df.Severity $df.Category $df.Message } }
     foreach ($af in @(Get-AdSiteFlags (Get-AdSiteCheck $Result))) { Add-Flag $af.Severity $af.Category $af.Message }
+    $Result['RdpTransport'] = Get-RdpTransportCheck $Result
+    foreach ($rf in @(Get-RdpTransportFlags $Result['RdpTransport'] ([bool]@($RdpHosts).Count))) { Add-Flag $rf.Severity $rf.Category $rf.Message }
     if ("$(Get-Prop $Result 'Ipv6', 'Status')" -eq 'Broken') { Add-Flag 'Medium' 'Network' 'IPv6 is offered but does not reach the internet (slow first connections)' }
     foreach ($rf in @(Get-NetworkRiskFlags $Result)) { Add-Flag $rf.Severity $rf.Category $rf.Message }
     foreach ($sd in @(Get-Val $Result['Snmp'] 'Devices')) {

@@ -812,3 +812,49 @@ Describe 'Active Directory site cross-check' {
         @(Get-AdSiteFlags $null).Count | Should -Be 0
     }
 }
+
+Describe 'Remote desktop transport (UDP or TCP only)' {
+    BeforeAll {
+        $script:Stun = { param([int[]]$ports) @($ports | ForEach-Object { @{ Server = "s$_"; Answered = $true; MappedPort = $_ } }) }
+        $script:Run = {
+            param([hashtable]$Extra = @{})
+            $r = @{ Meta = @{ HostedDesktop = @{ Profile = 'AzureVirtualDesktop' } }; Rdp = @{ SelectedTargets = @('rdweb.wvd.microsoft.com') }
+                    Cloud = @{ Stun = (& $Stun @(50000, 50000)) }; Traceroutes = @(@{ Target = '1.1.1.1'; Analysis = @{ DoubleNatLikely = $false; CgnatHops = 0 } }) }
+            foreach ($k in $Extra.Keys) { $r[$k] = $Extra[$k] }
+            $r
+        }
+    }
+    It 'says UDP is in use when the RDP client has established it before' {
+        (Get-RdpTransportCheck (& $Run @{ EventLogs = @{ RdpClient = @{ Udp = @{ Attempted = 4; Established = 3; Failed = 1 } } } })).Verdict | Should -Be 'UDP in use'
+    }
+    It 'says UDP is possible when it gets out and the NAT keeps one port' {
+        (Get-RdpTransportCheck (& $Run)).Verdict | Should -Be 'UDP possible'
+    }
+    It 'says TCP only when the client policy turns UDP off' {
+        $c = Get-RdpTransportCheck (& $Run @{ Session = @{ UdpPolicy = @{ UdpDisabled = $true; Source = 'group policy' } } })
+        $c.Verdict | Should -Be 'TCP only: UDP turned off on this PC'
+        (Get-RdpTransportFlags $c).Severity | Should -Be 'Medium'
+    }
+    It 'says TCP only when no STUN server answers on UDP' {
+        $c = Get-RdpTransportCheck (& $Run @{ Cloud = @{ Stun = @(@{ Server = 'a'; Answered = $false }, @{ Server = 'b'; Answered = $false }) } })
+        $c.Verdict | Should -Be 'TCP only: outbound UDP blocked'
+        (Get-RdpTransportFlags $c).Message | Should -Match '51\.5\.0\.0/16 port 3478'
+    }
+    It 'says relayed UDP only for Azure Virtual Desktop behind symmetric NAT' {
+        (Get-RdpTransportCheck (& $Run @{ Cloud = @{ Stun = (& $Stun @(50000, 50123)) } })).Verdict | Should -Be 'Relayed UDP only (symmetric NAT)'
+        $plain = & $Run @{ Cloud = @{ Stun = (& $Stun @(50000, 50123)) }; Meta = @{ HostedDesktop = @{ Profile = 'RDP' } } }
+        (Get-RdpTransportCheck $plain).Verdict | Should -Be 'UDP may fail (symmetric NAT)'
+    }
+    It 'lists what Microsoft says gets in the way of a direct UDP path' {
+        $c = Get-RdpTransportCheck (& $Run @{ Traceroutes = @(@{ Target = '1.1.1.1'; Analysis = @{ DoubleNatLikely = $true; CgnatHops = 1 } }); Network = @{ VpnHoldsDefaultRoute = $true } })
+        $c.Caveats.Count | Should -Be 3
+    }
+    It 'raises nothing on a PC that does not use remote desktop' {
+        $c = Get-RdpTransportCheck (& $Run @{ Session = @{ UdpPolicy = @{ UdpDisabled = $true } } })
+        @(Get-RdpTransportFlags $c $false).Count | Should -Be 0
+    }
+    It 'turns it into a Remote desktop finding' {
+        $f = @(Get-AssessmentFindings (& $Run @{ Cloud = @{ Stun = @(@{ Server = 'a'; Answered = $false }) } }))
+        ($f | Where-Object Area -eq 'Remote desktop').Finding | Should -Match 'only use TCP'
+    }
+}

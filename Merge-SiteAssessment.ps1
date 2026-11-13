@@ -343,7 +343,7 @@ foreach ($r in $runs) {
         DownProvider = $(if (V $bw 'DownloadProvider') { V $bw 'DownloadProvider' } elseif (V $bw 'DownloadOk') { 'Cloudflare' }); UpProvider = $(if (V $bw 'UploadProvider') { V $bw 'UploadProvider' } elseif (V $bw 'UploadOk') { 'Cloudflare' })
         IdleMs = V $bw 'IdleLatencyMs'; BufferbloatMs = V $bw 'BufferbloatMs'; BufferbloatGrade = V $bw 'BufferbloatGrade'
         InetLossPct = V $inetPing 'LossPct'; InetAvgMs = V $inetPing 'AvgMs'; InetPingSent = V $inetPing 'Sent'; InetJitterMs = V $inetPing 'JitterMs'; GwLossPct = V $gwPing 'LossPct'
-        RdpUnexpectedDisconnects = V $rdpc 'UnexpectedDisconnects'; RdpNetworkDisconnects = V $rdpc 'NetworkDisconnects'; RdpUdp = V $udpInfo 'Status'
+        RdpUnexpectedDisconnects = V $rdpc 'UnexpectedDisconnects'; RdpNetworkDisconnects = V $rdpc 'NetworkDisconnects'; RdpUdp = V $udpInfo 'Status'; RdpTransport = V (V $r 'RdpTransport') 'Verdict'
         HostedTarget = $(if ($avSeries) { '{0}{1}' -f $avSeries.Target, $(if (V $avSeries 'Port') { " tcp/$($avSeries.Port)" } else { ' (ping)' }) }); HostedAvgMs = V $avSeries 'AvgMs'; HostedLossPct = V $avSeries 'LossPct'; HostedJitterMs = V $avSeries 'JitterMs'
         DataCheck = $dataCheck; DataIssues = $dataIssues
         Ipv6 = V (V $r 'Ipv6') 'Status'; Ipv6Prefix = J @(V (V $r 'Ipv6') 'GlobalPrefixes') ', '; Ipv6Ms = V (V (V $r 'Ipv6') 'Ping') 'AvgMs'
@@ -1065,6 +1065,7 @@ foreach ($g in ($endpoints | Group-Object Site | Sort-Object Name)) {
         RouterWan = J @($routerAddr | Where-Object { $_.Site -eq $g.Name -and $_.Class -eq 'Public' } | ForEach-Object { if ($_.Owner) { '{0} ({1})' -f $_.Address, $_.Owner } else { $_.Address } } | Sort-Object -Unique) ', '
         UpsCount = @($upsRows | Where-Object { $_.Site -eq $g.Name }).Count
         Ipv6 = J @($eps | ForEach-Object { $_.Ipv6 } | Where-Object { $_ } | Sort-Object -Unique) ', '
+        RdpTransport = J @($eps | ForEach-Object { $_.RdpTransport } | Where-Object { $_ -and $_ -ne 'Not known' } | Sort-Object -Unique) ', '
         AdSite = J @($runs | Where-Object { $_._SiteKey -eq (SiteKey $g.Name) } | ForEach-Object { V (V $_ 'AdSites') 'CurrentSite' } | Where-Object { $_ } | Sort-Object -Unique) ', '
         ExposedPorts = J (@($ips | ForEach-Object { $x = $exposure[$_]; if ($x -and $x.Listed) { "$($_): $(@($x.Ports) -join ' ')" } elseif ($x -and -not $x.Error) { "$($_): none listed" } }))
         Notes = J $notes
@@ -1798,7 +1799,7 @@ foreach ($s in $sites) {
         'Wired median down', $(if ($null -ne $s.WiredMedianDown) { "$($s.WiredMedianDown) Mbps" }), 'Wi-Fi median down', $(if ($null -ne $s.WifiMedianDown) { "$($s.WifiMedianDown) Mbps" }),
         'Firewall', $s.FirewallModel, 'Gateway MAC vendor', $s.GatewayVendors, 'Firewall (admin ports)', $s.FirewallHints, 'VPN client vendor on PCs', $s.VpnClientVendors,
         'Router WAN address (SNMP)', $(if ($s.RouterWan) { $s.RouterWan } else { $null }),
-        'IPv6', $(if ($s.Ipv6) { $s.Ipv6 } else { 'not checked' }), 'Active Directory site', $(if ($s.AdSite) { $s.AdSite } else { $null }),
+        'IPv6', $(if ($s.Ipv6) { $s.Ipv6 } else { 'not checked' }), 'Remote desktop transport', $(if ($s.RdpTransport) { $s.RdpTransport } else { $null }), 'Active Directory site', $(if ($s.AdSite) { $s.AdSite } else { $null }),
         'Wireless', $(if ($s.ApVendors) { "$($s.ApVendors) ($($s.ApBssids) BSSIDs seen)" } else { 'not identified' }), 'Switching', $(if ($s.Switches) { $s.Switches } else { 'not identified (needs admin run on a wired machine)' }))
     [void]$body.Append((New-Panel 'Site facts' ($facts + "<h4>Topology: $(Enc $s.Verdict)</h4>" + $ev.ToString())))
 
@@ -1815,7 +1816,7 @@ foreach ($s in $sites) {
     }
 
     # Network detail
-    [void]$body.Append((New-Section 'Connection detail by machine' (New-Table $eps @('Hostname|Machine', 'Connection', 'LocalSubnet|Subnet', 'DownMbps|Down', 'DownProvider|Down via', 'UpMbps|Up', 'UpProvider|Up via', 'LinkMbps|Link Mbps', 'WifiSsid|SSID', 'WifiBand|Band', 'WifiSignalPct|Signal %', 'WifiRealDrops|Wi-Fi drops on this SSID (30d)', 'IdleMs|Idle ms', 'BufferbloatMs|Bufferbloat ms', "HostedAvgMs|$HostedLabel ms", "HostedLossPct|$HostedLabel loss %", 'RdpNetworkDisconnects|RDP network drops (30d)', 'RdpUdp|RDP UDP', 'Verdict', 'DataCheck|Data check'))))
+    [void]$body.Append((New-Section 'Connection detail by machine' (New-Table $eps @('Hostname|Machine', 'Connection', 'LocalSubnet|Subnet', 'DownMbps|Down', 'DownProvider|Down via', 'UpMbps|Up', 'UpProvider|Up via', 'LinkMbps|Link Mbps', 'WifiSsid|SSID', 'WifiBand|Band', 'WifiSignalPct|Signal %', 'WifiRealDrops|Wi-Fi drops on this SSID (30d)', 'IdleMs|Idle ms', 'BufferbloatMs|Bufferbloat ms', "HostedAvgMs|$HostedLabel ms", "HostedLossPct|$HostedLabel loss %", 'RdpNetworkDisconnects|RDP network drops (30d)', 'RdpUdp|RDP UDP', 'RdpTransport|RDP transport', 'Verdict', 'DataCheck|Data check'))))
     $rdpT = @($rdpRows | Where-Object Site -eq $name)
     if ($rdpT.Count) { [void]$body.Append((New-Section 'RDP target reachability' (New-Table $rdpT $(if ($ipInfo.Count) { @('Hostname|Machine', 'Host|Target', 'ResolvedIPs|Resolves to', 'Owner|Registered to', 'AddressClass|Class', 'Port', 'Open', 'MedianMs|Median ms', 'JitterMs|Jitter ms') } else { @('Hostname|Machine', 'Host|Target', 'ResolvedIPs|Resolves to', 'AddressClass|Class', 'Port', 'Open', 'MedianMs|Median ms', 'JitterMs|Jitter ms') })) -Badge ("{0} checks" -f $rdpT.Count))) }
 
